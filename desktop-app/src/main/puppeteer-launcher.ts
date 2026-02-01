@@ -81,9 +81,6 @@ export class PuppeteerLauncher {
         try { prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf8')); } catch {}
       }
 
-      if (options.lastUrl) {
-        prefs.session = { restore_on_startup: 1, startup_urls: [options.lastUrl] };
-      }
       fs.writeFileSync(prefsPath, JSON.stringify(prefs));
 
       // Get proxy configuration
@@ -334,12 +331,42 @@ export class PuppeteerLauncher {
         }
       }
 
-      // Navigate to start URL AFTER proxy auth + stealth are configured
-      try {
-        await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        console.log(`[Navigation] Navigated to: ${startUrl}`);
-      } catch (e) {
-        console.error('[Navigation] Failed to navigate to start URL:', e);
+      // Restore all saved tabs or navigate to start URL
+      const tabsFilePath = path.join(profilePath, 'open_tabs.json');
+      let savedTabs: string[] = [];
+      if (fs.existsSync(tabsFilePath)) {
+        try { savedTabs = JSON.parse(fs.readFileSync(tabsFilePath, 'utf8')); } catch {}
+      }
+
+      if (savedTabs.length > 0) {
+        // Restore first tab in existing page
+        try {
+          await page.goto(savedTabs[0], { waitUntil: 'domcontentloaded', timeout: 30000 });
+          console.log(`[Navigation] Restored tab 1/${savedTabs.length}: ${savedTabs[0]}`);
+        } catch (e) {
+          console.error('[Navigation] Failed to restore first tab:', e);
+        }
+        // Open remaining tabs in parallel
+        await Promise.all(savedTabs.slice(1).map(async (url, idx) => {
+          try {
+            const newPage = await browser.newPage();
+            await applyStealthToPage(newPage);
+            if (proxy && proxy.username && proxy.password) {
+              await newPage.authenticate({ username: proxy.username, password: proxy.password });
+            }
+            newPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            console.log(`[Navigation] Restored tab ${idx + 2}/${savedTabs.length}: ${url}`);
+          } catch (e) {
+            console.error(`[Navigation] Failed to restore tab ${idx + 2}:`, e);
+          }
+        }));
+      } else {
+        try {
+          await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          console.log(`[Navigation] Navigated to: ${startUrl}`);
+        } catch (e) {
+          console.error('[Navigation] Failed to navigate to start URL:', e);
+        }
       }
 
       // Store browser instance
@@ -356,44 +383,66 @@ export class PuppeteerLauncher {
         }
       });
 
-      // Save URL on navigation
-      const saveUrl = async (url: string) => {
-        if (url && !url.includes('about:blank') && !url.includes('chrome://')) {
-          const curPrefsPath = path.join(profilePath, 'Default', 'Preferences');
-          if (fs.existsSync(curPrefsPath)) {
+      // Track all open tabs and save their URLs for multi-tab restoration
+      let tabSaveTimeout: ReturnType<typeof setTimeout> | null = null;
+      const saveAllTabUrls = async () => {
+        try {
+          const allPages = await browser.pages();
+          const urls: string[] = [];
+          for (const p of allPages) {
             try {
-              const curPrefs = JSON.parse(fs.readFileSync(curPrefsPath, 'utf8'));
-              curPrefs.session = curPrefs.session || {};
-              curPrefs.session.restore_on_startup = 1;
-              curPrefs.session.startup_urls = [url];
-              fs.writeFileSync(curPrefsPath, JSON.stringify(curPrefs));
-            } catch (e) {
-              console.error('Error saving Chrome prefs:', e);
-            }
+              const url = p.url();
+              if (url && !url.startsWith('about:') && !url.startsWith('chrome://') && !url.startsWith('devtools://')) {
+                urls.push(url);
+              }
+            } catch {}
           }
-
-          const urlPath = path.join(profilePath, 'last_url.txt');
-          fs.writeFileSync(urlPath, url);
-
-          const stateDir = path.join(os.homedir(), '.antidetect-browser', 'state');
-          if (!fs.existsSync(stateDir)) {
-            fs.mkdirSync(stateDir, { recursive: true });
+          if (urls.length > 0) {
+            fs.writeFileSync(tabsFilePath, JSON.stringify(urls));
+            console.log(`[Tabs] Saved ${urls.length} tab(s)`);
           }
-          const statePath = path.join(stateDir, `${options.profileId}.json`);
-          fs.writeFileSync(statePath, JSON.stringify({ lastUrl: url, lastUpdated: new Date().toISOString() }, null, 2));
-          console.log(`Saved URL for profile ${options.profileId}: ${url}`);
-        }
+          // Also save main page URL for Firestore sync
+          const mainUrl = page.url();
+          if (mainUrl && !mainUrl.startsWith('about:') && !mainUrl.startsWith('chrome://')) {
+            fs.writeFileSync(path.join(profilePath, 'last_url.txt'), mainUrl);
+            const stateDir = path.join(os.homedir(), '.antidetect-browser', 'state');
+            if (!fs.existsSync(stateDir)) fs.mkdirSync(stateDir, { recursive: true });
+            fs.writeFileSync(
+              path.join(stateDir, `${options.profileId}.json`),
+              JSON.stringify({ lastUrl: mainUrl, lastUpdated: new Date().toISOString() }, null, 2)
+            );
+          }
+        } catch {}
       };
 
-      page.on('framenavigated', async (frame) => {
-        if (frame === page.mainFrame()) {
-          await saveUrl(page.url());
+      const debouncedSaveTabs = () => {
+        if (tabSaveTimeout) clearTimeout(tabSaveTimeout);
+        tabSaveTimeout = setTimeout(saveAllTabUrls, 1000);
+      };
+
+      // Track main page navigations
+      page.on('framenavigated', (frame: any) => {
+        if (frame === page.mainFrame()) debouncedSaveTabs();
+      });
+      page.on('load', debouncedSaveTabs);
+
+      // Track new tabs opened by user
+      browser.on('targetcreated', async (target) => {
+        if (target.type() === 'page') {
+          try {
+            const p = await target.page();
+            if (p) {
+              p.on('framenavigated', (frame: any) => {
+                if (frame === p.mainFrame()) debouncedSaveTabs();
+              });
+              p.on('load', debouncedSaveTabs);
+            }
+          } catch {}
         }
       });
 
-      page.on('load', async () => {
-        await saveUrl(page.url());
-      });
+      // Save when a tab is closed
+      browser.on('targetdestroyed', debouncedSaveTabs);
 
       console.log(`Chrome launched successfully for profile: ${options.profileId}`);
       return { success: true };

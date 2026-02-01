@@ -334,6 +334,14 @@ function App() {
       const profile = profilesRef.current.find(p => p.id === profileId);
       const profileName = profile?.name || profileId;
 
+      // Release lock IMMEDIATELY so other users can see it's free
+      try {
+        await releaseProfileLock(profileId);
+      } catch (error) {
+        console.error('[ProfileSync] Failed to release lock:', error);
+      }
+
+      // Then upload to cloud in background
       try {
         setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
 
@@ -349,13 +357,6 @@ function App() {
         console.error('[ProfileSync] Upload failed:', error);
         setSyncProgress(null);
         showToast(`\u00c9chec sync "${profileName}"`, 'error');
-      }
-
-      // Release lock
-      try {
-        await releaseProfileLock(profileId);
-      } catch (error) {
-        console.error('[ProfileSync] Failed to release lock:', error);
       }
     });
 
