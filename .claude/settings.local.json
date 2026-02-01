@@ -39,7 +39,8 @@
       "Bash(vercel --version:*)",
       "Bash(npm run dist:win:*)",
       "Bash(./node_modules/.bin/firebase deploy:*)",
-      "Bash(gh auth:*)"
+      "Bash(gh auth:*)",
+      "Bash(npm run compile:*)"
     ]
   }
 }

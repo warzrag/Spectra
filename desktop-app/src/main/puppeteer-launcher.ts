@@ -331,6 +331,37 @@ export class PuppeteerLauncher {
         }
       }
 
+      // Import synced cookies from cloud via CDP (bypasses Chrome DPAPI encryption)
+      const syncedCookiesPath = path.join(profilePath, 'synced_cookies.json');
+      if (fs.existsSync(syncedCookiesPath)) {
+        try {
+          const syncedCookies = JSON.parse(fs.readFileSync(syncedCookiesPath, 'utf8'));
+          if (Array.isArray(syncedCookies) && syncedCookies.length > 0) {
+            const cdpSession = await page.createCDPSession();
+            let imported = 0;
+            for (const c of syncedCookies) {
+              try {
+                await cdpSession.send('Network.setCookie', {
+                  name: c.name,
+                  value: c.value,
+                  domain: c.domain,
+                  path: c.path || '/',
+                  httpOnly: c.httpOnly || false,
+                  secure: c.secure || false,
+                  sameSite: c.sameSite || undefined,
+                  ...(c.expires && c.expires > 0 ? { expires: c.expires } : {}),
+                });
+                imported++;
+              } catch {}
+            }
+            await cdpSession.detach();
+            console.log(`[CookieSync] Imported ${imported}/${syncedCookies.length} synced cookies`);
+          }
+        } catch (e) {
+          console.error('[CookieSync] Error importing synced cookies:', e);
+        }
+      }
+
       // Restore all saved tabs or navigate to start URL
       const tabsFilePath = path.join(profilePath, 'open_tabs.json');
       let savedTabs: string[] = [];
@@ -372,8 +403,12 @@ export class PuppeteerLauncher {
       // Store browser instance
       this.activeProfiles.set(options.profileId, { browser, page });
 
+      // Cookie save interval ref (declared here so disconnect handler can clear it)
+      let cookieSaveInterval: ReturnType<typeof setInterval> | null = null;
+
       // Listen for browser close
       browser.on('disconnected', () => {
+        if (cookieSaveInterval) clearInterval(cookieSaveInterval);
         this.activeProfiles.delete(options.profileId);
         console.log(`Browser closed for profile: ${options.profileId}`);
         // Notify renderer for cloud sync upload
@@ -443,6 +478,25 @@ export class PuppeteerLauncher {
 
       // Save when a tab is closed
       browser.on('targetdestroyed', debouncedSaveTabs);
+
+      // --- Periodic cookie export via CDP (bypasses DPAPI encryption for cross-PC sync) ---
+      const saveCookiesViaCDP = async () => {
+        try {
+          const allPages = await browser.pages();
+          if (allPages.length === 0) return;
+          const cdpSession = await allPages[0].createCDPSession();
+          const result = await cdpSession.send('Network.getAllCookies');
+          await cdpSession.detach();
+          if (result.cookies && result.cookies.length > 0) {
+            fs.writeFileSync(syncedCookiesPath, JSON.stringify(result.cookies));
+            console.log(`[CookieSync] Exported ${result.cookies.length} cookies via CDP`);
+          }
+        } catch {}
+      };
+      // Save cookies 5s after launch (pages need time to load and set cookies)
+      setTimeout(saveCookiesViaCDP, 5000);
+      // Save cookies every 30s during the session
+      cookieSaveInterval = setInterval(saveCookiesViaCDP, 30000);
 
       console.log(`Chrome launched successfully for profile: ${options.profileId}`);
       return { success: true };
