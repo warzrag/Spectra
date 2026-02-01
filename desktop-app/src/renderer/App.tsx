@@ -14,6 +14,8 @@ import CreateProfileModal from './components/CreateProfileModal';
 import QuickCreateModal from './components/QuickCreateModal';
 import FolderModal from './components/FolderModal';
 import BrowserDownloadNotification from './components/BrowserDownloadNotification';
+import ProfileSyncNotification from './components/ProfileSyncNotification';
+import ForceUpdateModal from './components/ForceUpdateModal';
 import { AuthProvider } from './contexts/AuthContext';
 import { useToast } from './contexts/ToastContext';
 import { onAuthStateChanged, logout as authLogout } from './services/auth-service';
@@ -31,6 +33,14 @@ import {
   migrateLocalProfiles,
 } from './services/firestore-service';
 import { Profile, Folder, Extension, AppPage, AppSettings, AppUser } from '../types';
+import {
+  uploadProfileToCloud,
+  downloadProfileFromCloud,
+  needsCloudDownload,
+  isLockedByOther,
+  acquireProfileLock,
+  releaseProfileLock,
+} from './services/profile-sync-service';
 
 declare global {
   interface Window {
@@ -61,7 +71,7 @@ declare global {
         delete: (folderId: string) => Promise<boolean>;
       };
       fingerprint: {
-        generate: () => Promise<any>;
+        generate: (os?: string, browserType?: string) => Promise<any>;
         getPresets: () => Promise<any[]>;
       };
       proxy: {
@@ -74,6 +84,7 @@ declare global {
         rotate: (profileId: string) => Promise<any>;
         healthCheck: () => Promise<boolean>;
         getStats: (profileId?: string) => Promise<any[]>;
+        autoAssign: (profiles: any[]) => Promise<{ profileId: string; proxy: any }[]>;
       };
       network: {
         getConnections: () => Promise<any[]>;
@@ -107,9 +118,30 @@ declare global {
         getAll: () => Promise<any[]>;
         remove: (extensionId: string) => Promise<boolean>;
         getPaths: (extensionIds: string[]) => Promise<string[]>;
+        zip: (extensionId: string) => Promise<string>;
+        readZip: (zipPath: string) => Promise<Buffer>;
+        downloadAndInstall: (extensionId: string, url: string) => Promise<boolean>;
+      };
+      profileSync?: {
+        zipForSync: (profileId: string) => Promise<{ buffer: number[]; size: number }>;
+        unzipFromSync: (profileId: string, zipData: number[]) => Promise<boolean>;
+        hasLocalData: (profileId: string) => Promise<boolean>;
+        getLocalSyncVersion: (profileId: string) => Promise<number>;
+        setLocalSyncVersion: (profileId: string, version: number) => Promise<boolean>;
+        getHostname: () => Promise<string>;
+        onProfileClosed: (callback: (profileId: string) => void) => () => void;
       };
       browser?: {
         onDownloadProgress: (callback: (data: { percent: number; status: string }) => void) => () => void;
+      };
+      update?: {
+        onUpdateAvailable: (callback: (data: { version: string; releaseNotes?: string }) => void) => () => void;
+        onDownloadProgress: (callback: (data: { percent: number }) => void) => () => void;
+        onUpdateDownloaded: (callback: () => void) => () => void;
+        startDownload: () => Promise<void>;
+        installUpdate: () => Promise<void>;
+        openExternal: (url: string) => Promise<void>;
+        quit: () => Promise<void>;
       };
     };
   }
@@ -142,6 +174,57 @@ function App() {
   const [showFolderModal, setShowFolderModal] = useState(false);
   const [editingFolder, setEditingFolder] = useState<Folder | null>(null);
   const [editingProfile, setEditingProfile] = useState<Profile | null>(null);
+  const [updateInfo, setUpdateInfo] = useState<{ version: string; releaseNotes?: string } | null>(null);
+  const [updatePercent, setUpdatePercent] = useState<number | null>(null);
+  const [updateDownloaded, setUpdateDownloaded] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<{ profileId: string; percent: number; type: 'upload' | 'download'; profileName?: string } | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    const saved = localStorage.getItem('spectra-sidebar-collapsed');
+    return saved === 'true';
+  });
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed(prev => {
+      const next = !prev;
+      localStorage.setItem('spectra-sidebar-collapsed', String(next));
+      return next;
+    });
+  };
+
+  // Auto-collapse sidebar on narrow windows
+  useEffect(() => {
+    const handleResize = () => {
+      if (window.innerWidth < 1024 && !sidebarCollapsed) {
+        setSidebarCollapsed(true);
+        localStorage.setItem('spectra-sidebar-collapsed', 'true');
+      }
+    };
+    window.addEventListener('resize', handleResize);
+    handleResize();
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Listen for auto-update events
+  useEffect(() => {
+    const cleanups: (() => void)[] = [];
+
+    const c1 = window.electronAPI.update?.onUpdateAvailable((data) => {
+      setUpdateInfo(data);
+    });
+    if (c1) cleanups.push(c1);
+
+    const c2 = window.electronAPI.update?.onDownloadProgress((data) => {
+      setUpdatePercent(data.percent);
+    });
+    if (c2) cleanups.push(c2);
+
+    const c3 = window.electronAPI.update?.onUpdateDownloaded(() => {
+      setUpdateDownloaded(true);
+    });
+    if (c3) cleanups.push(c3);
+
+    return () => { cleanups.forEach(c => c()); };
+  }, []);
 
   // Auth state listener
   useEffect(() => {
@@ -222,8 +305,10 @@ function App() {
 
   // Keep a ref of profile IDs so the URL listener always has the latest
   const profileIdsRef = useRef<Set<string>>(new Set());
+  const profilesRef = useRef<Profile[]>([]);
   useEffect(() => {
     profileIdsRef.current = new Set(profiles.map(p => p.id));
+    profilesRef.current = profiles;
   }, [profiles]);
 
   // Listen for URL changes from main process and sync to Firestore
@@ -234,6 +319,43 @@ function App() {
     const unsubscribe = window.electronAPI.profiles.onUrlChanged((profileId, url) => {
       if (profileIdsRef.current.has(profileId)) {
         firestoreUpdateProfile(profileId, { lastUrl: url }).catch(() => {});
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Listen for profile:closed events → upload to cloud + release lock
+  useEffect(() => {
+    if (!user) return;
+    if (!window.electronAPI?.profileSync?.onProfileClosed) return;
+
+    const unsubscribe = window.electronAPI.profileSync.onProfileClosed(async (profileId) => {
+      const profile = profilesRef.current.find(p => p.id === profileId);
+      const profileName = profile?.name || profileId;
+
+      try {
+        setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
+
+        await uploadProfileToCloud(
+          profileId,
+          { uid: user.uid, email: user.email },
+          (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
+        );
+
+        setSyncProgress(null);
+        showToast(`"${profileName}" synchronis\u00e9`, 'success');
+      } catch (error) {
+        console.error('[ProfileSync] Upload failed:', error);
+        setSyncProgress(null);
+        showToast(`\u00c9chec sync "${profileName}"`, 'error');
+      }
+
+      // Release lock
+      try {
+        await releaseProfileLock(profileId);
+      } catch (error) {
+        console.error('[ProfileSync] Failed to release lock:', error);
       }
     });
 
@@ -300,6 +422,8 @@ function App() {
         browserType: profile.browserType,
         tags: profile.tags ? [...profile.tags] : [],
         notes: profile.notes,
+        status: profile.status,
+        preset: profile.preset,
         fingerprint: profile.fingerprint ? { ...profile.fingerprint } : {},
         folderId: profile.folderId,
         platform: profile.platform,
@@ -396,16 +520,64 @@ function App() {
 
   const handleLaunchProfile = async (profile: any) => {
     try {
-      // Get enabled extension paths to load in the browser
+      // Check if profile is locked by another user
+      if (user && isLockedByOther(profile, user.uid)) {
+        showToast(`Profil utilisé par ${profile.lockedByEmail || 'un autre utilisateur'} sur ${profile.lockedByDevice || 'un autre PC'}`, 'warning');
+        return;
+      }
+
+      // Acquire lock
+      if (user) {
+        await acquireProfileLock(profile.id, { uid: user.uid, email: user.email });
+      }
+
+      // Download from cloud if needed
+      try {
+        const needsDownload = await needsCloudDownload(profile);
+        if (needsDownload) {
+          setSyncProgress({ profileId: profile.id, percent: 0, type: 'download', profileName: profile.name });
+          showToast('Téléchargement du profil depuis le cloud...', 'info');
+          await downloadProfileFromCloud(
+            profile.id,
+            profile.cloudSyncVersion!,
+            (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
+          );
+          setSyncProgress(null);
+          showToast('Profil téléchargé', 'success');
+        }
+      } catch (dlError) {
+        console.error('Cloud download failed:', dlError);
+        setSyncProgress(null);
+        // Continue with local data if available, or show error
+        const hasLocal = await window.electronAPI?.profileSync?.hasLocalData(profile.id);
+        if (!hasLocal) {
+          showToast('Échec du téléchargement du profil', 'error');
+          await releaseProfileLock(profile.id).catch(() => {});
+          return;
+        }
+      }
+
+      // Get enabled extensions and auto-download missing ones from cloud
       let extensionPaths: string[] = [];
-      const enabledExtIds = extensions.filter(e => e.enabled).map(e => e.id);
-      if (enabledExtIds.length > 0 && window.electronAPI?.extensions?.getPaths) {
+      const enabledExts = extensions.filter(e => e.enabled);
+      const enabledExtIds = enabledExts.map(e => e.id);
+
+      if (enabledExtIds.length > 0 && window.electronAPI?.extensions) {
+        const localExts = await window.electronAPI.extensions.getAll();
+        const localIds = new Set(localExts.map((e: any) => e.id));
+        const missing = enabledExts.filter(e => !localIds.has(e.id) && e.storageUrl);
+        for (const ext of missing) {
+          try {
+            await window.electronAPI.extensions.downloadAndInstall(ext.id, ext.storageUrl!);
+          } catch (e) {
+            console.error(`Failed to download extension ${ext.name}:`, e);
+          }
+        }
         extensionPaths = await window.electronAPI.extensions.getPaths(enabledExtIds);
       }
 
       const result = await window.electronAPI.profiles.launch(profile.id, { ...profile, extensionPaths });
       if (result.success) {
-        // Update lastUsed in Firestore
         await firestoreUpdateProfile(profile.id, { lastUsed: new Date().toISOString() });
         showToast(`"${profile.name}" launched successfully`, 'success');
         if (user) {
@@ -421,11 +593,13 @@ function App() {
         } else {
           console.error('Launch failed:', result.error);
           showToast(`Launch failed: ${result.error}`, 'error');
+          await releaseProfileLock(profile.id).catch(() => {});
         }
       }
     } catch (error) {
       console.error('Failed to launch profile:', error);
       showToast('Failed to launch browser', 'error');
+      await releaseProfileLock(profile.id).catch(() => {});
     }
   };
 
@@ -512,7 +686,7 @@ function App() {
           />
         );
       case 'proxies':
-        return <ProxyManagerPage />;
+        return <ProxyManagerPage profiles={profiles} onUpdateProfile={handleUpdateProfile} userId={user?.uid} />;
       case 'extensions':
         return <ExtensionsPage />;
       case 'settings':
@@ -568,6 +742,7 @@ function App() {
       <div className="h-screen flex flex-col" style={{ background: 'var(--bg-base)' }}>
         <TitleBar />
         <BrowserDownloadNotification />
+        <ProfileSyncNotification syncProgress={syncProgress} onDismiss={() => setSyncProgress(null)} />
         <div className="flex-1 flex overflow-hidden">
           <Sidebar
             activePage={activePage}
@@ -584,6 +759,8 @@ function App() {
             onQuickCreate={() => setShowQuickCreateModal(true)}
             onMoveProfile={handleMoveProfile}
             onLogout={handleLogout}
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={toggleSidebar}
           />
           <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
             {renderPage()}
@@ -619,6 +796,10 @@ function App() {
             }
             folder={editingFolder || undefined}
           />
+        )}
+
+        {updateInfo && (
+          <ForceUpdateModal version={updateInfo.version} releaseNotes={updateInfo.releaseNotes} downloadPercent={updatePercent} downloaded={updateDownloaded} />
         )}
       </div>
     </AuthProvider>

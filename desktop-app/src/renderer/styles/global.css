@@ -162,3 +162,15 @@ select {
 [data-theme="light"] .modal-backdrop {
   background: rgba(0, 0, 0, 0.3);
 }
+
+/* Sidebar transition */
+aside {
+  transition: width 0.2s ease;
+}
+
+/* Modal responsiveness safety */
+@media (max-width: 1024px) {
+  .modal-backdrop > div {
+    max-width: 95vw !important;
+  }
+}

@@ -1,14 +1,17 @@
-import { app, BrowserWindow, ipcMain, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { autoUpdater } from 'electron-updater';
 import { Profile, Folder } from '../types';
 import { ChromeLauncher } from './chrome-launcher';
 import { PuppeteerLauncher } from './puppeteer-launcher';
 import { UrlTrackingServer } from './url-server';
 import ProxyManager from './proxy-manager';
 import NetworkManager from './network-manager';
-import { installExtension, getInstalledExtensions, removeExtension, getExtensionPaths } from './extension-manager';
+import { installExtension, getInstalledExtensions, removeExtension, getExtensionPaths, zipExtension, readZipFile, downloadAndInstallExtension } from './extension-manager';
+import { generateFingerprint } from './fingerprint-generator';
+import { zipProfileDir, unzipProfileDir, profileDirExists, getLocalSyncVersion, setLocalSyncVersion } from './profile-sync';
 
 const Store = require('electron-store');
 
@@ -104,8 +107,66 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
   }
 }
 
+function setupAutoUpdater() {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('update-available', (info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('app:update-available', {
+        version: info.version,
+        releaseNotes: typeof info.releaseNotes === 'string' ? info.releaseNotes : '',
+      });
+    }
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('app:update-progress', {
+        percent: Math.round(progress.percent),
+      });
+    }
+  });
+
+  autoUpdater.on('update-downloaded', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('app:update-downloaded');
+    }
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.error('Auto-update error:', err);
+  });
+
+  autoUpdater.checkForUpdates().catch((err) => {
+    console.error('Update check failed:', err);
+  });
+}
+
+// IPC handlers for update actions
+ipcMain.handle('app:startDownload', () => {
+  autoUpdater.downloadUpdate().catch(console.error);
+});
+
+ipcMain.handle('app:installUpdate', () => {
+  autoUpdater.quitAndInstall(false, true);
+});
+
+ipcMain.handle('app:openExternal', (_, url: string) => {
+  shell.openExternal(url);
+});
+
+ipcMain.handle('app:quit', () => {
+  app.quit();
+});
+
 app.whenReady().then(() => {
   createWindow();
+
+  // Check for updates after window loads
+  mainWindow?.webContents.once('did-finish-load', () => {
+    if (!isDev) setupAutoUpdater();
+  });
 
   // Give PuppeteerLauncher access to mainWindow for download progress events
   PuppeteerLauncher.setMainWindow(mainWindow);
@@ -239,45 +300,25 @@ ipcMain.handle('profile:cleanupLocal', (_, profileId: string) => {
   return true;
 });
 
-// New handlers for fingerprint generation
-ipcMain.handle('fingerprint:generate', () => {
-  // Return a simple mock fingerprint for now
-  return {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    timezone: 'America/New_York',
-    language: 'en-US',
-    screenResolution: '1920x1080',
-    hardwareConcurrency: 8,
-    deviceMemory: 8,
-    webglVendor: 'Google Inc.',
-    webglRenderer: 'ANGLE (Intel(R) HD Graphics Direct3D11 vs_5_0 ps_5_0)',
-  };
+// Fingerprint generation
+ipcMain.handle('fingerprint:generate', (_, os?: string, browserType?: string, countryCode?: string) => {
+  console.log(`[Fingerprint] Generate request: os=${os}, browser=${browserType}, country=${countryCode}`);
+  return generateFingerprint(os as any, browserType as any, countryCode);
 });
 
-ipcMain.handle('fingerprint:getPresets', async () => {
-  // Return mock presets for now
+ipcMain.handle('fingerprint:getPresets', () => {
   return [
     {
       name: 'Facebook Ads Manager',
       description: 'Optimized for Facebook advertising accounts',
       category: 'social-media',
-      fingerprint: {
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        timezone: 'America/New_York',
-        language: 'en-US',
-        screenResolution: '1920x1080',
-      }
+      fingerprint: generateFingerprint('windows'),
     },
     {
       name: 'Amazon Seller',
       description: 'Configured for Amazon seller account management',
       category: 'e-commerce',
-      fingerprint: {
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        timezone: 'America/Chicago',
-        language: 'en-US',
-        screenResolution: '1920x1080',
-      }
+      fingerprint: generateFingerprint('windows'),
     },
   ];
 });
@@ -306,10 +347,11 @@ const proxyManager = ProxyManager.getInstance();
 
 ipcMain.handle('proxy:test', async (_, proxyConfig) => {
   try {
-    return await proxyManager.testProxy(proxyConfig);
+    const isHealthy = await proxyManager.testProxy(proxyConfig);
+    return { isHealthy, country: proxyConfig.country || null };
   } catch (error: any) {
     console.error('Proxy test error:', error);
-    return false;
+    return { isHealthy: false, country: null };
   }
 });
 
@@ -346,6 +388,39 @@ ipcMain.handle('proxy:healthCheck', async () => {
 
 ipcMain.handle('proxy:getStats', (_, profileId) => {
   return proxyManager.getStats(profileId);
+});
+
+ipcMain.handle('proxy:autoAssign', (_, profiles) => {
+  return proxyManager.autoAssignProxies(profiles);
+});
+
+// Profile sync handlers
+ipcMain.handle('profile:zipForSync', async (_, profileId: string) => {
+  const result = await zipProfileDir(profileId);
+  return { buffer: Array.from(result.buffer), size: result.size };
+});
+
+ipcMain.handle('profile:unzipFromSync', async (_, profileId: string, zipData: number[]) => {
+  const buffer = Buffer.from(zipData);
+  await unzipProfileDir(profileId, buffer);
+  return true;
+});
+
+ipcMain.handle('profile:hasLocalData', (_, profileId: string) => {
+  return profileDirExists(profileId);
+});
+
+ipcMain.handle('profile:getLocalSyncVersion', (_, profileId: string) => {
+  return getLocalSyncVersion(profileId);
+});
+
+ipcMain.handle('profile:setLocalSyncVersion', (_, profileId: string, version: number) => {
+  setLocalSyncVersion(profileId, version);
+  return true;
+});
+
+ipcMain.handle('system:hostname', () => {
+  return os.hostname();
 });
 
 // Network handlers
@@ -418,12 +493,10 @@ ipcMain.handle('cookies:import', async (_, profileId: string, cookieData: string
 
 ipcMain.handle('cookies:export', async (_, profileId: string) => {
   try {
-    // Try to get cookies from active Puppeteer instance
-    const activeProfiles = PuppeteerLauncher.getActiveProfiles();
-    if (activeProfiles.includes(profileId)) {
-      // Profile is running - we'd need to get cookies from the browser
-      // For now, return empty as Puppeteer cookie extraction needs the page reference
-      return { success: true, cookies: [] };
+    // Extract cookies from running browser via CDP
+    if (PuppeteerLauncher.isProfileActive(profileId)) {
+      const cookies = await PuppeteerLauncher.getCookies(profileId);
+      return { success: true, cookies };
     }
     return { success: true, cookies: [] };
   } catch (error: any) {
@@ -502,4 +575,17 @@ ipcMain.handle('extensions:remove', (_, extensionId: string) => {
 
 ipcMain.handle('extensions:getPaths', (_, extensionIds: string[]) => {
   return getExtensionPaths(extensionIds);
+});
+
+ipcMain.handle('extensions:zip', (_, extensionId: string) => {
+  return zipExtension(extensionId);
+});
+
+ipcMain.handle('extensions:readZip', (_, zipPath: string) => {
+  return readZipFile(zipPath);
+});
+
+ipcMain.handle('extensions:downloadAndInstall', async (_, extensionId: string, url: string) => {
+  await downloadAndInstallExtension(extensionId, url);
+  return true;
 });

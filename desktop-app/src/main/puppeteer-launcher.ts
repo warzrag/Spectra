@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
+import { getCountryFromIP, overrideFingerprintGeo } from './fingerprint-generator';
 
 // Get the Chrome version this Puppeteer version supports
 const COMPATIBLE_CHROME_VERSION = (() => {
@@ -96,7 +97,7 @@ export class PuppeteerLauncher {
         fs.mkdirSync(cacheDir, { recursive: true });
       }
 
-      // Build Chrome args
+      // Build Chrome args — avoid detectable automation flags
       const args = [
         `--user-data-dir=${profilePath}`,
         `--disk-cache-dir=${cacheDir}`,
@@ -105,11 +106,9 @@ export class PuppeteerLauncher {
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--disable-popup-blocking',
-        '--disable-background-networking',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-breakpad',
@@ -120,19 +119,19 @@ export class PuppeteerLauncher {
         '--disable-ipc-flooding-protection',
         '--disable-renderer-backgrounding',
         '--disable-sync',
-        '--disable-web-security',
-        '--disable-site-isolation-trials',
-        '--disable-features=IsolateOrigins,site-per-process,Translate,AcceptCHFrame,MediaRouter,OptimizationHints,BlockInsecurePrivateNetworkRequests',
-        '--metrics-recording-only',
+        '--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints',
         '--force-color-profile=srgb',
         '--password-store=basic',
-        '--window-size=1200,800',
-        '--lang=fr-FR',
+        `--window-size=${options.fingerprint?.screenWidth || 1200},${options.fingerprint?.screenHeight || 800}`,
+        `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
       ];
 
-      // Proxy
+      // Proxy + DNS leak prevention
       if (proxy && proxy.host) {
         args.push(`--proxy-server=${proxy.type || 'http'}://${proxy.host}:${proxy.port}`);
+        // Force DNS resolution through proxy — prevent local DNS leaks
+        args.push(`--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE ${proxy.host}`);
+        args.push('--disable-dns-prefetch');
       }
 
       // Load extensions via --load-extension flag (like AdsPower/GoLogin)
@@ -151,7 +150,7 @@ export class PuppeteerLauncher {
       }
 
       // Set user agent and start URL as Chrome args (avoids Puppeteer viewport emulation)
-      const userAgent = options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+      const userAgent = options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36';
       args.push(`--user-agent=${userAgent}`);
 
       // Determine start URL
@@ -169,9 +168,9 @@ export class PuppeteerLauncher {
         }
       }
 
-      // Pass URL as Chrome arg — Chrome opens it natively, no Puppeteer viewport emulation
-      args.push(startUrl);
-      console.log(`Start URL: ${startUrl}`);
+      // Don't pass startUrl as Chrome arg — we navigate AFTER proxy auth is configured
+      // This prevents the proxy auth popup race condition
+      console.log(`Start URL (will navigate after auth setup): ${startUrl}`);
 
       // Get portable Chrome (downloads on first use)
       const chromePath = await this.getPortableChrome();
@@ -204,6 +203,110 @@ export class PuppeteerLauncher {
       const pages = await browser.pages();
       const page = pages.length > 1 ? pages[1] : pages[0];
 
+      // Handle proxy authentication BEFORE navigation (prevents auth popup)
+      if (proxy && proxy.username && proxy.password) {
+        for (const p of pages) {
+          await p.authenticate({ username: proxy.username, password: proxy.password });
+        }
+
+        // Also handle auth for new tabs
+        browser.on('targetcreated', async (target) => {
+          if (target.type() === 'page') {
+            try {
+              const newPage = await target.page();
+              if (newPage) {
+                await newPage.authenticate({ username: proxy.username, password: proxy.password });
+              }
+            } catch {}
+          }
+        });
+        console.log('[ProxyAuth] Proxy authentication configured');
+      }
+
+      // Auto-detect proxy country and override fingerprint timezone/language
+      let fp = options.fingerprint || {};
+      if (proxy && proxy.host) {
+        try {
+          const country = await getCountryFromIP(proxy.host, proxy.port, proxy.type);
+          if (country) {
+            console.log(`[GeoIP] Proxy country detected: ${country}`);
+            fp = overrideFingerprintGeo(fp, country);
+          }
+        } catch (e) {
+          console.warn('[GeoIP] Failed to detect proxy country:', e);
+        }
+      }
+
+      // Extract Chrome version from user agent for Sec-CH-UA consistency
+      const chromeVersionMatch = userAgent.match(/Chrome\/(\d+)\.\d+\.\d+\.\d+/);
+      const majorVersion = chromeVersionMatch ? chromeVersionMatch[1] : '140';
+      const fullVersion = chromeVersionMatch ? chromeVersionMatch[0].replace('Chrome/', '') : '140.0.0.0';
+
+      // Build Sec-CH-UA metadata to match the spoofed user agent
+      const uaMetadata = {
+        brands: [
+          { brand: 'Chromium', version: majorVersion },
+          { brand: 'Google Chrome', version: majorVersion },
+          { brand: 'Not)A;Brand', version: '99' },
+        ],
+        fullVersionList: [
+          { brand: 'Chromium', version: fullVersion },
+          { brand: 'Google Chrome', version: fullVersion },
+          { brand: 'Not)A;Brand', version: '99.0.0.0' },
+        ],
+        fullVersion: fullVersion,
+        platform: fp.platform === 'MacIntel' ? 'macOS' : fp.platform === 'Linux x86_64' ? 'Linux' : 'Windows',
+        platformVersion: fp.platform === 'MacIntel' ? '10.15.7' : fp.platform === 'Linux x86_64' ? '6.5.0' : '15.0.0',
+        architecture: 'x86',
+        bitness: '64',
+        model: '',
+        mobile: false,
+        wow64: false,
+      };
+
+      // Inject dynamic stealth/fingerprint script via CDP
+      const stealthScript = buildStealthScript(fp);
+
+      // Helper: apply all CDP overrides to a page
+      const applyStealthToPage = async (p: any) => {
+        try {
+          const cdp = await p.createCDPSession();
+          // Override User-Agent + Sec-CH-UA headers at network level
+          await cdp.send('Network.setUserAgentOverride', {
+            userAgent: userAgent,
+            acceptLanguage: fp.language || 'en-US',
+            platform: fp.platform || 'Win32',
+            userAgentMetadata: uaMetadata,
+          });
+          await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: stealthScript });
+          if (fp.timezone) {
+            await cdp.send('Emulation.setTimezoneOverride', { timezoneId: fp.timezone });
+          }
+          await cdp.detach();
+        } catch (e) {
+          console.error('Failed to inject stealth into page:', e);
+        }
+      };
+
+      // Inject into all existing pages
+      for (const p of pages) {
+        await applyStealthToPage(p);
+      }
+
+      // Inject into new tabs/pages
+      browser.on('targetcreated', async (target) => {
+        if (target.type() === 'page') {
+          try {
+            const newPage = await target.page();
+            if (newPage) {
+              await applyStealthToPage(newPage);
+            }
+          } catch (e) { /* Page may have closed */ }
+        }
+      });
+
+      console.log(`[Stealth] Sec-CH-UA configured: Chrome/${majorVersion}, platform: ${uaMetadata.platform}`);
+
       // Load pending cookies via CDP (no page-level API to avoid viewport emulation)
       const pendingCookiesPath = path.join(profilePath, 'pending_cookies.json');
       if (fs.existsSync(pendingCookiesPath)) {
@@ -231,6 +334,14 @@ export class PuppeteerLauncher {
         }
       }
 
+      // Navigate to start URL AFTER proxy auth + stealth are configured
+      try {
+        await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        console.log(`[Navigation] Navigated to: ${startUrl}`);
+      } catch (e) {
+        console.error('[Navigation] Failed to navigate to start URL:', e);
+      }
+
       // Store browser instance
       this.activeProfiles.set(options.profileId, { browser, page });
 
@@ -238,6 +349,11 @@ export class PuppeteerLauncher {
       browser.on('disconnected', () => {
         this.activeProfiles.delete(options.profileId);
         console.log(`Browser closed for profile: ${options.profileId}`);
+        // Notify renderer for cloud sync upload
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('profiles:activeUpdate', Array.from(this.activeProfiles.keys()));
+          this.mainWindow.webContents.send('profile:closed', options.profileId);
+        }
       });
 
       // Save URL on navigation
@@ -366,4 +482,343 @@ export class PuppeteerLauncher {
   static getActiveProfiles(): string[] {
     return Array.from(this.activeProfiles.keys());
   }
+
+  static async getCookies(profileId: string): Promise<any[]> {
+    const instance = this.activeProfiles.get(profileId);
+    if (!instance || !instance.page) return [];
+
+    try {
+      const cdp = await instance.page.createCDPSession();
+      const result = await cdp.send('Network.getAllCookies');
+      await cdp.detach();
+      return result.cookies || [];
+    } catch (e) {
+      console.error('Failed to extract cookies:', e);
+      return [];
+    }
+  }
+}
+
+function buildStealthScript(fp: any): string {
+  const screenWidth = fp.screenWidth || 1920;
+  const screenHeight = fp.screenHeight || 1080;
+  const availWidth = fp.availWidth || screenWidth;
+  const availHeight = fp.availHeight || screenHeight - 40;
+  const colorDepth = fp.colorDepth || 24;
+  const pixelDepth = fp.pixelDepth || 24;
+  const devicePixelRatio = fp.devicePixelRatio || 1;
+  const hardwareConcurrency = fp.hardwareConcurrency || 8;
+  const deviceMemory = fp.deviceMemory || 8;
+  const maxTouchPoints = fp.maxTouchPoints || 0;
+  const webglVendor = JSON.stringify(fp.webglVendor || 'Google Inc. (Intel)');
+  const webglRenderer = JSON.stringify(fp.webglRenderer || 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)');
+  const languages = JSON.stringify(fp.languages || ['en-US', 'en']);
+  const language = JSON.stringify(fp.language || 'en-US');
+  const platform = JSON.stringify(fp.platform || 'Win32');
+  const vendor = JSON.stringify(fp.vendor || 'Google Inc.');
+  const timezoneOffset = fp.timezoneOffset ?? 300;
+  const timezone = JSON.stringify(fp.timezone || 'America/New_York');
+  const canvasNoiseSeed = fp.canvasNoiseSeed || Math.floor(Math.random() * 999999999) + 1;
+  const audioNoiseSeed = fp.audioNoiseSeed || Math.floor(Math.random() * 999999999) + 1;
+  const doNotTrack = fp.doNotTrack === true;
+  const webrtcMode = fp.webrtcMode || 'disabled';
+  const canvasNoise = fp.canvasNoise !== false;
+  const audioNoise = fp.audioNoise !== false;
+  const fonts = JSON.stringify(fp.fonts || []);
+
+  return `(function() {
+  'use strict';
+
+  // --- Navigator overrides ---
+  Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${hardwareConcurrency}, configurable: true });
+  Object.defineProperty(navigator, 'deviceMemory', { get: () => ${deviceMemory}, configurable: true });
+  Object.defineProperty(navigator, 'maxTouchPoints', { get: () => ${maxTouchPoints}, configurable: true });
+  Object.defineProperty(navigator, 'languages', { get: () => ${languages}, configurable: true });
+  Object.defineProperty(navigator, 'language', { get: () => ${language}, configurable: true });
+  Object.defineProperty(navigator, 'platform', { get: () => ${platform}, configurable: true });
+  Object.defineProperty(navigator, 'vendor', { get: () => ${vendor}, configurable: true });
+  ${doNotTrack ? `Object.defineProperty(navigator, 'doNotTrack', { get: () => '1', configurable: true });` : ''}
+
+  // --- Screen overrides ---
+  Object.defineProperty(screen, 'width', { get: () => ${screenWidth}, configurable: true });
+  Object.defineProperty(screen, 'height', { get: () => ${screenHeight}, configurable: true });
+  Object.defineProperty(screen, 'availWidth', { get: () => ${availWidth}, configurable: true });
+  Object.defineProperty(screen, 'availHeight', { get: () => ${availHeight}, configurable: true });
+  Object.defineProperty(screen, 'colorDepth', { get: () => ${colorDepth}, configurable: true });
+  Object.defineProperty(screen, 'pixelDepth', { get: () => ${pixelDepth}, configurable: true });
+  Object.defineProperty(window, 'devicePixelRatio', { get: () => ${devicePixelRatio}, configurable: true });
+
+  // --- Timezone ---
+  Date.prototype.getTimezoneOffset = function() { return ${timezoneOffset}; };
+  var origResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+  Intl.DateTimeFormat.prototype.resolvedOptions = function() {
+    var result = origResolvedOptions.call(this);
+    result.timeZone = ${timezone};
+    return result;
+  };
+
+  // --- WebGL spoofing (WebGL1 + WebGL2) — vendor, renderer + extended params ---
+  (function() {
+    // Seeded values for consistent extended WebGL params per profile
+    var seed = ${canvasNoiseSeed};
+    var paramOverrides = {
+      3379: 4096 + (seed % 4) * 4096,       // MAX_TEXTURE_SIZE (4096-16384)
+      3386: 16 + (seed % 8),                 // MAX_VERTEX_ATTRIBS (16-23)
+      3413: 4 + (seed % 5),                  // MAX_TEXTURE_IMAGE_UNITS (4-8)
+      34076: 8192 + (seed % 3) * 4096,       // MAX_RENDERBUFFER_SIZE (8192-16384)
+      34024: 16 + (seed % 8),                // MAX_VERTEX_TEXTURE_IMAGE_UNITS (16-23)
+      34930: 16 + (seed % 16),               // MAX_COMBINED_TEXTURE_IMAGE_UNITS (16-31)
+      36349: 256 + (seed % 256),             // MAX_VERTEX_UNIFORM_COMPONENTS (256-511)
+      36347: 256 + (seed % 256),             // MAX_FRAGMENT_UNIFORM_COMPONENTS (256-511)
+      7936: ${webglVendor},                  // VENDOR
+      7937: ${webglRenderer},                // RENDERER
+    };
+    function spoofWebGL(proto) {
+      var origGetParameter = proto.getParameter;
+      proto.getParameter = function(param) {
+        if (param === 37445) return ${webglVendor};
+        if (param === 37446) return ${webglRenderer};
+        if (paramOverrides.hasOwnProperty(param)) return paramOverrides[param];
+        return origGetParameter.call(this, param);
+      };
+    }
+    spoofWebGL(WebGLRenderingContext.prototype);
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+      spoofWebGL(WebGL2RenderingContext.prototype);
+    }
+  })();
+
+  // --- Canvas noise (seeded PRNG) — covers toDataURL, toBlob AND getImageData ---
+  ${canvasNoise ? `
+  (function() {
+    var seed = ${canvasNoiseSeed};
+    function mulberry32(a) {
+      return function() {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        var t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    var rng = mulberry32(seed);
+    function addNoise(imageData) {
+      for (var i = 0; i < imageData.data.length; i += 4) {
+        imageData.data[i] = imageData.data[i] ^ (rng() < 0.1 ? 1 : 0);
+      }
+      return imageData;
+    }
+    // Hook getImageData — primary fingerprinting vector
+    var origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function(sx, sy, sw, sh) {
+      var imageData = origGetImageData.call(this, sx, sy, sw, sh);
+      try { addNoise(imageData); } catch(e) {}
+      return imageData;
+    };
+    // Hook toDataURL
+    var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+      try {
+        var ctx = this.getContext('2d');
+        if (ctx && this.width > 0 && this.height > 0) {
+          var w = Math.min(this.width, 16);
+          var h = Math.min(this.height, 16);
+          var id = origGetImageData.call(ctx, 0, 0, w, h);
+          addNoise(id);
+          ctx.putImageData(id, 0, 0);
+        }
+      } catch(e) {}
+      return origToDataURL.call(this, type, quality);
+    };
+    // Hook toBlob
+    var origToBlob = HTMLCanvasElement.prototype.toBlob;
+    HTMLCanvasElement.prototype.toBlob = function(callback, type, quality) {
+      try {
+        var ctx = this.getContext('2d');
+        if (ctx && this.width > 0 && this.height > 0) {
+          var w = Math.min(this.width, 16);
+          var h = Math.min(this.height, 16);
+          var id = origGetImageData.call(ctx, 0, 0, w, h);
+          addNoise(id);
+          ctx.putImageData(id, 0, 0);
+        }
+      } catch(e) {}
+      return origToBlob.call(this, callback, type, quality);
+    };
+  })();
+  ` : ''}
+
+  // --- Audio noise (seeded PRNG) — covers AnalyserNode + AudioBuffer (oscillator/compressor pattern) ---
+  ${audioNoise ? `
+  (function() {
+    var seed = ${audioNoiseSeed};
+    function mulberry32(a) {
+      return function() {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        var t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    var rng = mulberry32(seed);
+    // AnalyserNode — getFloatFrequencyData + getFloatTimeDomainData
+    if (typeof AnalyserNode !== 'undefined') {
+      var origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
+      AnalyserNode.prototype.getFloatFrequencyData = function(array) {
+        origGetFloatFreq.call(this, array);
+        for (var i = 0; i < array.length; i++) {
+          array[i] = array[i] + (rng() * 0.1 - 0.05);
+        }
+      };
+      var origGetFloatTime = AnalyserNode.prototype.getFloatTimeDomainData;
+      AnalyserNode.prototype.getFloatTimeDomainData = function(array) {
+        origGetFloatTime.call(this, array);
+        for (var i = 0; i < array.length; i++) {
+          array[i] = array[i] + (rng() * 0.001 - 0.0005);
+        }
+      };
+    }
+    // AudioBuffer.getChannelData — used by oscillator+compressor fingerprinting
+    if (typeof AudioBuffer !== 'undefined') {
+      var origGetChannelData = AudioBuffer.prototype.getChannelData;
+      AudioBuffer.prototype.getChannelData = function(channel) {
+        var data = origGetChannelData.call(this, channel);
+        for (var i = 0; i < data.length; i++) {
+          data[i] = data[i] + (rng() * 0.0001 - 0.00005);
+        }
+        return data;
+      };
+    }
+  })();
+  ` : ''}
+
+  // --- WebRTC leak prevention ---
+  ${webrtcMode === 'disabled' ? `
+  (function() {
+    // Block all WebRTC interfaces to prevent IP leaks
+    Object.defineProperty(window, 'RTCPeerConnection', { value: undefined, configurable: true, writable: true });
+    Object.defineProperty(window, 'webkitRTCPeerConnection', { value: undefined, configurable: true, writable: true });
+    Object.defineProperty(window, 'RTCDataChannel', { value: undefined, configurable: true, writable: true });
+    Object.defineProperty(window, 'RTCSessionDescription', { value: undefined, configurable: true, writable: true });
+    Object.defineProperty(window, 'RTCIceCandidate', { value: undefined, configurable: true, writable: true });
+    // Block media device enumeration (prevents device ID fingerprinting)
+    if (navigator.mediaDevices) {
+      navigator.mediaDevices.enumerateDevices = function() {
+        return Promise.resolve([]);
+      };
+    }
+  })();
+  ` : ''}
+
+  // --- Permissions API ---
+  var origQuery = navigator.permissions.query;
+  navigator.permissions.query = function(params) {
+    if (params.name === 'notifications') {
+      return Promise.resolve({ state: Notification.permission });
+    }
+    return origQuery(params);
+  };
+
+  // --- Plugins mock (Chrome 120+ removed Native Client) ---
+  Object.defineProperty(navigator, 'plugins', {
+    get: function() {
+      return [
+        { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+        { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+        { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+        { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+        { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+      ];
+    },
+    configurable: true
+  });
+
+  // --- Battery API ---
+  if (navigator.getBattery) {
+    navigator.getBattery = function() {
+      return Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1.0 });
+    };
+  }
+
+  // --- Connection API ---
+  if (navigator.connection) {
+    Object.defineProperties(navigator.connection, {
+      effectiveType: { get: function() { return '4g'; }, configurable: true },
+      rtt: { get: function() { return 50; }, configurable: true },
+      downlink: { get: function() { return 10; }, configurable: true },
+    });
+  }
+
+  // --- ClientRects / DOMRect noise (seeded) ---
+  (function() {
+    var seed = ${canvasNoiseSeed} + 7;
+    function mulberry32(a) {
+      return function() {
+        a |= 0; a = a + 0x6D2B79F5 | 0;
+        var t = Math.imul(a ^ a >>> 15, 1 | a);
+        t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+        return ((t ^ t >>> 14) >>> 0) / 4294967296;
+      };
+    }
+    var rng = mulberry32(seed);
+    function noiseRect(rect) {
+      var n = (rng() - 0.5) * 0.25;
+      return new DOMRect(rect.x + n, rect.y + n, rect.width + n, rect.height + n);
+    }
+    var origGetBCR = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function() {
+      var rect = origGetBCR.call(this);
+      return noiseRect(rect);
+    };
+    var origGetCR = Element.prototype.getClientRects;
+    Element.prototype.getClientRects = function() {
+      var rects = origGetCR.call(this);
+      var result = [];
+      for (var i = 0; i < rects.length; i++) {
+        result.push(noiseRect(rects[i]));
+      }
+      return result;
+    };
+    if (typeof Range !== 'undefined') {
+      var origRangeGetBCR = Range.prototype.getBoundingClientRect;
+      Range.prototype.getBoundingClientRect = function() {
+        var rect = origRangeGetBCR.call(this);
+        return noiseRect(rect);
+      };
+      var origRangeGetCR = Range.prototype.getClientRects;
+      Range.prototype.getClientRects = function() {
+        var rects = origRangeGetCR.call(this);
+        var result = [];
+        for (var i = 0; i < rects.length; i++) {
+          result.push(noiseRect(rects[i]));
+        }
+        return result;
+      };
+    }
+  })();
+
+  // --- Font enumeration spoofing ---
+  (function() {
+    var allowedFonts = ${fonts};
+    if (allowedFonts.length > 0 && document.fonts && document.fonts.check) {
+      var origCheck = document.fonts.check.bind(document.fonts);
+      document.fonts.check = function(font, text) {
+        // Extract font family name from CSS font shorthand (e.g. "12px Arial")
+        var parts = font.split(/\\s+/);
+        var family = parts.slice(1).join(' ').replace(/['"]/g, '').trim();
+        if (!family) family = parts[0].replace(/['"]/g, '').trim();
+        // If font is not in our allowed list, report it as unavailable
+        var isAllowed = allowedFonts.some(function(f) {
+          return f.toLowerCase() === family.toLowerCase();
+        });
+        if (!isAllowed) return false;
+        return origCheck(font, text);
+      };
+    }
+  })();
+
+  // --- Chrome runtime mock ---
+  if (!window.chrome) window.chrome = {};
+  window.chrome.runtime = window.chrome.runtime || {};
+})();`;
 }

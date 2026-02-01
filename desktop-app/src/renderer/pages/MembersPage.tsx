@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { UsersRound, UserPlus, Shield, Eye, MoreVertical, Mail, Calendar, Trash2 } from 'lucide-react';
+import { UsersRound, UserPlus, Shield, Eye, MoreVertical, Mail, Calendar, Trash2, Crown } from 'lucide-react';
 import { collection, getDocs, doc, updateDoc, deleteDoc } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuth } from '../contexts/AuthContext';
@@ -42,13 +42,23 @@ const MembersPage: React.FC = () => {
     }
   };
 
+  const currentUserRole = members.find(m => m.uid === user?.uid)?.role;
+
   const handleRoleChange = async (memberId: string, newRole: UserRole) => {
+    const target = members.find(m => m.uid === memberId);
+    if (target?.role === 'owner') {
+      showToast('Cannot change the Owner role', 'error');
+      return;
+    }
+    if (currentUserRole !== 'owner' && currentUserRole !== 'admin') {
+      showToast('Only Owner and Admins can change roles', 'error');
+      return;
+    }
     try {
       await updateDoc(doc(db, 'users', memberId), { role: newRole });
       setMembers(prev => prev.map(m => m.uid === memberId ? { ...m, role: newRole } : m));
       setMenuOpenId(null);
-      const member = members.find(m => m.uid === memberId);
-      showToast(`${member?.email || 'Member'} is now ${newRole === 'admin' ? 'Admin' : 'VA'}`, 'success');
+      showToast(`${target?.email || 'Member'} is now ${newRole === 'admin' ? 'Admin' : 'VA'}`, 'success');
     } catch (e) {
       console.error('Error updating role:', e);
       showToast('Failed to update role', 'error');
@@ -56,13 +66,21 @@ const MembersPage: React.FC = () => {
   };
 
   const handleRemoveMember = async (memberId: string) => {
+    const target = members.find(m => m.uid === memberId);
+    if (target?.role === 'owner') {
+      showToast('Cannot remove the Owner', 'error');
+      return;
+    }
+    if (currentUserRole !== 'owner' && currentUserRole !== 'admin') {
+      showToast('Only Owner and Admins can remove members', 'error');
+      return;
+    }
     if (!window.confirm('Remove this member? They will lose access.')) return;
     try {
-      const member = members.find(m => m.uid === memberId);
       await deleteDoc(doc(db, 'users', memberId));
       setMembers(prev => prev.filter(m => m.uid !== memberId));
       setMenuOpenId(null);
-      showToast(`${member?.email || 'Member'} removed`, 'success');
+      showToast(`${target?.email || 'Member'} removed`, 'success');
     } catch (e) {
       console.error('Error removing member:', e);
       showToast('Failed to remove member', 'error');
@@ -80,7 +98,7 @@ const MembersPage: React.FC = () => {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="max-w-3xl mx-auto p-6 space-y-6">
+      <div className="max-w-3xl xl:max-w-4xl mx-auto p-6 space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>
@@ -100,7 +118,7 @@ const MembersPage: React.FC = () => {
         </div>
 
         {/* Stats */}
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           <div className="rounded-xl p-4" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }}>
             <div className="flex items-center gap-2 mb-1">
               <UsersRound size={16} style={{ color: 'var(--accent)' }} />
@@ -126,9 +144,9 @@ const MembersPage: React.FC = () => {
 
         {/* Members Table */}
         <section>
-          <div className="rounded-xl overflow-hidden" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }}>
+          <div className="rounded-xl overflow-hidden overflow-x-auto" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }}>
             {/* Table Header */}
-            <div className="grid grid-cols-[1fr_120px_120px_60px] px-5 py-3 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
+            <div className="grid grid-cols-[1fr_120px_120px_60px] min-w-[480px] px-5 py-3 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
               <span>Member</span>
               <span>Role</span>
               <span>Joined</span>
@@ -144,7 +162,7 @@ const MembersPage: React.FC = () => {
             {!loading && members.map((member) => (
               <div
                 key={member.uid}
-                className="grid grid-cols-[1fr_120px_120px_60px] px-5 py-3 items-center transition-colors"
+                className="grid grid-cols-[1fr_120px_120px_60px] min-w-[480px] px-5 py-3 items-center transition-colors"
                 style={{ borderBottom: '1px solid var(--border-subtle)' }}
                 onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
                 onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
@@ -174,10 +192,10 @@ const MembersPage: React.FC = () => {
                 <div>
                   <span className="text-[11px] px-2.5 py-1 rounded-full font-semibold uppercase"
                     style={{
-                      background: member.role === 'admin' ? 'var(--accent-subtle)' : 'rgba(16, 185, 129, 0.1)',
-                      color: member.role === 'admin' ? 'var(--accent-light)' : 'var(--success)',
+                      background: member.role === 'owner' ? 'rgba(245, 158, 11, 0.1)' : member.role === 'admin' ? 'var(--accent-subtle)' : 'rgba(16, 185, 129, 0.1)',
+                      color: member.role === 'owner' ? '#f59e0b' : member.role === 'admin' ? 'var(--accent-light)' : 'var(--success)',
                     }}>
-                    {member.role === 'admin' ? 'Admin' : 'VA'}
+                    {member.role === 'owner' ? 'Owner' : member.role === 'admin' ? 'Admin' : 'VA'}
                   </span>
                 </div>
 
@@ -189,7 +207,7 @@ const MembersPage: React.FC = () => {
 
                 {/* Actions */}
                 <div className="relative">
-                  {member.uid !== user?.uid && (
+                  {member.uid !== user?.uid && member.role !== 'owner' && (
                     <>
                       <button
                         onClick={() => setMenuOpenId(menuOpenId === member.uid ? null : member.uid)}

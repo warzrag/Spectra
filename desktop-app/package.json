@@ -1,6 +1,6 @@
 {
   "name": "spectra",
-  "version": "1.0.0",
+  "version": "1.4.5",
   "description": "Spectra - Multi-profile browser management",
   "main": "dist/src/main/main.js",
   "scripts": {
@@ -52,6 +52,7 @@
     "autoprefixer": "^10.4.21",
     "axios": "^1.11.0",
     "electron-store": "^8.1.0",
+    "electron-updater": "^6.7.3",
     "firebase": "^12.8.0",
     "lucide-react": "^0.542.0",
     "postcss": "^8.5.6",
@@ -61,6 +62,7 @@
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-router-dom": "^7.8.2",
+    "socks-proxy-agent": "^8.0.5",
     "sqlite3": "^5.1.7",
     "tailwindcss": "^3.4.0"
   }

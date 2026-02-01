@@ -77,7 +77,7 @@ const ActivityLogPage: React.FC = () => {
       </div>
 
       {/* Filters */}
-      <div className="px-6 py-3 flex items-center gap-3" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+      <div className="px-6 py-3 flex items-center gap-3 flex-wrap" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
         <Filter size={14} style={{ color: 'var(--text-muted)' }} />
         <select value={filterUser} onChange={e => setFilterUser(e.target.value)}
           className="px-3 py-1.5 rounded-lg text-[12px]"
@@ -96,7 +96,7 @@ const ActivityLogPage: React.FC = () => {
       </div>
 
       {/* Table */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto overflow-x-auto">
         {loading ? (
           <div className="flex items-center justify-center h-40">
             <Loader2 size={24} className="animate-spin" style={{ color: 'var(--text-muted)' }} />
@@ -107,7 +107,7 @@ const ActivityLogPage: React.FC = () => {
             <p className="text-[13px]" style={{ color: 'var(--text-muted)' }}>No activity logged yet</p>
           </div>
         ) : (
-          <table className="w-full">
+          <table className="w-full min-w-[600px]">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
                 <th className="text-left px-6 py-2.5 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Time</th>

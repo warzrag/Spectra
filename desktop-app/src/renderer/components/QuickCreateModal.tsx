@@ -30,9 +30,9 @@ const QuickCreateModal: React.FC<QuickCreateModalProps> = ({ onClose, onCreate, 
   };
 
   const userAgents: Record<string, string> = {
-    chrome: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    firefox: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
-    edge: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+    chrome: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36',
+    firefox: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
+    edge: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36 Edg/140.0.0.0',
   };
 
   const platformUrls: Record<string, string> = {
@@ -52,7 +52,7 @@ const QuickCreateModal: React.FC<QuickCreateModalProps> = ({ onClose, onCreate, 
       let fingerprint: any = {};
       if (generateFingerprints && window.electronAPI?.fingerprint) {
         try {
-          fingerprint = await window.electronAPI.fingerprint.generate();
+          fingerprint = await window.electronAPI.fingerprint.generate(os, browserType);
         } catch {}
       }
 
@@ -85,7 +85,7 @@ const QuickCreateModal: React.FC<QuickCreateModalProps> = ({ onClose, onCreate, 
 
   return (
     <div className="fixed inset-0 flex items-center justify-center z-50 modal-backdrop non-draggable" onClick={(e) => { if (e.target === e.currentTarget && !creating) onClose(); }}>
-      <div className="rounded-xl w-full max-w-md overflow-hidden shadow-2xl" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }} onClick={e => e.stopPropagation()}>
+      <div className="rounded-xl w-full max-w-[95vw] sm:max-w-md overflow-hidden shadow-2xl" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }} onClick={e => e.stopPropagation()}>
 
         {/* Header */}
         <div className="px-6 py-4 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-subtle)' }}>

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle } from 'lucide-react';
+import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Extension } from '../../types';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { storage } from '../services/firebase';
 import {
   subscribeToExtensions,
   registerExtension,
@@ -25,22 +27,52 @@ const ExtensionsPage: React.FC = () => {
     return () => unsub();
   }, []);
 
-  // Check which extensions are installed locally
+  // Check which extensions are installed locally + auto-download missing ones
   useEffect(() => {
     if (!window.electronAPI?.extensions?.getAll) return;
-    window.electronAPI.extensions.getAll().then((localExts: any[]) => {
-      setLocalInstalled(new Set(localExts.map((e: any) => e.id)));
-    }).catch(console.error);
+
+    const syncExtensions = async () => {
+      const localExts = await window.electronAPI.extensions!.getAll();
+      const localIds = new Set(localExts.map((e: any) => e.id));
+
+      // Auto-download missing extensions from cloud
+      const missing = extensions.filter(e => !localIds.has(e.id) && e.storageUrl);
+      for (const ext of missing) {
+        try {
+          await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl!);
+          localIds.add(ext.id);
+        } catch (e) {
+          console.error(`Failed to download extension ${ext.name}:`, e);
+        }
+      }
+
+      setLocalInstalled(localIds);
+    };
+
+    syncExtensions().catch(console.error);
   }, [extensions]);
 
   const doInstall = async (pathToInstall: string) => {
-    const result = await window.electronAPI.extensions.install(pathToInstall);
+    const result = await window.electronAPI.extensions!.install(pathToInstall);
     if (!result.success) {
       showToast(`Failed to install extension: ${result.error}`, 'error');
       return;
     }
 
     const ext = result.extension;
+
+    // Upload to Firebase Storage for cloud sync
+    let storageUrl: string | undefined;
+    try {
+      const zipPath = await window.electronAPI.extensions!.zip(ext.id);
+      const zipBuffer = await window.electronAPI.extensions!.readZip(zipPath);
+      const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+      await uploadBytes(storageRef, new Uint8Array(zipBuffer));
+      storageUrl = await getDownloadURL(storageRef);
+    } catch (e) {
+      console.error('Failed to upload extension to cloud:', e);
+    }
+
     await registerExtension({
       id: ext.id,
       name: ext.name,
@@ -48,6 +80,7 @@ const ExtensionsPage: React.FC = () => {
       description: ext.description,
       enabled: true,
       localPath: ext.localPath,
+      storageUrl,
       createdAt: new Date().toISOString(),
     });
   };

@@ -175,3 +175,88 @@ export function getExtensionPaths(extensionIds: string[]): string[] {
     .map(id => path.join(EXTENSIONS_DIR, id))
     .filter(p => fs.existsSync(p) && fs.existsSync(path.join(p, 'manifest.json')));
 }
+
+export function zipExtension(extensionId: string): string {
+  const extDir = path.join(EXTENSIONS_DIR, extensionId);
+  if (!fs.existsSync(extDir)) throw new Error(`Extension ${extensionId} not found locally`);
+
+  const zipPath = path.join(EXTENSIONS_DIR, `${extensionId}.zip`);
+  const zip = new AdmZip();
+  zip.addLocalFolder(extDir);
+  zip.writeZip(zipPath);
+  return zipPath;
+}
+
+export function readZipFile(zipPath: string): Buffer {
+  return fs.readFileSync(zipPath);
+}
+
+export function downloadAndInstallExtension(extensionId: string, url: string): Promise<void> {
+  ensureExtensionsDir();
+  const extDir = path.join(EXTENSIONS_DIR, extensionId);
+
+  // Already installed
+  if (fs.existsSync(extDir) && fs.existsSync(path.join(extDir, 'manifest.json'))) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const https = require('https');
+    const http = require('http');
+    const client = url.startsWith('https') ? https : http;
+
+    const doRequest = (requestUrl: string) => {
+      client.get(requestUrl, (res: any) => {
+        // Follow redirects
+        if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
+          doRequest(res.headers.location);
+          return;
+        }
+
+        if (res.statusCode !== 200) {
+          reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          try {
+            const zipBuffer = Buffer.concat(chunks);
+            fs.mkdirSync(extDir, { recursive: true });
+
+            const zip = new AdmZip(zipBuffer);
+            zip.extractAllTo(extDir, true);
+
+            // Check for subfolder pattern
+            const entries = fs.readdirSync(extDir);
+            if (entries.length === 1) {
+              const subDir = path.join(extDir, entries[0]);
+              if (fs.statSync(subDir).isDirectory() && fs.existsSync(path.join(subDir, 'manifest.json'))) {
+                const subEntries = fs.readdirSync(subDir);
+                for (const entry of subEntries) {
+                  fs.renameSync(path.join(subDir, entry), path.join(extDir, entry));
+                }
+                fs.rmdirSync(subDir);
+              }
+            }
+
+            if (!fs.existsSync(path.join(extDir, 'manifest.json'))) {
+              fs.rmSync(extDir, { recursive: true, force: true });
+              reject(new Error('Downloaded extension has no manifest.json'));
+              return;
+            }
+
+            resolve();
+          } catch (e) {
+            if (fs.existsSync(extDir)) fs.rmSync(extDir, { recursive: true, force: true });
+            reject(e);
+          }
+        });
+        res.on('error', reject);
+      }).on('error', reject);
+    };
+
+    doRequest(url);
+  });
+}

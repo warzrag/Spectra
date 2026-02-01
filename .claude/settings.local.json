@@ -36,7 +36,10 @@
       "Bash(node:*)",
       "Bash(xxd:*)",
       "Bash(./node_modules/.bin/tsc:*)",
-      "Bash(vercel --version:*)"
+      "Bash(vercel --version:*)",
+      "Bash(npm run dist:win:*)",
+      "Bash(./node_modules/.bin/firebase deploy:*)",
+      "Bash(gh auth:*)"
     ]
   }
 }

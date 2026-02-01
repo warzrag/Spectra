@@ -55,7 +55,7 @@ const RecycleBinPage: React.FC<RecycleBinPageProps> = ({ deletedProfiles, onRest
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto overflow-x-auto">
         {deletedProfiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-3">
             <div className="w-16 h-16 rounded-2xl flex items-center justify-center" style={{ background: 'var(--bg-elevated)' }}>
@@ -65,7 +65,7 @@ const RecycleBinPage: React.FC<RecycleBinPageProps> = ({ deletedProfiles, onRest
             <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>Deleted instances will appear here</p>
           </div>
         ) : (
-          <table className="w-full">
+          <table className="w-full min-w-[600px]">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
                 <th className="text-left px-6 py-2.5 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Instance</th>

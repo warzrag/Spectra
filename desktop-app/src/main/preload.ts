@@ -42,7 +42,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   fingerprint: {
-    generate: () => ipcRenderer.invoke('fingerprint:generate'),
+    generate: (os?: string, browserType?: string, countryCode?: string) => ipcRenderer.invoke('fingerprint:generate', os, browserType, countryCode),
     getPresets: () => ipcRenderer.invoke('fingerprint:getPresets'),
   },
 
@@ -56,6 +56,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
     rotate: (profileId: string) => ipcRenderer.invoke('proxy:rotate', profileId),
     healthCheck: () => ipcRenderer.invoke('proxy:healthCheck'),
     getStats: (profileId?: string) => ipcRenderer.invoke('proxy:getStats', profileId),
+    autoAssign: (profiles: any[]) => ipcRenderer.invoke('proxy:autoAssign', profiles),
+  },
+
+  profileSync: {
+    zipForSync: (profileId: string) => ipcRenderer.invoke('profile:zipForSync', profileId),
+    unzipFromSync: (profileId: string, zipData: number[]) => ipcRenderer.invoke('profile:unzipFromSync', profileId, zipData),
+    hasLocalData: (profileId: string) => ipcRenderer.invoke('profile:hasLocalData', profileId),
+    getLocalSyncVersion: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncVersion', profileId),
+    setLocalSyncVersion: (profileId: string, version: number) => ipcRenderer.invoke('profile:setLocalSyncVersion', profileId, version),
+    getHostname: () => ipcRenderer.invoke('system:hostname'),
+    onProfileClosed: (callback: (profileId: string) => void) => {
+      const listener = (_event: any, profileId: string) => callback(profileId);
+      ipcRenderer.on('profile:closed', listener);
+      return () => ipcRenderer.removeListener('profile:closed', listener);
+    },
   },
 
   network: {
@@ -88,6 +103,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getAll: () => ipcRenderer.invoke('extensions:getAll'),
     remove: (extensionId: string) => ipcRenderer.invoke('extensions:remove', extensionId),
     getPaths: (extensionIds: string[]) => ipcRenderer.invoke('extensions:getPaths', extensionIds),
+    zip: (extensionId: string) => ipcRenderer.invoke('extensions:zip', extensionId),
+    readZip: (zipPath: string) => ipcRenderer.invoke('extensions:readZip', zipPath),
+    downloadAndInstall: (extensionId: string, url: string) => ipcRenderer.invoke('extensions:downloadAndInstall', extensionId, url),
   },
 
   browser: {
@@ -98,6 +116,34 @@ contextBridge.exposeInMainWorld('electronAPI', {
         ipcRenderer.removeListener('browser:downloadProgress', listener);
       };
     },
+  },
+
+  update: {
+    onUpdateAvailable: (callback: (data: { version: string }) => void) => {
+      const listener = (_event: any, data: { version: string }) => callback(data);
+      ipcRenderer.on('app:update-available', listener);
+      return () => {
+        ipcRenderer.removeListener('app:update-available', listener);
+      };
+    },
+    onDownloadProgress: (callback: (data: { percent: number }) => void) => {
+      const listener = (_event: any, data: { percent: number }) => callback(data);
+      ipcRenderer.on('app:update-progress', listener);
+      return () => {
+        ipcRenderer.removeListener('app:update-progress', listener);
+      };
+    },
+    onUpdateDownloaded: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('app:update-downloaded', listener);
+      return () => {
+        ipcRenderer.removeListener('app:update-downloaded', listener);
+      };
+    },
+    startDownload: () => ipcRenderer.invoke('app:startDownload'),
+    installUpdate: () => ipcRenderer.invoke('app:installUpdate'),
+    openExternal: (url: string) => ipcRenderer.invoke('app:openExternal', url),
+    quit: () => ipcRenderer.invoke('app:quit'),
   },
 
   recycleBin: {

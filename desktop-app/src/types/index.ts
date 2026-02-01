@@ -1,6 +1,6 @@
 export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'activity' | 'recycle-bin' | 'billing' | 'members';
 
-export type UserRole = 'admin' | 'va';
+export type UserRole = 'owner' | 'admin' | 'va';
 
 export interface AppUser {
   uid: string;
@@ -30,6 +30,8 @@ export interface UserProfile {
 
 export type Platform = 'twitter' | 'instagram' | 'tiktok' | 'reddit' | 'onlyfans' | 'telegram' | 'other';
 
+export type ProfileStatus = 'active' | 'banned' | 'warming' | 'limited' | 'review' | 'none';
+
 export interface Profile {
   id: string;
   name: string;
@@ -54,6 +56,7 @@ export interface Profile {
   preset?: string;
   os?: 'windows' | 'macos' | 'linux';
   browserType?: 'chrome' | 'firefox' | 'edge';
+  status?: ProfileStatus;
   tags?: string[];
   notes?: string;
   assignedTo?: string;
@@ -68,6 +71,18 @@ export interface Profile {
   updatedAt?: string;
   lastUsed?: string;
   lastUrl?: string;
+
+  // Cloud sync
+  cloudStorageUrl?: string;
+  cloudSyncedAt?: string;
+  cloudSyncSize?: number;
+  cloudSyncVersion?: number;
+
+  // Profile lock
+  lockedBy?: string | null;
+  lockedByEmail?: string | null;
+  lockedByDevice?: string | null;
+  lockedAt?: string | null;
 }
 
 export interface Folder {
@@ -89,6 +104,7 @@ export interface Extension {
   description?: string;
   enabled: boolean;
   localPath?: string;
+  storageUrl?: string;
   createdAt: string;
 }
 

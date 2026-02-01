@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit } from 'lucide-react';
+import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, Lock } from 'lucide-react';
 import MoveFolderModal from '../components/MoveFolderModal';
 import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { logActivity } from '../services/firestore-service';
-import { Profile, Folder, AppSettings, Platform } from '../../types';
+import { Profile, Folder, AppSettings, Platform, ProfileStatus } from '../../types';
+import { isLockedByOther } from '../services/profile-sync-service';
 
 interface DashboardProps {
   profiles: Profile[];
@@ -51,6 +52,18 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(settings.sortOrder || 'desc');
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [assignProfileId, setAssignProfileId] = useState<string | null>(null);
+  const [bulkAssignMode, setBulkAssignMode] = useState(false);
+  const [statusMenuId, setStatusMenuId] = useState<string | null>(null);
+  const [showBulkStatusMenu, setShowBulkStatusMenu] = useState(false);
+
+  const statusOptions: { id: ProfileStatus; label: string; color: string; bg: string }[] = [
+    { id: 'active', label: 'Active', color: 'var(--success)', bg: 'var(--success-subtle)' },
+    { id: 'warming', label: 'Warming', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
+    { id: 'limited', label: 'Limited', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
+    { id: 'review', label: 'Review', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
+    { id: 'banned', label: 'Banned', color: 'var(--danger)', bg: 'var(--danger-subtle)' },
+    { id: 'none', label: 'No Status', color: 'var(--text-muted)', bg: 'var(--bg-elevated)' },
+  ];
 
   useEffect(() => {
     if (window.electronAPI?.profiles?.getActive) {
@@ -64,7 +77,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   useEffect(() => {
     if (openMenuId) {
-      const handler = () => setOpenMenuId(null);
+      const handler = () => { setOpenMenuId(null); setStatusMenuId(null); };
       document.addEventListener('click', handler);
       return () => document.removeEventListener('click', handler);
     }
@@ -131,11 +144,13 @@ const Dashboard: React.FC<DashboardProps> = ({
     if (!window.electronAPI?.cookies) return;
 
     try {
-      const filePath = await window.electronAPI.cookies.selectFile();
-      if (!filePath) return;
+      const fileContent = await window.electronAPI.cookies.selectFile();
+      if (!fileContent) return;
 
-      const format = filePath.toLowerCase().endsWith('.txt') ? 'netscape' as const : 'json' as const;
-      const result = await window.electronAPI.cookies.import(profile.id, filePath, format);
+      // Auto-detect format: JSON starts with [ or {, otherwise Netscape
+      const trimmed = fileContent.trim();
+      const format = (trimmed.startsWith('[') || trimmed.startsWith('{')) ? 'json' as const : 'netscape' as const;
+      const result = await window.electronAPI.cookies.import(profile.id, fileContent, format);
       if (result.success) {
         showToast(`Imported ${result.count} cookies into "${profile.name}"`, 'success');
         if (user) {
@@ -182,6 +197,23 @@ const Dashboard: React.FC<DashboardProps> = ({
   const handleAssign = (profileId: string, userId: string | null, userEmail: string | null) => {
     onUpdateProfile(profileId, { assignedTo: userId, assignedToEmail: userEmail });
     setAssignProfileId(null);
+  };
+
+  const handleBulkAssign = (userId: string | null, userEmail: string | null) => {
+    selectedProfiles.forEach(id => {
+      onUpdateProfile(id, { assignedTo: userId, assignedToEmail: userEmail });
+    });
+    setBulkAssignMode(false);
+    setSelectedProfiles([]);
+    showToast(`${selectedProfiles.length} instances assigned`, 'success');
+  };
+
+  const handleBulkStatusChange = (newStatus: ProfileStatus | undefined) => {
+    selectedProfiles.forEach(id => {
+      onUpdateProfile(id, { status: newStatus });
+    });
+    setShowBulkStatusMenu(false);
+    showToast(`Status updated for ${selectedProfiles.length} instances`, 'success');
   };
 
   const getConnectionInfo = (profile: any) => {
@@ -428,7 +460,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   return (
     <div className="h-full flex flex-col">
       {/* Folder Header with Back button */}
-      <header className="px-5 py-3 flex items-center justify-between gap-4" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+      <header className="px-5 py-3 flex items-center justify-between gap-4 flex-wrap" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
         <div className="flex items-center gap-3 flex-1 min-w-0">
           <button
             onClick={() => onSelectFolder(null)}
@@ -462,7 +494,7 @@ const Dashboard: React.FC<DashboardProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {selectedProfiles.length > 0 && (
             <>
               <button
@@ -473,6 +505,47 @@ const Dashboard: React.FC<DashboardProps> = ({
                 <MoveRight size={14} />
                 Move ({selectedProfiles.length})
               </button>
+              {isAdmin && (
+                <button
+                  onClick={() => setBulkAssignMode(true)}
+                  className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
+                  style={{ background: 'var(--accent-subtle)', border: '1px solid var(--accent)', color: 'var(--accent-light)' }}
+                >
+                  <UserPlus size={14} />
+                  Assign ({selectedProfiles.length})
+                </button>
+              )}
+              <div className="relative">
+                <button
+                  onClick={() => setShowBulkStatusMenu(!showBulkStatusMenu)}
+                  className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
+                  style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)' }}
+                >
+                  <Circle size={14} />
+                  Status ({selectedProfiles.length})
+                </button>
+                {showBulkStatusMenu && (
+                  <div
+                    className="absolute right-0 top-full mt-1 rounded-lg shadow-xl z-20 py-1 min-w-[140px]"
+                    style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+                    onClick={e => e.stopPropagation()}
+                  >
+                    {statusOptions.map(s => (
+                      <button
+                        key={s.id}
+                        onClick={() => handleBulkStatusChange(s.id === 'none' ? undefined : s.id)}
+                        className="w-full px-3 py-1.5 text-[12px] text-left flex items-center gap-2 transition-colors"
+                        style={{ color: 'var(--text-secondary)' }}
+                        onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                      >
+                        <span className="w-2 h-2 rounded-full" style={{ background: s.color }} />
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
               {isAdmin && (
                 <button
                   onClick={handleBulkDelete}
@@ -524,7 +597,7 @@ const Dashboard: React.FC<DashboardProps> = ({
       )}
 
       {/* Table */}
-      <div className="flex-1 overflow-auto">
+      <div className="flex-1 overflow-auto overflow-x-auto">
         {loading ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-[13px]" style={{ color: 'var(--text-muted)' }}>Loading instances...</div>
@@ -569,14 +642,15 @@ const Dashboard: React.FC<DashboardProps> = ({
                   <span className="flex items-center">Instance <SortIcon col="name" /></span>
                 </th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Status</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>OS</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Connection</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Account</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider hidden xl:table-cell" style={{ color: 'var(--text-muted)' }}>OS</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider hidden lg:table-cell" style={{ color: 'var(--text-muted)' }}>Connection</th>
                 {isAdmin && (
-                  <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Assigned To</th>
+                  <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider hidden lg:table-cell" style={{ color: 'var(--text-muted)' }}>Assigned To</th>
                 )}
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Tags</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>Last URL</th>
-                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider cursor-pointer select-none" style={{ color: 'var(--text-muted)' }} onClick={() => toggleSort('lastUsed')}>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider hidden xl:table-cell" style={{ color: 'var(--text-muted)' }}>Tags</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider hidden 2xl:table-cell" style={{ color: 'var(--text-muted)' }}>Last URL</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider cursor-pointer select-none hidden xl:table-cell" style={{ color: 'var(--text-muted)' }} onClick={() => toggleSort('lastUsed')}>
                   <span className="flex items-center">Last Used <SortIcon col="lastUsed" /></span>
                 </th>
                 <th className="px-3 py-2.5 text-right text-[11px] font-semibold uppercase tracking-wider w-44" style={{ color: 'var(--text-muted)' }}>Actions</th>
@@ -587,6 +661,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                 const isActive = activeProfiles.includes(profile.id);
                 const isSelected = selectedProfiles.includes(profile.id);
                 const conn = getConnectionInfo(profile);
+                const locked = !isActive && isLockedByOther(profile, user?.uid || '');
 
                 return (
                   <tr
@@ -621,7 +696,18 @@ const Dashboard: React.FC<DashboardProps> = ({
                             : profile.name.charAt(0).toUpperCase()}
                         </div>
                         <div className="min-w-0">
-                          <div className="text-[13px] font-medium truncate" style={{ color: 'var(--text-primary)' }}>{profile.name}</div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[13px] font-medium truncate" style={{ color: 'var(--text-primary)' }}>{profile.name}</span>
+                            {profile.notes && (
+                              <span className="relative group/notes shrink-0">
+                                <FileText size={11} style={{ color: 'var(--text-muted)', opacity: 0.6 }} />
+                                <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1.5 px-2.5 py-1.5 rounded-lg text-[11px] whitespace-pre-wrap max-w-[200px] hidden group-hover/notes:block z-50 shadow-lg"
+                                  style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)' }}>
+                                  {profile.notes}
+                                </span>
+                              </span>
+                            )}
+                          </div>
                           {profile.platform && platformInfo[profile.platform] && (
                             <div className="text-[11px]" style={{ color: 'var(--text-muted)' }}>{platformInfo[profile.platform].label}</div>
                           )}
@@ -641,13 +727,38 @@ const Dashboard: React.FC<DashboardProps> = ({
                     </td>
 
                     <td className="px-3 py-2.5">
+                      {(() => {
+                        const statusMap: Record<string, { label: string; color: string; bg: string }> = {
+                          active: { label: 'Active', color: 'var(--success)', bg: 'var(--success-subtle)' },
+                          banned: { label: 'Banned', color: 'var(--danger)', bg: 'var(--danger-subtle)' },
+                          warming: { label: 'Warming', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
+                          limited: { label: 'Limited', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
+                          review: { label: 'Review', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
+                        };
+                        const s = profile.status && statusMap[profile.status];
+                        const currentIdx = statusOptions.findIndex(o => o.id === (profile.status || 'none'));
+                        const nextStatus = statusOptions[(currentIdx + 1) % statusOptions.length];
+                        return (
+                          <button
+                            onClick={() => onUpdateProfile(profile.id, { status: nextStatus.id === 'none' ? undefined : nextStatus.id })}
+                            className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium cursor-pointer transition-opacity hover:opacity-80"
+                            style={{ background: s ? s.bg : 'var(--bg-elevated)', color: s ? s.color : 'var(--text-muted)', border: 'none' }}
+                            title={`Click to change status → ${nextStatus.label}`}
+                          >
+                            {s ? s.label : '-'}
+                          </button>
+                        );
+                      })()}
+                    </td>
+
+                    <td className="px-3 py-2.5 hidden xl:table-cell">
                       <div className="flex items-center gap-1.5 text-[12px]" style={{ color: 'var(--text-secondary)' }}>
                         <Monitor size={13} style={{ opacity: 0.6 }} />
                         <span>{getOSLabel(profile.os)}</span>
                       </div>
                     </td>
 
-                    <td className="px-3 py-2.5">
+                    <td className="px-3 py-2.5 hidden lg:table-cell">
                       <div className="flex items-center gap-1.5 text-[12px]" style={{ color: conn.color }}>
                         {conn.icon}
                         <span className="truncate max-w-[100px]">{conn.label}</span>
@@ -655,7 +766,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                     </td>
 
                     {isAdmin && (
-                      <td className="px-3 py-2.5">
+                      <td className="px-3 py-2.5 hidden lg:table-cell">
                         {profile.assignedToEmail ? (
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium" style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}>
                             <UserPlus size={10} />
@@ -667,7 +778,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                       </td>
                     )}
 
-                    <td className="px-3 py-2.5">
+                    <td className="px-3 py-2.5 hidden xl:table-cell">
                       <div className="flex gap-1 flex-wrap">
                         {(profile.tags || []).slice(0, 2).map(tag => (
                           <span key={tag} className="px-1.5 py-0.5 rounded text-[10px] font-medium" style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}>
@@ -680,7 +791,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                       </div>
                     </td>
 
-                    <td className="px-3 py-2.5">
+                    <td className="px-3 py-2.5 hidden 2xl:table-cell">
                       {profile.lastUrl ? (
                         <div className="flex items-center gap-1.5 text-[12px] max-w-[150px]" style={{ color: 'var(--text-secondary)' }}>
                           <ExternalLink size={12} className="shrink-0" style={{ color: 'var(--text-muted)' }} />
@@ -691,22 +802,27 @@ const Dashboard: React.FC<DashboardProps> = ({
                       )}
                     </td>
 
-                    <td className="px-3 py-2.5">
+                    <td className="px-3 py-2.5 hidden xl:table-cell">
                       <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>{formatDate(profile.lastUsed)}</span>
                     </td>
 
                     <td className="px-3 py-2.5">
                       <div className="flex items-center justify-end gap-1.5">
                         <button
-                          onClick={() => onLaunchProfile(profile)}
-                          className="px-3 py-1.5 rounded-md flex items-center gap-1.5 text-[12px] font-medium text-white transition-all"
+                          onClick={() => !locked && onLaunchProfile(profile)}
+                          className="px-3 py-1.5 rounded-md flex items-center gap-1.5 text-[12px] font-medium transition-all"
                           style={{
-                            background: isActive ? 'var(--success)' : 'var(--accent)',
-                            boxShadow: isActive ? '0 1px 4px rgba(34,197,94,0.3)' : '0 1px 4px rgba(99,102,241,0.3)',
+                            background: locked ? 'var(--bg-elevated)' : isActive ? 'var(--success)' : 'var(--accent)',
+                            boxShadow: locked ? 'none' : isActive ? '0 1px 4px rgba(34,197,94,0.3)' : '0 1px 4px rgba(99,102,241,0.3)',
+                            color: locked ? 'var(--text-muted)' : 'white',
+                            cursor: locked ? 'not-allowed' : 'pointer',
                           }}
+                          title={locked ? `Utilis\u00e9 par ${profile.lockedByEmail || '?'} sur ${profile.lockedByDevice || '?'}` : ''}
                         >
                           {isActive ? (
                             <><Circle size={10} className="fill-current status-dot-active" /> Active</>
+                          ) : locked ? (
+                            <><Lock size={12} /> Locked</>
                           ) : (
                             <><Play size={12} /> Launch</>
                           )}
@@ -764,6 +880,46 @@ const Dashboard: React.FC<DashboardProps> = ({
                                   <UserPlus size={13} /> Assign
                                 </button>
                               )}
+
+                              {/* Set Status submenu */}
+                              <div className="relative">
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); setStatusMenuId(statusMenuId === profile.id ? null : profile.id); }}
+                                  className="w-full px-3 py-1.5 text-[13px] text-left flex items-center gap-2 justify-between transition-colors"
+                                  style={{ color: 'var(--text-secondary)' }}
+                                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                                  onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                                >
+                                  <span className="flex items-center gap-2"><Circle size={13} /> Set Status</span>
+                                  <ChevronRight size={12} />
+                                </button>
+                                {statusMenuId === profile.id && (
+                                  <div
+                                    className="absolute left-full top-0 ml-1 rounded-lg shadow-xl z-30 py-1 min-w-[140px]"
+                                    style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+                                    onClick={e => e.stopPropagation()}
+                                  >
+                                    {statusOptions.map(s => (
+                                      <button
+                                        key={s.id}
+                                        onClick={() => {
+                                          onUpdateProfile(profile.id, { status: s.id === 'none' ? undefined : s.id });
+                                          setOpenMenuId(null);
+                                          setStatusMenuId(null);
+                                        }}
+                                        className="w-full px-3 py-1.5 text-[12px] text-left flex items-center gap-2 transition-colors"
+                                        style={{ color: profile.status === s.id ? s.color : 'var(--text-secondary)' }}
+                                        onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                                      >
+                                        <span className="w-2 h-2 rounded-full" style={{ background: s.color }} />
+                                        {s.label}
+                                        {profile.status === s.id && <span className="ml-auto text-[10px]">✓</span>}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
 
                               <button
                                 onClick={() => handleImportCookies(profile)}
@@ -843,6 +999,14 @@ const Dashboard: React.FC<DashboardProps> = ({
           currentAssignee={assignProfile.assignedTo}
           onClose={() => setAssignProfileId(null)}
           onAssign={(userId, userEmail) => handleAssign(assignProfile.id, userId, userEmail)}
+        />
+      )}
+
+      {bulkAssignMode && (
+        <AssignProfileModal
+          profileName={`${selectedProfiles.length} instances`}
+          onClose={() => setBulkAssignMode(false)}
+          onAssign={(userId, userEmail) => handleBulkAssign(userId, userEmail)}
         />
       )}
     </div>

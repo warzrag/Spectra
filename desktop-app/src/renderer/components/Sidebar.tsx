@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { Folder as FolderType, AppPage } from '../../types';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -18,6 +18,8 @@ interface SidebarProps {
   onQuickCreate: () => void;
   onMoveProfile?: (profileId: string, folderId: string | null) => void;
   onLogout: () => void;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }
 
 const Sidebar: React.FC<SidebarProps> = ({
@@ -35,12 +37,19 @@ const Sidebar: React.FC<SidebarProps> = ({
   onQuickCreate,
   onMoveProfile,
   onLogout,
+  collapsed,
+  onToggleCollapse,
 }) => {
   const { user, isAdmin } = useAuth();
   const [contextMenuId, setContextMenuId] = useState<string | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const [foldersExpanded, setFoldersExpanded] = useState(true);
   const [showNewDropdown, setShowNewDropdown] = useState(false);
+  const [appVersion, setAppVersion] = useState('');
+
+  useEffect(() => {
+    window.electronAPI.getVersion().then(v => setAppVersion(v));
+  }, []);
 
   // Main navigation items
   const mainNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean }[] = [
@@ -98,17 +107,18 @@ const Sidebar: React.FC<SidebarProps> = ({
     <button
       key={page}
       onClick={() => onNavigate(page)}
-      className="w-full text-left px-3 py-2 rounded-lg flex items-center gap-2.5 text-[13px] font-medium transition-colors"
+      className={`w-full text-left ${collapsed ? 'px-0 justify-center' : 'px-3'} py-2 rounded-lg flex items-center ${collapsed ? '' : 'gap-2.5'} text-[13px] font-medium transition-colors`}
       style={{
         background: activePage === page ? 'var(--accent-subtle)' : 'transparent',
         color: activePage === page ? 'var(--accent-light)' : 'var(--text-secondary)',
       }}
       onMouseEnter={e => { if (activePage !== page) e.currentTarget.style.background = 'var(--bg-elevated)'; }}
       onMouseLeave={e => { if (activePage !== page) e.currentTarget.style.background = 'transparent'; }}
+      title={collapsed ? label : undefined}
     >
-      {icon}
-      <span className="flex-1">{label}</span>
-      {page === 'profiles' && (
+      <span className={collapsed ? 'mx-auto' : ''}>{icon}</span>
+      {!collapsed && <span className="flex-1">{label}</span>}
+      {!collapsed && page === 'profiles' && (
         <span className="text-[11px] tabular-nums px-1.5 py-0.5 rounded-full" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
           {totalProfiles}
         </span>
@@ -117,63 +127,91 @@ const Sidebar: React.FC<SidebarProps> = ({
   );
 
   return (
-    <aside className="w-60 flex flex-col shrink-0" style={{ background: 'var(--bg-surface)', borderRight: '1px solid var(--border-subtle)' }}>
-      {/* Logo - like AdsPower */}
-      <div className="px-4 pt-4 pb-3 flex items-center gap-3 draggable">
+    <aside
+      className={`${collapsed ? 'w-[60px]' : 'w-60'} flex flex-col shrink-0 relative transition-all duration-200`}
+      style={{ background: 'var(--bg-surface)', borderRight: '1px solid var(--border-subtle)' }}
+    >
+      {/* Collapse toggle button */}
+      <button
+        onClick={onToggleCollapse}
+        className="absolute -right-3 top-[52px] w-6 h-6 rounded-full flex items-center justify-center z-10 transition-colors"
+        style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)', color: 'var(--text-muted)' }}
+        onMouseEnter={e => { e.currentTarget.style.color = 'var(--accent-light)'; e.currentTarget.style.borderColor = 'var(--accent)'; }}
+        onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.borderColor = 'var(--border-default)'; }}
+        title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+      >
+        {collapsed ? <PanelLeftOpen size={12} /> : <PanelLeftClose size={12} />}
+      </button>
+
+      {/* Logo */}
+      <div className={`${collapsed ? 'px-2 justify-center' : 'px-4'} pt-4 pb-3 flex items-center gap-3 draggable`}>
         <div className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style={{ background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', boxShadow: '0 2px 8px rgba(99, 102, 241, 0.3)' }}>
           <Shield size={24} className="text-white" />
         </div>
-        <div>
-          <span className="text-[20px] font-bold tracking-tight block leading-tight" style={{ color: 'var(--text-primary)' }}>
-            Spectra
-          </span>
-          <span className="text-[10px] font-medium" style={{ color: 'var(--text-muted)' }}>
-            Antidetect Browser
-          </span>
-        </div>
+        {!collapsed && (
+          <div>
+            <span className="text-[20px] font-bold tracking-tight block leading-tight" style={{ color: 'var(--text-primary)' }}>
+              Spectra
+            </span>
+            <span className="text-[10px] font-medium" style={{ color: 'var(--text-muted)' }}>
+              Antidetect Browser
+            </span>
+          </div>
+        )}
       </div>
 
       {/* New Profile Button - only for admins */}
       {isAdmin && (
-        <div className="p-3">
-          <div className="relative">
-            <div className="flex gap-1">
-              <button
-                onClick={onCreateProfile}
-                className="flex-1 py-2.5 px-4 rounded-l-lg flex items-center justify-center gap-2 text-sm font-medium text-white transition-all"
-                style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)', boxShadow: '0 2px 8px rgba(99, 102, 241, 0.25)' }}
-                onMouseEnter={e => e.currentTarget.style.boxShadow = '0 4px 16px rgba(99, 102, 241, 0.35)'}
-                onMouseLeave={e => e.currentTarget.style.boxShadow = '0 2px 8px rgba(99, 102, 241, 0.25)'}
-              >
-                <Plus size={16} />
-                New Instance
-              </button>
-              <button
-                onClick={() => setShowNewDropdown(!showNewDropdown)}
-                className="py-2.5 px-2 rounded-r-lg text-white transition-all"
-                style={{ background: 'linear-gradient(135deg, #7c3aed, #6d28d9)', boxShadow: '0 2px 8px rgba(99, 102, 241, 0.25)' }}
-              >
-                <ChevronDown size={14} />
-              </button>
-            </div>
-            {showNewDropdown && (
-              <div
-                className="absolute left-0 right-0 top-full mt-1 rounded-lg shadow-xl z-20 overflow-hidden py-1"
-                style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
-              >
+        <div className={`${collapsed ? 'px-2' : 'p-3'}`}>
+          {collapsed ? (
+            <button
+              onClick={onCreateProfile}
+              className="w-full py-2.5 rounded-lg flex items-center justify-center text-white transition-all"
+              style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)', boxShadow: '0 2px 8px rgba(99, 102, 241, 0.25)' }}
+              title="New Instance"
+            >
+              <Plus size={18} />
+            </button>
+          ) : (
+            <div className="relative">
+              <div className="flex gap-1">
                 <button
-                  onClick={() => { onQuickCreate(); setShowNewDropdown(false); }}
-                  className="w-full px-3 py-2 text-[13px] text-left flex items-center gap-2 transition-colors"
-                  style={{ color: 'var(--text-secondary)' }}
-                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-elevated)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
-                  onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
+                  onClick={onCreateProfile}
+                  className="flex-1 py-2.5 px-4 rounded-l-lg flex items-center justify-center gap-2 text-sm font-medium text-white transition-all"
+                  style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)', boxShadow: '0 2px 8px rgba(99, 102, 241, 0.25)' }}
+                  onMouseEnter={e => e.currentTarget.style.boxShadow = '0 4px 16px rgba(99, 102, 241, 0.35)'}
+                  onMouseLeave={e => e.currentTarget.style.boxShadow = '0 2px 8px rgba(99, 102, 241, 0.25)'}
                 >
-                  <Zap size={14} style={{ color: 'var(--warning)' }} />
-                  Quick Create (Bulk)
+                  <Plus size={16} />
+                  New Instance
+                </button>
+                <button
+                  onClick={() => setShowNewDropdown(!showNewDropdown)}
+                  className="py-2.5 px-2 rounded-r-lg text-white transition-all"
+                  style={{ background: 'linear-gradient(135deg, #7c3aed, #6d28d9)', boxShadow: '0 2px 8px rgba(99, 102, 241, 0.25)' }}
+                >
+                  <ChevronDown size={14} />
                 </button>
               </div>
-            )}
-          </div>
+              {showNewDropdown && (
+                <div
+                  className="absolute left-0 right-0 top-full mt-1 rounded-lg shadow-xl z-20 overflow-hidden py-1"
+                  style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+                >
+                  <button
+                    onClick={() => { onQuickCreate(); setShowNewDropdown(false); }}
+                    className="w-full px-3 py-2 text-[13px] text-left flex items-center gap-2 transition-colors"
+                    style={{ color: 'var(--text-secondary)' }}
+                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-elevated)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
+                  >
+                    <Zap size={14} style={{ color: 'var(--warning)' }} />
+                    Quick Create (Bulk)
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -182,8 +220,8 @@ const Sidebar: React.FC<SidebarProps> = ({
         {filterItems(mainNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
       </nav>
 
-      {/* Folders section - only visible when on profiles page */}
-      {activePage === 'profiles' && (
+      {/* Folders section - only visible when on profiles page and not collapsed */}
+      {activePage === 'profiles' && !collapsed && (
         <div className="flex-1 px-2 pb-2 overflow-y-auto mt-3">
           {/* Divider */}
           <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-3 mx-1" />
@@ -304,56 +342,76 @@ const Sidebar: React.FC<SidebarProps> = ({
         </div>
       )}
 
-      {/* Spacer when not on profiles page */}
-      {activePage !== 'profiles' && <div className="flex-1" />}
+      {/* Spacer when folders not shown */}
+      {(activePage !== 'profiles' || collapsed) && <div className="flex-1" />}
 
       {/* Team Section */}
       {isAdmin && (
         <div className="px-2 pb-2">
           <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-2 mx-1" />
-          <div className="px-3 mb-1">
-            <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-              Team
-            </span>
-          </div>
+          {!collapsed && (
+            <div className="px-3 mb-1">
+              <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                Team
+              </span>
+            </div>
+          )}
           <div className="space-y-0.5">
             {filterItems(teamNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
           </div>
         </div>
       )}
 
-      {/* Bottom: User info + Stats */}
-      <div className="px-3 py-3 space-y-2" style={{ borderTop: '1px solid var(--border-subtle)' }}>
+      {/* Bottom: User info */}
+      <div className={`${collapsed ? 'px-2' : 'px-3'} py-3 space-y-2`} style={{ borderTop: '1px solid var(--border-subtle)' }}>
         {user && (
           <>
-            <div className="flex items-center gap-2 px-1">
-              <div className="w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
-                style={{ background: isAdmin ? 'linear-gradient(135deg, #6366f1, #7c3aed)' : 'linear-gradient(135deg, #059669, #10b981)' }}>
-                {user.email.charAt(0).toUpperCase()}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="text-[11px] font-medium truncate" style={{ color: 'var(--text-primary)' }}>{user.email}</div>
-                <div className="text-[10px] uppercase font-semibold tracking-wider" style={{
-                  color: isAdmin ? 'var(--accent-light)' : 'var(--success)',
-                }}>
-                  {user.role}
+            {collapsed ? (
+              <div className="flex flex-col items-center gap-2">
+                <div className="w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+                  style={{ background: isAdmin ? 'linear-gradient(135deg, #6366f1, #7c3aed)' : 'linear-gradient(135deg, #059669, #10b981)' }}
+                  title={user.email}
+                >
+                  {user.email.charAt(0).toUpperCase()}
                 </div>
+                <button onClick={onLogout} className="p-1.5 rounded-lg transition-colors shrink-0" title="Sign out"
+                  style={{ color: 'var(--text-muted)' }}
+                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--danger-subtle)'; e.currentTarget.style.color = 'var(--danger)'; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}>
+                  <LogOut size={14} />
+                </button>
               </div>
-              <button onClick={onLogout} className="p-1.5 rounded-lg transition-colors shrink-0" title="Sign out"
-                style={{ color: 'var(--text-muted)' }}
-                onMouseEnter={e => { e.currentTarget.style.background = 'var(--danger-subtle)'; e.currentTarget.style.color = 'var(--danger)'; }}
-                onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}>
-                <LogOut size={14} />
-              </button>
-            </div>
-            {/* Stats like AdsPower */}
-            <div className="flex items-center justify-between px-1">
-              <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Profiles</span>
-              <span className="text-[10px] font-medium" style={{ color: 'var(--text-secondary)' }}>{totalProfiles}</span>
-            </div>
+            ) : (
+              <>
+                <div className="flex items-center gap-2 px-1">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center text-[11px] font-bold text-white shrink-0"
+                    style={{ background: isAdmin ? 'linear-gradient(135deg, #6366f1, #7c3aed)' : 'linear-gradient(135deg, #059669, #10b981)' }}>
+                    {user.email.charAt(0).toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[11px] font-medium truncate" style={{ color: 'var(--text-primary)' }}>{user.email}</div>
+                    <div className="text-[10px] uppercase font-semibold tracking-wider" style={{
+                      color: isAdmin ? 'var(--accent-light)' : 'var(--success)',
+                    }}>
+                      {user.role}
+                    </div>
+                  </div>
+                  <button onClick={onLogout} className="p-1.5 rounded-lg transition-colors shrink-0" title="Sign out"
+                    style={{ color: 'var(--text-muted)' }}
+                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--danger-subtle)'; e.currentTarget.style.color = 'var(--danger)'; }}
+                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}>
+                    <LogOut size={14} />
+                  </button>
+                </div>
+                <div className="flex items-center justify-between px-1">
+                  <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Profiles</span>
+                  <span className="text-[10px] font-medium" style={{ color: 'var(--text-secondary)' }}>{totalProfiles}</span>
+                </div>
+              </>
+            )}
           </>
         )}
-        <div className="text-[10px] px-1" style={{ color: 'var(--text-muted)' }}>Spectra v1.0.0</div>
+        {!collapsed && <div className="text-[10px] px-1" style={{ color: 'var(--text-muted)' }}>Spectra v{appVersion}</div>}
       </div>
     </aside>
   );

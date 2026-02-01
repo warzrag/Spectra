@@ -61,5 +61,12 @@
     "icon": "assets/icon.png",
     "target": ["AppImage"],
     "category": "Network"
-  }
+  },
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "warzrag",
+      "repo": "Spectra"
+    }
+  ]
 }

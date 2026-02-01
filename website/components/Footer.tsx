@@ -3,7 +3,7 @@ import { Shield, Github, Twitter } from "lucide-react";
 const productLinks = [
   { label: "Features", href: "#features" },
   { label: "Pricing", href: "#pricing" },
-  { label: "Download", href: "https://github.com/warzrag/Spectra/releases/latest/download/Spectra-Setup-1.0.0.exe" },
+  { label: "Download", href: "https://github.com/warzrag/Spectra/releases/latest" },
   { label: "Changelog", href: "https://github.com/warzrag/Spectra/releases" },
 ];
 

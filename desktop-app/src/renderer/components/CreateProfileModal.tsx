@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { X, Wand2, ChevronDown, Monitor, Globe, Fingerprint, Settings2, Tag as TagIcon } from 'lucide-react';
-import { Folder as FolderType, Platform, Profile } from '../../types';
+import { X, Wand2, ChevronDown, Monitor, Globe, Fingerprint, Settings2, Tag as TagIcon, Loader2, Check, Shuffle } from 'lucide-react';
+import { Folder as FolderType, Platform, Profile, ProfileStatus } from '../../types';
 import ConnectionSelector from './ConnectionSelector';
 
 interface CreateProfileModalProps {
@@ -61,11 +61,15 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
   const [tags, setTags] = useState<string[]>(editProfile?.tags || []);
   const [tagInput, setTagInput] = useState('');
   const [notes, setNotes] = useState(editProfile?.notes || '');
+  const [status, setStatus] = useState<ProfileStatus>(editProfile?.status || 'none');
   const [canvasNoise, setCanvasNoise] = useState(editProfile?.fingerprint?.canvasNoise ?? true);
   const [audioNoise, setAudioNoise] = useState(editProfile?.fingerprint?.audioNoise ?? true);
   const [webrtcMode, setWebrtcMode] = useState<'real' | 'disabled' | 'fake'>(editProfile?.fingerprint?.webrtcMode || 'fake');
   const [doNotTrack, setDoNotTrack] = useState(editProfile?.fingerprint?.doNotTrack ?? false);
   const [cookieImport, setCookieImport] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [generated, setGenerated] = useState(false);
+  const [showCountryPicker, setShowCountryPicker] = useState(false);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -77,23 +81,45 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
 
   const userAgents: Record<string, { name: string; value: string }[]> = {
     chrome: [
-      { name: 'Chrome 121 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36' },
-      { name: 'Chrome 121 Mac', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36' },
-      { name: 'Chrome 120 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      { name: 'Chrome 140 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36' },
+      { name: 'Chrome 140 Mac', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36' },
+      { name: 'Chrome 140 Linux', value: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36' },
+      { name: 'Chrome 139 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.94 Safari/537.36' },
     ],
     firefox: [
-      { name: 'Firefox 122 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0' },
-      { name: 'Firefox 122 Mac', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0' },
+      { name: 'Firefox 130 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0' },
+      { name: 'Firefox 130 Mac', value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0' },
     ],
     edge: [
-      { name: 'Edge 121 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0' },
+      { name: 'Edge 140 Windows', value: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36 Edg/140.0.0.0' },
     ],
   };
 
   const currentAgents = userAgents[browserType] || userAgents.chrome;
 
-  const timezones = ['UTC', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Singapore', 'Australia/Sydney'];
-  const languages = ['en-US', 'en-GB', 'es-ES', 'fr-FR', 'de-DE', 'it-IT', 'pt-BR', 'ru-RU', 'ja-JP', 'zh-CN', 'ko-KR'];
+  // Country → coherent timezones + languages (random pick)
+  const COUNTRY_PROFILES: Record<string, { timezones: string[]; languages: string[] }> = {
+    US: { timezones: ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'], languages: ['en-US'] },
+    GB: { timezones: ['Europe/London'], languages: ['en-GB'] },
+    CA: { timezones: ['America/Toronto', 'America/Vancouver', 'America/Edmonton'], languages: ['en-US', 'fr-CA'] },
+    FR: { timezones: ['Europe/Paris'], languages: ['fr-FR'] },
+    DE: { timezones: ['Europe/Berlin'], languages: ['de-DE'] },
+    AU: { timezones: ['Australia/Sydney', 'Australia/Melbourne', 'Australia/Perth', 'Australia/Brisbane'], languages: ['en-AU'] },
+    BR: { timezones: ['America/Sao_Paulo', 'America/Fortaleza', 'America/Manaus'], languages: ['pt-BR'] },
+    ES: { timezones: ['Europe/Madrid'], languages: ['es-ES'] },
+    IT: { timezones: ['Europe/Rome'], languages: ['it-IT'] },
+    NL: { timezones: ['Europe/Amsterdam'], languages: ['nl-NL'] },
+    JP: { timezones: ['Asia/Tokyo'], languages: ['ja-JP'] },
+    KR: { timezones: ['Asia/Seoul'], languages: ['ko-KR'] },
+    IN: { timezones: ['Asia/Kolkata'], languages: ['en-US'] },
+    RU: { timezones: ['Europe/Moscow', 'Asia/Yekaterinburg', 'Asia/Novosibirsk'], languages: ['ru-RU'] },
+    SG: { timezones: ['Asia/Singapore'], languages: ['en-US'] },
+  };
+
+  const pickRandom = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+
+  const timezones = ['UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles', 'America/Toronto', 'America/Vancouver', 'America/Edmonton', 'America/Sao_Paulo', 'America/Fortaleza', 'America/Manaus', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Madrid', 'Europe/Rome', 'Europe/Amsterdam', 'Europe/Moscow', 'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Seoul', 'Asia/Kolkata', 'Asia/Singapore', 'Asia/Yekaterinburg', 'Asia/Novosibirsk', 'Australia/Sydney', 'Australia/Melbourne', 'Australia/Perth', 'Australia/Brisbane'];
+  const languages = ['en-US', 'en-GB', 'en-AU', 'es-ES', 'fr-FR', 'fr-CA', 'de-DE', 'it-IT', 'nl-NL', 'pt-BR', 'ru-RU', 'ja-JP', 'zh-CN', 'ko-KR'];
   const resolutions = ['1920x1080', '1366x768', '1440x900', '1536x864', '1600x900', '1280x720', '1280x800', '1920x1200', '2560x1440'];
 
   useEffect(() => {
@@ -102,23 +128,42 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
     }
   }, []);
 
-  const handleGenerateFingerprint = async () => {
+  const handleGenerateFingerprint = async (countryCode?: string) => {
     try {
-      if (!window.electronAPI?.fingerprint) return;
-      const fp = await window.electronAPI.fingerprint.generate();
+      if (!window.electronAPI?.fingerprint) {
+        console.error('electronAPI.fingerprint not available');
+        return;
+      }
+      setShowCountryPicker(false);
+      setGenerating(true);
+      setGenerated(false);
+      const fp = await (window.electronAPI.fingerprint.generate as any)(os, browserType, countryCode);
       setFingerprint(fp);
       if (fp) {
         setUserAgent(fp.userAgent || '');
-        setTimezone(fp.timezone || 'UTC');
-        setLanguage(fp.language || 'en-US');
         setResolution(fp.screenResolution || '1920x1080');
         setHardwareConcurrency(fp.hardwareConcurrency || 8);
         setDeviceMemory(fp.deviceMemory || 8);
         setWebglVendor(fp.webglVendor || 'Google Inc.');
         setWebglRenderer(fp.webglRenderer || 'ANGLE (Intel(R) HD Graphics Direct3D11 vs_5_0 ps_5_0)');
+
+        // If a country was selected, force coherent timezone + language from local mapping
+        if (countryCode && COUNTRY_PROFILES[countryCode]) {
+          const profile = COUNTRY_PROFILES[countryCode];
+          setTimezone(pickRandom(profile.timezones));
+          setLanguage(pickRandom(profile.languages));
+        } else {
+          setTimezone(fp.timezone || 'UTC');
+          setLanguage(fp.language || 'en-US');
+        }
+
+        setGenerated(true);
+        setTimeout(() => setGenerated(false), 2000);
       }
     } catch (error) {
       console.error('Failed to generate fingerprint:', error);
+    } finally {
+      setGenerating(false);
     }
   };
 
@@ -176,6 +221,7 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
       browserType,
       tags,
       notes,
+      status: status !== 'none' ? status : null,
       preset: selectedPreset,
       fingerprint: {
         ...(fingerprint || {}),
@@ -201,7 +247,7 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
 
   return (
     <div className="fixed inset-0 flex items-center justify-center z-50 modal-backdrop non-draggable" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="rounded-xl w-full max-w-2xl max-h-[85vh] overflow-hidden shadow-2xl non-draggable" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }} onClick={e => e.stopPropagation()}>
+      <div className="rounded-xl w-full max-w-[95vw] lg:max-w-2xl max-h-[85vh] overflow-hidden shadow-2xl non-draggable" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }} onClick={e => e.stopPropagation()}>
 
         {/* Header */}
         <div className="px-6 py-4 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
@@ -282,6 +328,31 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
                 </div>
               </div>
 
+              {/* Account Status */}
+              <div>
+                <label className="block text-[12px] font-medium mb-1.5" style={labelStyle}>Account Status</label>
+                <div className="flex gap-2 flex-wrap">
+                  {([
+                    { id: 'none' as ProfileStatus, label: 'None', color: 'var(--text-muted)', bg: 'var(--bg-elevated)' },
+                    { id: 'active' as ProfileStatus, label: 'Active', color: 'var(--success)', bg: 'var(--success-subtle)' },
+                    { id: 'warming' as ProfileStatus, label: 'Warming', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
+                    { id: 'limited' as ProfileStatus, label: 'Limited', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
+                    { id: 'review' as ProfileStatus, label: 'Review', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
+                    { id: 'banned' as ProfileStatus, label: 'Banned', color: 'var(--danger)', bg: 'var(--danger-subtle)' },
+                  ]).map(s => (
+                    <button key={s.id} type="button" onClick={() => setStatus(s.id)}
+                      className="px-3 py-1.5 rounded-lg text-[12px] font-medium transition-all"
+                      style={{
+                        background: status === s.id ? s.bg : 'var(--bg-elevated)',
+                        border: `1px solid ${status === s.id ? s.color : 'var(--border-default)'}`,
+                        color: status === s.id ? s.color : 'var(--text-secondary)',
+                      }}>
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* OS + Browser */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
@@ -322,17 +393,24 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
               <div>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="text-[12px] font-medium" style={labelStyle}>User Agent</label>
-                  <button type="button" onClick={handleGenerateFingerprint}
+                  <button type="button" onClick={() => handleGenerateFingerprint()} disabled={generating}
                     className="px-2 py-1 rounded text-[11px] font-medium flex items-center gap-1 transition-all"
-                    style={{ background: 'linear-gradient(135deg, #7c3aed, #6366f1)', color: 'white' }}>
-                    <Wand2 size={12} /> Auto-Generate
+                    style={{ background: generated ? 'var(--success)' : 'linear-gradient(135deg, #7c3aed, #6366f1)', color: 'white', opacity: generating ? 0.7 : 1 }}>
+                    {generating ? <><Loader2 size={12} className="animate-spin" /> Generating...</> : generated ? <><Check size={12} /> Generated!</> : <><Wand2 size={12} /> Auto-Generate</>}
                   </button>
                 </div>
                 <select value={userAgent} onChange={e => setUserAgent(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-indigo-500" style={inputStyle}>
                   <option value="">Select user agent</option>
                   {currentAgents.map(ua => <option key={ua.name} value={ua.value}>{ua.name}</option>)}
-                  {userAgent && !currentAgents.find(ua => ua.value === userAgent) && <option value={userAgent}>Custom: {userAgent.substring(0, 50)}...</option>}
+                  {userAgent && !currentAgents.find(ua => ua.value === userAgent) && <option value={userAgent}>{
+                    (() => {
+                      const chromeMatch = userAgent.match(/Chrome\/([\d.]+)/);
+                      const osMatch = userAgent.includes('Windows') ? 'Windows' : userAgent.includes('Macintosh') ? 'Mac' : userAgent.includes('Linux') ? 'Linux' : '';
+                      if (chromeMatch) return `Chrome ${chromeMatch[1].split('.')[0]} ${osMatch} (Generated)`;
+                      return `Custom: ${userAgent.substring(0, 50)}...`;
+                    })()
+                  }</option>}
                 </select>
               </div>
 
@@ -395,17 +473,56 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
                     </optgroup>
                   </select>
                 </div>
-                <div className="flex items-end">
-                  <button type="button" onClick={handleGenerateFingerprint}
+                <div className="flex items-end relative">
+                  <button type="button" onClick={() => setShowCountryPicker(!showCountryPicker)}
                     className="w-full px-3 py-2 rounded-lg flex items-center justify-center gap-2 text-[13px] font-medium text-white transition-all"
                     style={{ background: 'linear-gradient(135deg, #7c3aed, #6366f1)' }}>
-                    <Wand2 size={15} /> Generate Fingerprint
+                    {generating ? <><Loader2 size={14} className="animate-spin" /> Generating...</> : <><Wand2 size={15} /> Generate Fingerprint</>}
                   </button>
+                  {showCountryPicker && (
+                    <div className="absolute top-full left-0 right-0 mt-1 rounded-lg shadow-xl border z-50 py-1.5 max-h-[280px] overflow-y-auto"
+                      style={{ background: 'var(--bg-elevated)', borderColor: 'var(--border-default)' }}>
+                      <div className="px-2.5 py-1.5 text-[11px] font-medium" style={{ color: 'var(--text-muted)' }}>Select country for coherent fingerprint</div>
+                      {[
+                        { code: 'US', name: 'United States', flag: 'us' },
+                        { code: 'GB', name: 'United Kingdom', flag: 'gb' },
+                        { code: 'CA', name: 'Canada', flag: 'ca' },
+                        { code: 'FR', name: 'France', flag: 'fr' },
+                        { code: 'DE', name: 'Germany', flag: 'de' },
+                        { code: 'AU', name: 'Australia', flag: 'au' },
+                        { code: 'BR', name: 'Brazil', flag: 'br' },
+                        { code: 'ES', name: 'Spain', flag: 'es' },
+                        { code: 'IT', name: 'Italy', flag: 'it' },
+                        { code: 'NL', name: 'Netherlands', flag: 'nl' },
+                        { code: 'JP', name: 'Japan', flag: 'jp' },
+                        { code: 'KR', name: 'South Korea', flag: 'kr' },
+                        { code: 'IN', name: 'India', flag: 'in' },
+                        { code: 'RU', name: 'Russia', flag: 'ru' },
+                        { code: 'SG', name: 'Singapore', flag: 'sg' },
+                      ].map(c => (
+                        <button key={c.code} type="button"
+                          onClick={() => handleGenerateFingerprint(c.code)}
+                          className="w-full px-2.5 py-1.5 text-left flex items-center gap-2 text-[12px] hover:bg-white/5 transition-colors"
+                          style={{ color: 'var(--text-primary)' }}>
+                          <img src={`https://flagcdn.com/w20/${c.flag}.png`} alt={c.code} width={16} height={12} style={{ borderRadius: 2 }} />
+                          {c.name}
+                          <span className="ml-auto text-[10px]" style={{ color: 'var(--text-muted)' }}>{c.code}</span>
+                        </button>
+                      ))}
+                      <div className="border-t my-1" style={{ borderColor: 'var(--border-default)' }} />
+                      <button type="button"
+                        onClick={() => handleGenerateFingerprint()}
+                        className="w-full px-2.5 py-1.5 text-left flex items-center gap-2 text-[12px] hover:bg-white/5 transition-colors"
+                        style={{ color: 'var(--text-muted)' }}>
+                        <Shuffle size={14} /> Random country
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
 
               {/* Timezone + Language + Resolution */}
-              <div className="grid grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-[12px] font-medium mb-1.5" style={labelStyle}>Timezone</label>
                   <select value={timezone} onChange={e => setTimezone(e.target.value)}

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { Download, Github } from "lucide-react";
 
-const DOWNLOAD_URL = "https://github.com/warzrag/Spectra/releases/latest/download/Spectra-Setup-1.0.0.exe";
+const DOWNLOAD_URL = "https://github.com/warzrag/Spectra/releases/latest";
 const GITHUB_URL = "https://github.com/warzrag/Spectra";
 
 export default function Hero() {

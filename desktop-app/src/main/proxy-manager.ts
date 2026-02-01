@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import axios from 'axios';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 import { app } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -7,7 +8,7 @@ import * as path from 'path';
 export interface ProxyConfig {
   id?: string;
   name?: string;
-  type: 'http' | 'https' | 'socks5';
+  type: 'http' | 'https' | 'socks4' | 'socks5';
   host: string;
   port: number;
   username?: string;
@@ -149,100 +150,127 @@ export class ProxyManager {
     }
   }
 
-  // Add a new proxy to the pool
+  // Add a new proxy to the pool (no blocking test — add immediately)
   async addProxy(proxy: ProxyConfig): Promise<string> {
     const proxyId = proxy.id || crypto.randomBytes(8).toString('hex');
-    
-    // Test proxy before adding
-    const isHealthy = await this.testProxy(proxy);
-    
+
     this.proxyPool.set(proxyId, {
       ...proxy,
       id: proxyId,
-      isHealthy,
-      lastCheck: new Date(),
+      isHealthy: undefined,
+      lastCheck: undefined,
     });
-    
+
     this.saveProxyData();
     return proxyId;
   }
 
   // Add multiple proxies from text input (bulk import)
-  async addProxiesFromText(text: string): Promise<number> {
+  async addProxiesFromText(text: string): Promise<{ added: number; failed: number }> {
     const lines = text.split('\n').filter(line => line.trim());
     let added = 0;
-    
+    let failed = 0;
+
     for (const line of lines) {
       try {
         const proxy = this.parseProxyString(line.trim());
         if (proxy) {
           await this.addProxy(proxy);
           added++;
+        } else {
+          failed++;
+          console.warn('Unrecognized proxy format:', line.trim());
         }
       } catch (error) {
-        console.error('Failed to parse proxy:', line, error);
+        failed++;
+        console.error('Failed to add proxy:', line, error);
       }
     }
-    
-    return added;
+
+    return { added, failed };
   }
 
   // Parse proxy string in various formats
   private parseProxyString(proxyStr: string): ProxyConfig | null {
     // Format: protocol://username:password@host:port
-    const regex = /^(https?|socks5):\/\/(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/i;
+    const regex = /^(https?|socks[45]):\/\/(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/i;
     const match = proxyStr.match(regex);
-    
+
     if (match) {
       return {
-        type: match[1].toLowerCase() as 'http' | 'https' | 'socks5',
+        type: match[1].toLowerCase() as ProxyConfig['type'],
         username: match[2],
         password: match[3],
         host: match[4],
         port: parseInt(match[5], 10),
       };
     }
-    
+
     // Alternative format: host:port:username:password
     const parts = proxyStr.split(':');
-    if (parts.length >= 2) {
+    if (parts.length >= 2 && parseInt(parts[1], 10) > 0) {
       return {
         type: 'http',
         host: parts[0],
         port: parseInt(parts[1], 10),
-        username: parts[2],
-        password: parts[3],
+        username: parts[2] || undefined,
+        password: parts[3] || undefined,
       };
     }
-    
+
     return null;
   }
 
-  // Test proxy connectivity
+  // Test proxy connectivity (supports HTTP, HTTPS, SOCKS4, SOCKS5)
+  // Also detects country and IP via ip-api.com
   async testProxy(proxy: ProxyConfig): Promise<boolean> {
-    const testUrls = [
-      'https://httpbin.org/ip',
-      'https://api.ipify.org?format=json',
-    ];
-    
+    const testUrl = 'http://ip-api.com/json/?fields=status,countryCode,query';
+
     try {
-      const axiosConfig: any = {
-        timeout: 10000,
-        proxy: {
-          protocol: proxy.type,
-          host: proxy.host,
-          port: proxy.port,
-        },
-      };
-      
-      if (proxy.username && proxy.password) {
-        axiosConfig.proxy.auth = {
-          username: proxy.username,
-          password: proxy.password,
+      const isSocks = proxy.type === 'socks4' || proxy.type === 'socks5';
+      let response: any;
+
+      if (isSocks) {
+        const auth = proxy.username && proxy.password
+          ? `${proxy.username}:${proxy.password}@` : '';
+        const agentUrl = `${proxy.type}://${auth}${proxy.host}:${proxy.port}`;
+        const agent = new SocksProxyAgent(agentUrl);
+
+        response = await axios.get(testUrl, {
+          timeout: 10000,
+          httpAgent: agent,
+          httpsAgent: agent,
+          proxy: false,
+        });
+      } else {
+        const axiosConfig: any = {
+          timeout: 10000,
+          proxy: {
+            protocol: proxy.type,
+            host: proxy.host,
+            port: proxy.port,
+          },
         };
+
+        if (proxy.username && proxy.password) {
+          axiosConfig.proxy.auth = {
+            username: proxy.username,
+            password: proxy.password,
+          };
+        }
+
+        response = await axios.get(testUrl, axiosConfig);
       }
-      
-      const response = await axios.get(testUrls[0], axiosConfig);
+
+      // Extract country from response
+      if (response.status === 200 && response.data) {
+        const data = response.data;
+        if (data.countryCode) {
+          proxy.country = data.countryCode;
+          console.log(`[Proxy] Detected country: ${data.countryCode} (IP: ${data.query})`);
+        }
+      }
+
       return response.status === 200;
     } catch (error) {
       console.error('Proxy test failed:', error);
@@ -398,6 +426,35 @@ export class ProxyManager {
     }
     
     return proxy;
+  }
+
+  // Auto-assign proxies to profiles that don't have one (round-robin)
+  autoAssignProxies(profiles: { id: string; proxy?: any }[]): { profileId: string; proxy: ProxyConfig }[] {
+    const allProxies = Array.from(this.proxyPool.values());
+    if (allProxies.length === 0) return [];
+
+    // Filter profiles without a proxy
+    const unassigned = profiles.filter(p => !p.proxy || !p.proxy.host);
+    if (unassigned.length === 0) return [];
+
+    const assignments: { profileId: string; proxy: ProxyConfig }[] = [];
+
+    for (let i = 0; i < unassigned.length; i++) {
+      const proxy = allProxies[i % allProxies.length]; // round-robin
+      this.assignProxyToProfile(unassigned[i].id, proxy.id!);
+      assignments.push({
+        profileId: unassigned[i].id,
+        proxy: {
+          type: proxy.type,
+          host: proxy.host,
+          port: proxy.port,
+          username: proxy.username,
+          password: proxy.password,
+        } as ProxyConfig,
+      });
+    }
+
+    return assignments;
   }
 
   // Health check all proxies

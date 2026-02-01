@@ -7,6 +7,7 @@ const USERS_COLLECTION = 'users';
 const PROFILES_COLLECTION = 'profiles';
 const FOLDERS_COLLECTION = 'folders';
 const EXTENSIONS_COLLECTION = 'extensions';
+const PROXIES_COLLECTION = 'proxies';
 
 // ── Activity Logs ──────────────────────────────────────────────
 
@@ -239,4 +240,96 @@ export async function setExtensionEnabled(extensionId: string, enabled: boolean)
 
 export async function unregisterExtension(extensionId: string): Promise<void> {
   await deleteDoc(doc(db, EXTENSIONS_COLLECTION, extensionId));
+}
+
+// ── Proxies (Cloud Sync) ──────────────────────────────────────
+
+export interface FirestoreProxy {
+  id: string;
+  name?: string;
+  type: string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  provider?: string;
+  country?: string;
+  isHealthy?: boolean;
+  lastCheck?: string;
+  responseTime?: number;
+  createdBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export function subscribeToProxies(callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
+  const q = query(collection(db, PROXIES_COLLECTION), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snapshot) => {
+    const proxies: FirestoreProxy[] = snapshot.docs.map(d => ({
+      id: d.id,
+      ...d.data(),
+    })) as FirestoreProxy[];
+    callback(proxies);
+  }, (error) => {
+    console.error('Proxies subscription error:', error);
+  });
+}
+
+export async function createProxy(proxyData: Omit<FirestoreProxy, 'id'>, userId: string): Promise<FirestoreProxy> {
+  const now = new Date().toISOString();
+  const data = {
+    ...proxyData,
+    createdBy: userId,
+    createdAt: now,
+    updatedAt: now,
+  };
+  const docRef = await addDoc(collection(db, PROXIES_COLLECTION), data);
+  return { id: docRef.id, ...data } as FirestoreProxy;
+}
+
+export async function createProxiesBulk(proxies: Omit<FirestoreProxy, 'id'>[], userId: string): Promise<{ added: number; failed: number }> {
+  const now = new Date().toISOString();
+  let added = 0;
+  let failed = 0;
+  const batch = writeBatch(db);
+
+  for (const proxy of proxies) {
+    try {
+      const docRef = doc(collection(db, PROXIES_COLLECTION));
+      batch.set(docRef, {
+        ...proxy,
+        createdBy: userId,
+        createdAt: now,
+        updatedAt: now,
+      });
+      added++;
+    } catch {
+      failed++;
+    }
+  }
+
+  if (added > 0) {
+    await batch.commit();
+  }
+  return { added, failed };
+}
+
+export async function updateProxy(proxyId: string, data: Partial<FirestoreProxy>): Promise<void> {
+  const { id, ...updateData } = data as any;
+  await updateDoc(doc(db, PROXIES_COLLECTION, proxyId), {
+    ...updateData,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+export async function deleteProxy(proxyId: string): Promise<void> {
+  await deleteDoc(doc(db, PROXIES_COLLECTION, proxyId));
+}
+
+export async function deleteProxiesBulk(proxyIds: string[]): Promise<void> {
+  const batch = writeBatch(db);
+  for (const id of proxyIds) {
+    batch.delete(doc(db, PROXIES_COLLECTION, id));
+  }
+  await batch.commit();
 }

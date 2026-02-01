@@ -2,12 +2,26 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Users collection - authenticated users can read all, write own doc or admin can write any
+    // Users collection
     match /users/{userId} {
       allow read: if request.auth != null;
+
+      // Nobody can modify/delete the owner's document (except the owner themselves)
+      // Owner and admin can write other user documents
+      // Users can write their own document
       allow write: if request.auth != null && (
-        request.auth.uid == userId ||
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        // Block anyone from modifying an owner's doc (except the owner)
+        (resource == null || resource.data.role != 'owner' || request.auth.uid == userId)
+        &&
+        // Block anyone from setting role to 'owner' (only existing owners keep it)
+        (!('role' in request.resource.data) || request.resource.data.role != 'owner' || (resource != null && resource.data.role == 'owner' && request.auth.uid == userId))
+        &&
+        // Permission: own doc, or owner, or admin
+        (
+          request.auth.uid == userId ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner' ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        )
       );
     }
 
@@ -23,6 +37,11 @@ service cloud.firestore {
 
     // Extensions collection - any authenticated user can CRUD
     match /extensions/{extensionId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Proxies collection - any authenticated user can CRUD
+    match /proxies/{proxyId} {
       allow read, write: if request.auth != null;
     }
 
