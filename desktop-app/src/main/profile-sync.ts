@@ -20,7 +20,6 @@ const EXCLUDE_DIRS = new Set([
   'BrowserMetrics',
   'Crashpad',
   'Safe Browsing',
-  'Network',
   'optimization_guide_model_store',
   'optimization_guide_prediction_model_downloads',
   'session-storage-backup',
