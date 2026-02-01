@@ -1,0 +1,65 @@
+{
+  "appId": "com.spectra.browser",
+  "productName": "Spectra",
+  "copyright": "Copyright © 2025 Spectra Team",
+  "directories": {
+    "output": "build",
+    "buildResources": "assets"
+  },
+  "asar": true,
+  "asarUnpack": [
+    "node_modules/sqlite3/**/*",
+    "node_modules/puppeteer/**/*",
+    "node_modules/puppeteer-extra/**/*",
+    "node_modules/puppeteer-extra-plugin-stealth/**/*",
+    "node_modules/electron-store/**/*"
+  ],
+  "files": [
+    "dist/**/*",
+    "node_modules/**/*",
+    "assets/icon.png"
+  ],
+  "extraResources": [
+    {
+      "from": "assets",
+      "to": "assets",
+      "filter": ["icon.png", "icon-256.png"]
+    }
+  ],
+  "win": {
+    "icon": "assets/icon.ico",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ],
+    "signAndEditExecutable": false,
+    "artifactName": "${productName}-Setup-${version}.${ext}"
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "license": "assets/LICENSE.txt",
+    "installerIcon": "assets/icon.ico",
+    "uninstallerIcon": "assets/icon.ico",
+    "installerHeaderIcon": "assets/icon.ico",
+    "createDesktopShortcut": "always",
+    "createStartMenuShortcut": true,
+    "shortcutName": "Spectra",
+    "perMachine": true,
+    "allowElevation": false,
+    "runAfterFinish": true,
+    "uninstallDisplayName": "Spectra"
+  },
+  "mac": {
+    "icon": "assets/icon.png",
+    "category": "public.app-category.productivity",
+    "target": ["dmg"]
+  },
+  "linux": {
+    "icon": "assets/icon.png",
+    "target": ["AppImage"],
+    "category": "Network"
+  }
+}

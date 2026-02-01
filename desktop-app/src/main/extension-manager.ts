@@ -1,0 +1,177 @@
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import AdmZip from 'adm-zip';
+
+const EXTENSIONS_DIR = path.join(os.homedir(), '.antidetect-browser', 'extensions');
+
+export interface InstalledExtension {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  localPath: string;
+}
+
+function ensureExtensionsDir(): void {
+  if (!fs.existsSync(EXTENSIONS_DIR)) {
+    fs.mkdirSync(EXTENSIONS_DIR, { recursive: true });
+  }
+}
+
+function readManifest(extDir: string): { name: string; version: string; description: string } | null {
+  const manifestPath = path.join(extDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) return null;
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    return {
+      name: manifest.name || 'Unknown Extension',
+      version: manifest.version || '0.0.0',
+      description: manifest.description || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function copyDirRecursive(src: string, dest: string): void {
+  fs.mkdirSync(dest, { recursive: true });
+  const entries = fs.readdirSync(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const destPath = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      copyDirRecursive(srcPath, destPath);
+    } else {
+      fs.copyFileSync(srcPath, destPath);
+    }
+  }
+}
+
+export function installExtension(filePath: string): InstalledExtension {
+  ensureExtensionsDir();
+
+  const extId = Date.now().toString();
+  const extDir = path.join(EXTENSIONS_DIR, extId);
+  fs.mkdirSync(extDir, { recursive: true });
+
+  try {
+    // Check if filePath is a directory (unpacked extension)
+    if (fs.statSync(filePath).isDirectory()) {
+      copyDirRecursive(filePath, extDir);
+
+      const manifest = readManifest(extDir);
+      if (!manifest) {
+        fs.rmSync(extDir, { recursive: true, force: true });
+        throw new Error('Invalid extension: no manifest.json found in folder');
+      }
+
+      return {
+        id: extId,
+        name: manifest.name,
+        version: manifest.version,
+        description: manifest.description,
+        localPath: extDir,
+      };
+    }
+
+    // File-based install (.crx or .zip)
+    const fileBuffer = fs.readFileSync(filePath);
+    let zipBuffer = fileBuffer;
+
+    // .crx files have a header before the zip data
+    // CRX3 format: "Cr24" magic + version(4) + header_length(4) + header + zip
+    // CRX2 format: "Cr24" magic + version(4) + pk_length(4) + sig_length(4) + pk + sig + zip
+    const magic = fileBuffer.toString('ascii', 0, 4);
+    if (magic === 'Cr24') {
+      const version = fileBuffer.readUInt32LE(4);
+      if (version === 3) {
+        // CRX3: header length at offset 8
+        const headerLength = fileBuffer.readUInt32LE(8);
+        zipBuffer = fileBuffer.subarray(12 + headerLength);
+      } else if (version === 2) {
+        // CRX2: public key length at offset 8, signature length at offset 12
+        const pkLength = fileBuffer.readUInt32LE(8);
+        const sigLength = fileBuffer.readUInt32LE(12);
+        zipBuffer = fileBuffer.subarray(16 + pkLength + sigLength);
+      }
+    }
+
+    const zip = new AdmZip(zipBuffer as Buffer);
+    zip.extractAllTo(extDir, true);
+
+    // Check if contents are inside a subfolder (some zips have a root folder)
+    const entries = fs.readdirSync(extDir);
+    if (entries.length === 1) {
+      const subDir = path.join(extDir, entries[0]);
+      if (fs.statSync(subDir).isDirectory() && fs.existsSync(path.join(subDir, 'manifest.json'))) {
+        // Move contents up
+        const subEntries = fs.readdirSync(subDir);
+        for (const entry of subEntries) {
+          fs.renameSync(path.join(subDir, entry), path.join(extDir, entry));
+        }
+        fs.rmdirSync(subDir);
+      }
+    }
+
+    const manifest = readManifest(extDir);
+    if (!manifest) {
+      fs.rmSync(extDir, { recursive: true, force: true });
+      throw new Error('Invalid extension: no manifest.json found');
+    }
+
+    return {
+      id: extId,
+      name: manifest.name,
+      version: manifest.version,
+      description: manifest.description,
+      localPath: extDir,
+    };
+  } catch (error: any) {
+    // Cleanup on failure
+    if (fs.existsSync(extDir)) {
+      fs.rmSync(extDir, { recursive: true, force: true });
+    }
+    throw error;
+  }
+}
+
+export function getInstalledExtensions(): InstalledExtension[] {
+  ensureExtensionsDir();
+
+  const extensions: InstalledExtension[] = [];
+  const entries = fs.readdirSync(EXTENSIONS_DIR);
+
+  for (const entry of entries) {
+    const extDir = path.join(EXTENSIONS_DIR, entry);
+    if (!fs.statSync(extDir).isDirectory()) continue;
+
+    const manifest = readManifest(extDir);
+    if (manifest) {
+      extensions.push({
+        id: entry,
+        name: manifest.name,
+        version: manifest.version,
+        description: manifest.description,
+        localPath: extDir,
+      });
+    }
+  }
+
+  return extensions;
+}
+
+export function removeExtension(extensionId: string): boolean {
+  const extDir = path.join(EXTENSIONS_DIR, extensionId);
+  if (fs.existsSync(extDir)) {
+    fs.rmSync(extDir, { recursive: true, force: true });
+    return true;
+  }
+  return false;
+}
+
+export function getExtensionPaths(extensionIds: string[]): string[] {
+  return extensionIds
+    .map(id => path.join(EXTENSIONS_DIR, id))
+    .filter(p => fs.existsSync(p) && fs.existsSync(path.join(p, 'manifest.json')));
+}

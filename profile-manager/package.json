@@ -1,0 +1,20 @@
+{
+  "name": "profile-manager",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node": "^24.3.1",
+    "bcrypt": "^6.0.0",
+    "crypto-js": "^4.2.0",
+    "sqlite3": "^5.1.7",
+    "typescript": "^5.9.2",
+    "uuid": "^11.1.0"
+  }
+}

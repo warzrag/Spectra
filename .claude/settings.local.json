@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run dev:*)",
+      "Bash(curl:*)",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_install",
+      "Bash(node scripts/generate-icon.js:*)",
+      "Bash(npx:*)",
+      "Bash(node scripts/png-to-ico.js:*)",
+      "Bash(npm run build:*)",
+      "Bash(powershell.exe -Command \"node --version\")",
+      "Bash(powershell.exe -Command \"cd D:\\\\claude\\\\client_nico\\\\antidetect-browser\\\\desktop-app; npx electron-builder --config electron-builder.json --win\")",
+      "Bash(ls:*)",
+      "Bash(powershell.exe -Command \"cd D:\\\\claude\\\\Spectra; .\\\\Spectra.exe 2>&1\")",
+      "Bash(powershell.exe -Command \"Get-Process -Name ''Spectra'' -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2; Write-Output ''Done''\")",
+      "Bash(powershell.exe:*)",
+      "WebSearch",
+      "WebFetch(domain:www.adspower.com)",
+      "WebFetch(domain:help.adspower.com)",
+      "WebFetch(domain:gologin.com)",
+      "Bash(npm install:*)",
+      "Bash(firebase deploy:*)",
+      "Bash(nvm list:*)",
+      "Bash(node --version:*)",
+      "Bash(cmd.exe /c \"node --version\")",
+      "Bash(cmd.exe /c \"cd /d D:\\\\claude\\\\client_nico\\\\antidetect-browser\\\\admin-panel && firebase deploy --only firestore:rules\")",
+      "Bash(npm run build:electron:*)",
+      "Bash(grep:*)",
+      "Bash(python3:*)",
+      "Bash(cmd.exe /c \"reg query \"\"HKLM\\\\SOFTWARE\\\\Policies\\\\Google\\\\Chrome\"\" 2>&1 & reg query \"\"HKCU\\\\SOFTWARE\\\\Policies\\\\Google\\\\Chrome\"\" 2>&1\")",
+      "Bash(cmd.exe:*)",
+      "Bash(node:*)",
+      "Bash(xxd:*)",
+      "Bash(./node_modules/.bin/tsc:*)",
+      "Bash(vercel --version:*)"
+    ]
+  }
+}

@@ -1,0 +1,108 @@
+export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'activity' | 'recycle-bin' | 'billing' | 'members';
+
+export type UserRole = 'admin' | 'va';
+
+export interface AppUser {
+  uid: string;
+  email: string;
+  displayName: string | null;
+  role: UserRole;
+}
+
+export interface ActivityLogEntry {
+  id?: string;
+  userId: string;
+  userName: string;
+  action: 'profile_launched' | 'profile_closed' | 'profile_created' | 'profile_deleted' | 'profile_restored' | 'profile_permanently_deleted' | 'user_login' | 'user_logout' | 'cookies_imported' | 'cookies_exported';
+  targetProfileId?: string;
+  targetProfileName?: string;
+  timestamp: string;
+  metadata?: Record<string, any>;
+}
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  role: UserRole;
+  displayName?: string;
+  createdAt: string;
+}
+
+export type Platform = 'twitter' | 'instagram' | 'tiktok' | 'reddit' | 'onlyfans' | 'telegram' | 'other';
+
+export interface Profile {
+  id: string;
+  name: string;
+  platform?: Platform;
+  folderId?: string;
+  userAgent: string;
+  timezone: string;
+  language: string;
+  screenResolution: string;
+  proxy?: {
+    type: string;
+    host: string;
+    port: number;
+    username?: string;
+    password?: string;
+  };
+  fingerprint?: any;
+  hardwareConcurrency?: number;
+  deviceMemory?: number;
+  webglVendor?: string;
+  webglRenderer?: string;
+  preset?: string;
+  os?: 'windows' | 'macos' | 'linux';
+  browserType?: 'chrome' | 'firefox' | 'edge';
+  tags?: string[];
+  notes?: string;
+  assignedTo?: string;
+  assignedToEmail?: string;
+  deleted?: boolean;
+  deletedAt?: string;
+  deletedBy?: string;
+  connectionType?: string;
+  connectionConfig?: any;
+  createdAt: string;
+  createdBy?: string;
+  updatedAt?: string;
+  lastUsed?: string;
+  lastUrl?: string;
+}
+
+export interface Folder {
+  id: string;
+  name: string;
+  parentId?: string;
+  icon?: string;
+  color?: string;
+  createdAt: string;
+  createdBy?: string;
+  updatedAt?: string;
+  profileCount?: number;
+}
+
+export interface Extension {
+  id: string;
+  name: string;
+  version?: string;
+  description?: string;
+  enabled: boolean;
+  localPath?: string;
+  createdAt: string;
+}
+
+export interface AppSettings {
+  theme: 'dark' | 'light';
+  language: string;
+  defaultOS: 'windows' | 'macos' | 'linux';
+  defaultBrowser: 'chrome' | 'firefox' | 'edge';
+  sortBy: 'name' | 'created' | 'lastUsed';
+  sortOrder: 'asc' | 'desc';
+}
+
+export interface StoreData {
+  profiles: Profile[];
+  folders: Folder[];
+  settings: AppSettings;
+}

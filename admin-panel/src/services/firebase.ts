@@ -1,0 +1,19 @@
+import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBANJWl76DuMwb3ci2i_4WWrXniCbqowLs",
+  authDomain: "spectra-59160.firebaseapp.com",
+  databaseURL: "https://spectra-59160-default-rtdb.firebaseio.com",
+  projectId: "spectra-59160",
+  storageBucket: "spectra-59160.firebasestorage.app",
+  messagingSenderId: "583704444265",
+  appId: "1:583704444265:web:75db7a2c41ed6b301391f8",
+  measurementId: "G-81JZLEN7Y7"
+};
+
+const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+export const db = getFirestore(app);
+export const FIREBASE_API_KEY = firebaseConfig.apiKey;

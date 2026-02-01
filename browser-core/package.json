@@ -1,0 +1,19 @@
+{
+  "name": "browser-core",
+  "version": "1.0.0",
+  "description": "Ce module contient l'intégration avec Chromium et le système de lancement de navigateurs avec des fingerprints personnalisés.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node": "^24.3.1",
+    "chrome-launcher": "^1.2.0",
+    "proxy-chain": "^2.5.9",
+    "puppeteer-core": "^24.19.0",
+    "typescript": "^5.9.2"
+  }
+}

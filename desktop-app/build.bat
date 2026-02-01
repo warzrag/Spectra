@@ -1,0 +1,13 @@
+@echo off
+echo Building AntiDetect Browser...
+echo.
+echo Step 1: Building React application...
+call npm run build:react
+echo.
+echo Step 2: Compiling TypeScript...
+call npm run build:electron
+echo.
+echo Step 3: Creating executable...
+call npm run compile
+echo.
+echo Build complete! Check the 'build' directory for the installer.

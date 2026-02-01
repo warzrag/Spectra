@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Spectra URL Tracker",
+  "version": "1.0",
+  "description": "Tracks current URL for profile persistence and handles proxy auth",
+  "permissions": [
+    "tabs",
+    "storage",
+    "webNavigation",
+    "webRequest",
+    "webRequestAuthProvider"
+  ],
+  "host_permissions": [
+    "http://localhost:45678/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["stealth.js", "content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}
