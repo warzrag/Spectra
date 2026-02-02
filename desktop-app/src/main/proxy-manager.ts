@@ -428,7 +428,7 @@ export class ProxyManager {
     return proxy;
   }
 
-  // Auto-assign proxies to profiles that don't have one (round-robin)
+  // Auto-assign proxies to profiles that don't have one (1 unique proxy per profile)
   autoAssignProxies(profiles: { id: string; proxy?: any }[]): { profileId: string; proxy: ProxyConfig }[] {
     const allProxies = Array.from(this.proxyPool.values());
     if (allProxies.length === 0) return [];
@@ -437,10 +437,28 @@ export class ProxyManager {
     const unassigned = profiles.filter(p => !p.proxy || !p.proxy.host);
     if (unassigned.length === 0) return [];
 
+    // Find proxies already used by assigned profiles
+    const usedProxyIds = new Set<string>();
+    for (const p of profiles) {
+      if (p.proxy && p.proxy.host) {
+        // Find matching proxy in pool by host:port
+        for (const poolProxy of allProxies) {
+          if (poolProxy.host === p.proxy.host && poolProxy.port === p.proxy.port) {
+            usedProxyIds.add(poolProxy.id!);
+            break;
+          }
+        }
+      }
+    }
+
+    // Get available (unused) proxies
+    const available = allProxies.filter(p => !usedProxyIds.has(p.id!));
+    if (available.length === 0) return [];
+
     const assignments: { profileId: string; proxy: ProxyConfig }[] = [];
 
-    for (let i = 0; i < unassigned.length; i++) {
-      const proxy = allProxies[i % allProxies.length]; // round-robin
+    for (let i = 0; i < unassigned.length && i < available.length; i++) {
+      const proxy = available[i];
       this.assignProxyToProfile(unassigned[i].id, proxy.id!);
       assignments.push({
         profileId: unassigned[i].id,
