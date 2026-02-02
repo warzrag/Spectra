@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, RefreshCw, CheckCircle, XCircle, Download, Shield, Globe, X, Shuffle, Search, Copy, AlertCircle, Zap, Clock, Filter, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Plus, Trash2, RefreshCw, CheckCircle, XCircle, Download, Shield, Globe, X, Shuffle, Search, Copy, AlertCircle, Zap, Clock, Filter, ChevronDown, Link2, Unlink } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Profile } from '../../types';
 import {
@@ -52,6 +52,8 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
   const [showFilters, setShowFilters] = useState(false);
+  const [assignDropdownProxy, setAssignDropdownProxy] = useState<string | null>(null);
+  const assignDropdownRef = useRef<HTMLDivElement>(null);
 
   // Subscribe to Firestore proxies (real-time sync)
   useEffect(() => {
@@ -61,6 +63,17 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
     });
     return () => unsub();
   }, []);
+
+  // Close assign dropdown on click outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (assignDropdownRef.current && !assignDropdownRef.current.contains(e.target as Node)) {
+        setAssignDropdownProxy(null);
+      }
+    };
+    if (assignDropdownProxy) document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [assignDropdownProxy]);
 
   // Parse proxy string in various formats
   const parseProxyString = (proxyStr: string): Omit<Proxy, 'id'> | null => {
@@ -216,6 +229,40 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
     showToast(`Removed ${count} proxies`, 'success');
   };
 
+  // Assign a specific proxy to a specific profile
+  const handleAssignToProfile = async (proxy: Proxy, profileId: string) => {
+    if (!onUpdateProfile) return;
+    try {
+      const proxyData = { type: proxy.type, host: proxy.host, port: proxy.port, username: proxy.username, password: proxy.password };
+      await onUpdateProfile(profileId, {
+        proxy: proxyData,
+        connectionType: 'proxy',
+        connectionConfig: { type: 'proxy', proxy: proxyData },
+      });
+      showToast(`Proxy assigned to profile`, 'success');
+      setAssignDropdownProxy(null);
+    } catch (error) {
+      console.error('Assign failed:', error);
+      showToast('Failed to assign proxy', 'error');
+    }
+  };
+
+  // Unassign proxy from a profile
+  const handleUnassignProfile = async (profileId: string) => {
+    if (!onUpdateProfile) return;
+    try {
+      await onUpdateProfile(profileId, {
+        proxy: null,
+        connectionType: 'system',
+        connectionConfig: { type: 'system' },
+      });
+      showToast('Proxy removed from profile', 'success');
+    } catch (error) {
+      console.error('Unassign failed:', error);
+    }
+  };
+
+  // Auto-assign: 1 unique proxy per unassigned profile (uses Firestore data directly)
   const handleAutoAssign = async () => {
     if (proxies.length === 0) {
       showToast('No proxies available', 'error');
@@ -226,24 +273,37 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
       showToast('All profiles already have a proxy', 'info');
       return;
     }
-    try {
-      const assignments = await window.electronAPI.proxy.autoAssign(
-        profiles.map(p => ({ id: p.id, proxy: p.proxy }))
-      );
-      if (onUpdateProfile) {
-        for (const a of assignments) {
-          await onUpdateProfile(a.profileId, {
-            proxy: a.proxy,
-            connectionType: 'proxy',
-            connectionConfig: { type: 'proxy', proxy: a.proxy },
-          });
-        }
+    if (!onUpdateProfile) return;
+
+    // Find which proxies are already used (by host:port)
+    const usedKeys = new Set<string>();
+    for (const p of profiles) {
+      if (p.proxy && (p.proxy as any).host) {
+        usedKeys.add(`${(p.proxy as any).host}:${(p.proxy as any).port}`);
       }
-      showToast(`${assignments.length} proxies assigned to profiles`, 'success');
-    } catch (error) {
-      console.error('Auto-assign failed:', error);
-      showToast('Auto-assign failed', 'error');
     }
+
+    // Get available proxies (not used by any profile)
+    const available = proxies.filter(px => !usedKeys.has(`${px.host}:${px.port}`));
+    if (available.length === 0) {
+      showToast('No free proxies available', 'error');
+      return;
+    }
+
+    let assigned = 0;
+    for (let i = 0; i < unassigned.length && i < available.length; i++) {
+      const proxy = available[i];
+      const proxyData = { type: proxy.type, host: proxy.host, port: proxy.port, username: proxy.username, password: proxy.password };
+      try {
+        await onUpdateProfile(unassigned[i].id, {
+          proxy: proxyData,
+          connectionType: 'proxy',
+          connectionConfig: { type: 'proxy', proxy: proxyData },
+        });
+        assigned++;
+      } catch {}
+    }
+    showToast(`${assigned} proxies assigned to profiles`, 'success');
   };
 
   const exportProxies = () => {
@@ -341,9 +401,14 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
     return matchesSearch && matchesStatus && matchesType;
   });
 
-  // Assigned profiles count per proxy
-  const getAssignedCount = (proxy: Proxy) => {
-    return profiles.filter(p => p.proxy && (p.proxy as any).host === proxy.host && (p.proxy as any).port === proxy.port).length;
+  // Get profiles assigned to a specific proxy
+  const getAssignedProfiles = (proxy: Proxy) => {
+    return profiles.filter(p => p.proxy && (p.proxy as any).host === proxy.host && (p.proxy as any).port === proxy.port);
+  };
+
+  // Get profiles that don't have any proxy assigned
+  const getUnassignedProfiles = () => {
+    return profiles.filter(p => !p.proxy || !(p.proxy as any).host);
   };
 
   return (
@@ -627,7 +692,8 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
               {filteredProxies.map(proxy => {
                 const isSelected = selectedProxies.has(proxy.id);
                 const isTesting = testingProxies.has(proxy.id);
-                const assignedCount = getAssignedCount(proxy);
+                const assignedProfiles = getAssignedProfiles(proxy);
+                const unassignedProfiles = getUnassignedProfiles();
 
                 return (
                   <tr
@@ -687,13 +753,52 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
                     </td>
 
                     <td className="px-3 py-2.5">
-                      {assignedCount > 0 ? (
-                        <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium" style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}>
-                          {assignedCount} profile{assignedCount > 1 ? 's' : ''}
-                        </span>
-                      ) : (
-                        <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>-</span>
-                      )}
+                      <div className="relative" ref={assignDropdownProxy === proxy.id ? assignDropdownRef : undefined}>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {assignedProfiles.map(p => (
+                            <span key={p.id} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium" style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}>
+                              {p.name}
+                              <button
+                                onClick={(e) => { e.stopPropagation(); handleUnassignProfile(p.id); }}
+                                className="hover:opacity-70"
+                                title={`Remove proxy from ${p.name}`}
+                              >
+                                <X size={9} />
+                              </button>
+                            </span>
+                          ))}
+                          <button
+                            onClick={() => setAssignDropdownProxy(assignDropdownProxy === proxy.id ? null : proxy.id)}
+                            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors"
+                            style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)', border: '1px solid var(--border-default)' }}
+                            title="Assign to profile"
+                          >
+                            <Link2 size={9} /> Assign
+                          </button>
+                        </div>
+                        {assignDropdownProxy === proxy.id && (
+                          <div className="absolute top-full left-0 mt-1 w-48 rounded-lg shadow-xl z-50 overflow-hidden" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }}>
+                            <div className="py-1 max-h-48 overflow-auto">
+                              {unassignedProfiles.length === 0 ? (
+                                <div className="px-3 py-2 text-[11px]" style={{ color: 'var(--text-muted)' }}>All profiles have a proxy</div>
+                              ) : (
+                                unassignedProfiles.map(p => (
+                                  <button
+                                    key={p.id}
+                                    onClick={() => handleAssignToProfile(proxy, p.id)}
+                                    className="w-full px-3 py-1.5 text-left text-[12px] transition-colors flex items-center gap-2"
+                                    style={{ color: 'var(--text-primary)' }}
+                                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                                  >
+                                    {p.name}
+                                  </button>
+                                ))
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     </td>
 
                     <td className="px-3 py-2.5">

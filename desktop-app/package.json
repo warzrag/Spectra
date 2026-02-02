@@ -1,6 +1,6 @@
 {
   "name": "spectra",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Spectra - Multi-profile browser management",
   "main": "dist/src/main/main.js",
   "scripts": {
