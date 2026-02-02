@@ -114,24 +114,38 @@ export function subscribeToFolders(callback: (folders: Folder[]) => void): Unsub
   });
 }
 
+// Recursively remove undefined values (Firestore rejects them)
+function removeUndefined(obj: any): any {
+  if (obj === null || obj === undefined) return null;
+  if (Array.isArray(obj)) return obj.map(removeUndefined);
+  if (typeof obj === 'object') {
+    const clean: any = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v !== undefined) clean[k] = removeUndefined(v);
+    }
+    return clean;
+  }
+  return obj;
+}
+
 export async function createProfile(profileData: Omit<Profile, 'id'>, userId: string): Promise<Profile> {
   const now = new Date().toISOString();
-  const data = {
+  const data = removeUndefined({
     ...profileData,
     createdBy: userId,
     createdAt: profileData.createdAt || now,
     updatedAt: now,
-  };
+  });
   const docRef = await addDoc(collection(db, PROFILES_COLLECTION), data);
   return { id: docRef.id, ...data } as Profile;
 }
 
 export async function updateProfile(profileId: string, data: Partial<Profile>): Promise<void> {
   const { id, ...updateData } = data as any;
-  await updateDoc(doc(db, PROFILES_COLLECTION, profileId), {
+  await updateDoc(doc(db, PROFILES_COLLECTION, profileId), removeUndefined({
     ...updateData,
     updatedAt: new Date().toISOString(),
-  });
+  }));
 }
 
 export async function deleteProfile(profileId: string): Promise<void> {
