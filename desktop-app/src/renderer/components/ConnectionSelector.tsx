@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { CheckCircle, XCircle, Loader, Eye, EyeOff } from 'lucide-react';
+import { subscribeToProxies, FirestoreProxy } from '../services/firestore-service';
 
 interface ConnectionSelectorProps {
   value?: any;
@@ -47,13 +48,22 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ value, onChange
   const [selectedSavedId, setSelectedSavedId] = useState('');
   const [provider, setProvider] = useState(hasProxy ? (value.proxy.provider || 'brightdata') : 'brightdata');
 
-  // Load saved proxies when switching to "saved" mode
+  // Load saved proxies from Firestore (real-time sync)
   useEffect(() => {
-    if (mode === 'saved') {
-      window.electronAPI?.proxy?.getAll().then((proxies: SavedProxy[]) => {
-        setSavedProxies(proxies || []);
-      }).catch(() => {});
-    }
+    if (mode !== 'saved') return;
+    const unsub = subscribeToProxies((allProxies: FirestoreProxy[]) => {
+      setSavedProxies(allProxies.map(p => ({
+        id: p.id,
+        type: p.type,
+        host: p.host,
+        port: p.port,
+        username: p.username,
+        password: p.password,
+        provider: p.provider,
+        isHealthy: p.isHealthy,
+      })));
+    });
+    return () => unsub();
   }, [mode]);
 
   // Emit onChange whenever proxy fields change
@@ -116,7 +126,8 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ value, onChange
         username: login || undefined,
         password: password || undefined,
       });
-      setTestResult(result ? 'success' : 'error');
+      const isHealthy = result && typeof result === 'object' ? (result as any).isHealthy : !!result;
+      setTestResult(isHealthy ? 'success' : 'error');
     } catch {
       setTestResult('error');
     } finally {
