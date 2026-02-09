@@ -64,16 +64,16 @@ export default function Navbar() {
 
         {/* Right section */}
         <div className="flex items-center gap-4">
-          {/* Download button - desktop */}
+          {/* Get Started button - desktop */}
           <a
-            href="https://github.com/warzrag/Spectra/releases/latest"
+            href="/signup"
             className="hidden rounded-lg px-5 py-2 font-medium text-white transition-opacity duration-200 hover:opacity-90 md:inline-flex"
             style={{
               fontSize: "14px",
               background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
             }}
           >
-            Download
+            Get Started
           </a>
 
           {/* Mobile hamburger */}
@@ -120,7 +120,7 @@ export default function Navbar() {
               </a>
             ))}
             <a
-              href="https://github.com/warzrag/Spectra/releases/latest"
+              href="/signup"
               className="mt-1 rounded-lg px-5 py-2.5 text-center font-medium text-white transition-opacity duration-200 hover:opacity-90"
               style={{
                 fontSize: "14px",
@@ -128,7 +128,7 @@ export default function Navbar() {
               }}
               onClick={() => setMobileOpen(false)}
             >
-              Download
+              Get Started
             </a>
           </div>
         </div>

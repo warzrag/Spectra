@@ -1,10 +1,9 @@
-import { Shield, Github, Twitter } from "lucide-react";
+import { Shield, Twitter } from "lucide-react";
 
 const productLinks = [
   { label: "Features", href: "#features" },
   { label: "Pricing", href: "#pricing" },
-  { label: "Download", href: "https://github.com/warzrag/Spectra/releases/latest" },
-  { label: "Changelog", href: "https://github.com/warzrag/Spectra/releases" },
+  { label: "Get Started", href: "/signup" },
 ];
 
 const resourceLinks = [
@@ -21,7 +20,6 @@ const legalLinks = [
 ];
 
 const socialLinks = [
-  { icon: Github, href: "https://github.com/warzrag/Spectra", label: "GitHub" },
   { icon: Twitter, href: "#", label: "Twitter" },
 ];
 
