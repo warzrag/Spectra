@@ -40,7 +40,17 @@
       "Bash(npm run dist:win:*)",
       "Bash(./node_modules/.bin/firebase deploy:*)",
       "Bash(gh auth:*)",
-      "Bash(npm run compile:*)"
+      "Bash(npm run compile:*)",
+      "Bash(gh release create:*)",
+      "Bash(wc:*)",
+      "Bash(PROF=/mnt/c/Users/flore/AppData/Local/AntidetectBrowser/Profiles/DMIvApPyCsZXnvLjhS2C:*)",
+      "Bash(du -sh:*)",
+      "Bash(npm run:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh release view:*)",
+      "WebFetch(domain:api.github.com)"
     ]
   }
 }

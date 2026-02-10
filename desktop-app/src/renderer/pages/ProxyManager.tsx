@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, RefreshCw, CheckCircle, XCircle, Download, Shield, Globe, X, Shuffle, Search, Copy, AlertCircle, Zap, Clock, Filter, ChevronDown, Link2, Unlink } from 'lucide-react';
+import { Plus, Trash2, RefreshCw, CheckCircle, XCircle, Download, Shield, Globe, X, Shuffle, Search, Copy, AlertCircle, Zap, Clock, Filter, ChevronDown, Link2, Unlink, FolderOpen } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
-import { Profile } from '../../types';
+import { Profile, Folder } from '../../types';
 import {
   subscribeToProxies,
   createProxy as firestoreCreateProxy,
@@ -16,8 +16,10 @@ type Proxy = FirestoreProxy;
 
 interface ProxyManagerPageProps {
   profiles?: Profile[];
+  folders?: Folder[];
   onUpdateProfile?: (profileId: string, data: any) => Promise<void>;
   userId?: string;
+  teamId?: string;
 }
 
 type StatusFilter = 'all' | 'healthy' | 'failed' | 'untested';
@@ -38,7 +40,7 @@ function CountryFlag({ code }: { code: string }) {
   );
 }
 
-const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUpdateProfile, userId }) => {
+const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], folders = [], onUpdateProfile, userId, teamId }) => {
   const { showToast } = useToast();
   const [proxies, setProxies] = useState<Proxy[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -54,15 +56,20 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
   const [showFilters, setShowFilters] = useState(false);
   const [assignDropdownProxy, setAssignDropdownProxy] = useState<string | null>(null);
   const assignDropdownRef = useRef<HTMLDivElement>(null);
+  const [folderFilter, setFolderFilter] = useState<string | null>(null);
+  const [addProxyFolderId, setAddProxyFolderId] = useState<string>('');
+  const [folderDropdownProxy, setFolderDropdownProxy] = useState<string | null>(null);
+  const folderDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Subscribe to Firestore proxies (real-time sync)
+  // Subscribe to Firestore proxies (real-time sync, scoped by teamId)
   useEffect(() => {
-    const unsub = subscribeToProxies((allProxies) => {
+    if (!teamId) return;
+    const unsub = subscribeToProxies(teamId, (allProxies) => {
       setProxies(allProxies);
       setLoading(false);
     });
     return () => unsub();
-  }, []);
+  }, [teamId]);
 
   // Close assign dropdown on click outside
   useEffect(() => {
@@ -74,6 +81,17 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
     if (assignDropdownProxy) document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [assignDropdownProxy]);
+
+  // Close folder dropdown on click outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (folderDropdownRef.current && !folderDropdownRef.current.contains(e.target as Node)) {
+        setFolderDropdownProxy(null);
+      }
+    };
+    if (folderDropdownProxy) document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [folderDropdownProxy]);
 
   // Parse proxy string in various formats
   const parseProxyString = (proxyStr: string): Omit<Proxy, 'id'> | null => {
@@ -124,9 +142,10 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
           const clean: any = { type: p.type, host: p.host, port: p.port };
           if (p.username) clean.username = p.username;
           if (p.password) clean.password = p.password;
+          if (addProxyFolderId) clean.folderId = addProxyFolderId;
           return clean;
         });
-        await createProxiesBulk(cleaned, userId || 'unknown');
+        await createProxiesBulk(cleaned, userId || 'unknown', teamId || '');
       }
       if (failed > 0) {
         showToast(`Added ${parsed.length} proxies, ${failed} failed (invalid format)`, parsed.length > 0 ? 'success' : 'error');
@@ -134,6 +153,7 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
         showToast(`Added ${parsed.length} proxies successfully`, 'success');
       }
       setBulkProxies('');
+      setAddProxyFolderId('');
       setShowAddModal(false);
     } catch (error) {
       console.error('Failed to add proxies:', error);
@@ -262,31 +282,54 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
     }
   };
 
-  // Auto-assign: 1 unique proxy per unassigned profile (uses Firestore data directly)
+  // Change folder for a proxy
+  const handleChangeFolder = async (proxyId: string, folderId: string | null) => {
+    try {
+      await firestoreUpdateProxy(proxyId, { folderId });
+      setFolderDropdownProxy(null);
+    } catch {
+      showToast('Failed to update folder', 'error');
+    }
+  };
+
+  // Auto-assign: 1 unique proxy per unassigned profile (folder-aware)
   const handleAutoAssign = async () => {
-    if (proxies.length === 0) {
-      showToast('No proxies available', 'error');
-      return;
-    }
-    const unassigned = profiles.filter(p => !p.proxy || !(p.proxy as any).host);
-    if (unassigned.length === 0) {
-      showToast('All profiles already have a proxy', 'info');
-      return;
-    }
     if (!onUpdateProfile) return;
 
-    // Find which proxies are already used (by host:port)
+    // Scope proxies and profiles based on folder filter (including children)
+    const folderChildIds = folderFilter && folderFilter !== 'none'
+      ? folders.filter(f => f.parentId === folderFilter).map(f => f.id)
+      : [];
+    const matchesFolderScope = (folderId: string | undefined | null) => {
+      if (!folderFilter) return true;
+      if (folderFilter === 'none') return !folderId;
+      return folderId === folderFilter || folderChildIds.includes(folderId || '');
+    };
+    const scopedProxies = proxies.filter(px => matchesFolderScope(px.folderId));
+    const scopedProfiles = profiles.filter(p => matchesFolderScope(p.folderId));
+
+    if (scopedProxies.length === 0) {
+      showToast('No proxies available' + (folderFilter ? ' in this folder' : ''), 'error');
+      return;
+    }
+    const unassigned = scopedProfiles.filter(p => !p.proxy || !(p.proxy as any).host);
+    if (unassigned.length === 0) {
+      showToast('All profiles already have a proxy' + (folderFilter ? ' in this folder' : ''), 'info');
+      return;
+    }
+
+    // Find which proxies are already used (by host:port) in the SAME folder scope
     const usedKeys = new Set<string>();
-    for (const p of profiles) {
+    for (const p of scopedProfiles) {
       if (p.proxy && (p.proxy as any).host) {
         usedKeys.add(`${(p.proxy as any).host}:${(p.proxy as any).port}`);
       }
     }
 
-    // Get available proxies (not used by any profile)
-    const available = proxies.filter(px => !usedKeys.has(`${px.host}:${px.port}`));
+    // Get available proxies (not used by profiles in this folder scope)
+    const available = scopedProxies.filter(px => !usedKeys.has(`${px.host}:${px.port}`));
     if (available.length === 0) {
-      showToast('No free proxies available', 'error');
+      showToast('No free proxies available' + (folderFilter ? ' in this folder' : ''), 'error');
       return;
     }
 
@@ -398,7 +441,15 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
 
     const matchesType = typeFilter === 'all' || p.type === typeFilter;
 
-    return matchesSearch && matchesStatus && matchesType;
+    const matchesFolder = folderFilter === null ||
+      (folderFilter === 'none' ? !p.folderId : (() => {
+        if (p.folderId === folderFilter) return true;
+        // Also match children of the selected folder
+        const childIds = folders.filter(f => f.parentId === folderFilter).map(f => f.id);
+        return childIds.includes(p.folderId || '');
+      })());
+
+    return matchesSearch && matchesStatus && matchesType && matchesFolder;
   });
 
   // Get profiles assigned to a specific proxy
@@ -624,6 +675,84 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
         </div>
       )}
 
+      {/* Folder tabs (hierarchical) */}
+      {folders.length > 0 && (() => {
+        const rootFolders = folders.filter(f => !f.parentId);
+        const getChildIds = (parentId: string) => folders.filter(f => f.parentId === parentId).map(f => f.id);
+        const getProxyCount = (folderId: string) => {
+          const childIds = getChildIds(folderId);
+          return proxies.filter(p => p.folderId === folderId || childIds.includes(p.folderId || '')).length;
+        };
+
+        return (
+          <div className="px-6 py-2 flex items-center gap-1.5 overflow-x-auto" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+            <button
+              onClick={() => setFolderFilter(null)}
+              className="px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors whitespace-nowrap flex items-center gap-1.5"
+              style={{
+                background: folderFilter === null ? 'var(--accent-subtle)' : 'transparent',
+                color: folderFilter === null ? 'var(--accent-light)' : 'var(--text-muted)',
+                border: folderFilter === null ? '1px solid var(--accent)' : '1px solid transparent',
+              }}
+            >
+              All
+              <span className="text-[10px] opacity-70">{proxies.length}</span>
+            </button>
+            {rootFolders.map(f => {
+              const children = folders.filter(c => c.parentId === f.id);
+              const count = getProxyCount(f.id);
+              const isActive = folderFilter === f.id || children.some(c => folderFilter === c.id);
+              return (
+                <React.Fragment key={f.id}>
+                  <button
+                    onClick={() => setFolderFilter(folderFilter === f.id ? null : f.id)}
+                    className="px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors whitespace-nowrap flex items-center gap-1.5"
+                    style={{
+                      background: isActive ? 'var(--accent-subtle)' : 'transparent',
+                      color: isActive ? 'var(--accent-light)' : 'var(--text-muted)',
+                      border: isActive ? '1px solid var(--accent)' : '1px solid transparent',
+                    }}
+                  >
+                    {f.icon && <span className="text-[13px]">{f.icon}</span>}
+                    {f.name}
+                    <span className="text-[10px] opacity-70">{count}</span>
+                  </button>
+                  {/* Show children when parent is active */}
+                  {isActive && children.map(child => (
+                    <button
+                      key={child.id}
+                      onClick={() => setFolderFilter(folderFilter === child.id ? f.id : child.id)}
+                      className="px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap flex items-center gap-1"
+                      style={{
+                        background: folderFilter === child.id ? 'var(--accent)' : 'var(--bg-elevated)',
+                        color: folderFilter === child.id ? '#fff' : 'var(--text-muted)',
+                        border: '1px solid ' + (folderFilter === child.id ? 'var(--accent)' : 'var(--border-default)'),
+                      }}
+                    >
+                      {child.icon && <span className="text-[11px]">{child.icon}</span>}
+                      {child.name}
+                      <span className="text-[10px] opacity-70">{proxies.filter(p => p.folderId === child.id).length}</span>
+                    </button>
+                  ))}
+                </React.Fragment>
+              );
+            })}
+            <button
+              onClick={() => setFolderFilter(folderFilter === 'none' ? null : 'none')}
+              className="px-3 py-1.5 rounded-lg text-[12px] font-medium transition-colors whitespace-nowrap flex items-center gap-1.5"
+              style={{
+                background: folderFilter === 'none' ? 'var(--bg-elevated)' : 'transparent',
+                color: folderFilter === 'none' ? 'var(--text-secondary)' : 'var(--text-muted)',
+                border: folderFilter === 'none' ? '1px solid var(--border-default)' : '1px solid transparent',
+              }}
+            >
+              No Folder
+              <span className="text-[10px] opacity-70">{proxies.filter(p => !p.folderId).length}</span>
+            </button>
+          </div>
+        );
+      })()}
+
       {/* Table */}
       <div className="flex-1 overflow-auto overflow-x-auto">
         {loading ? (
@@ -665,7 +794,7 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
             </button>
           </div>
         ) : (
-          <table className="w-full min-w-[900px]">
+          <table className="w-full min-w-[1050px]">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
                 <th className="w-10 px-4 py-2.5 text-left sticky top-0" style={{ background: 'var(--bg-surface)' }}>
@@ -681,6 +810,7 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Port</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Auth</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Provider</th>
+                <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Folder</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Profiles</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Status</th>
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider sticky top-0" style={{ color: 'var(--text-muted)', background: 'var(--bg-surface)' }}>Speed</th>
@@ -750,6 +880,59 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
                       <span className="text-[12px] capitalize" style={{ color: 'var(--text-secondary)' }}>
                         {proxy.provider && proxy.provider !== 'custom' ? proxy.provider : 'Custom'}
                       </span>
+                    </td>
+
+                    <td className="px-3 py-2.5">
+                      <div className="relative" ref={folderDropdownProxy === proxy.id ? folderDropdownRef : undefined}>
+                        {(() => {
+                          const folder = folders.find(f => f.id === proxy.folderId);
+                          return (
+                            <button
+                              onClick={() => setFolderDropdownProxy(folderDropdownProxy === proxy.id ? null : proxy.id)}
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors"
+                              style={{
+                                background: folder ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
+                                color: folder ? 'var(--accent-light)' : 'var(--text-muted)',
+                                border: `1px solid ${folder ? 'var(--accent)' : 'var(--border-default)'}`,
+                              }}
+                            >
+                              {folder ? (
+                                <>{folder.icon && <span>{folder.icon}</span>} {folder.name}</>
+                              ) : (
+                                <><FolderOpen size={9} /> None</>
+                              )}
+                            </button>
+                          );
+                        })()}
+                        {folderDropdownProxy === proxy.id && (
+                          <div className="absolute top-full left-0 mt-1 w-44 rounded-lg shadow-xl z-50 overflow-hidden" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }}>
+                            <div className="py-1 max-h-48 overflow-auto">
+                              <button
+                                onClick={() => handleChangeFolder(proxy.id, null)}
+                                className="w-full px-3 py-1.5 text-left text-[12px] transition-colors flex items-center gap-2"
+                                style={{ color: !proxy.folderId ? 'var(--accent-light)' : 'var(--text-primary)' }}
+                                onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                              >
+                                No Folder
+                              </button>
+                              {folders.map(f => (
+                                <button
+                                  key={f.id}
+                                  onClick={() => handleChangeFolder(proxy.id, f.id)}
+                                  className="w-full px-3 py-1.5 text-left text-[12px] transition-colors flex items-center gap-2"
+                                  style={{ color: proxy.folderId === f.id ? 'var(--accent-light)' : 'var(--text-primary)' }}
+                                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                                >
+                                  {f.icon && <span>{f.icon}</span>}
+                                  {f.name}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
                     </td>
 
                     <td className="px-3 py-2.5">
@@ -917,6 +1100,24 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
                 ))}
               </div>
 
+              {/* Folder selector */}
+              {folders.length > 0 && (
+                <div className="mb-3">
+                  <label className="block text-[12px] font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>Assign to folder (optional)</label>
+                  <select
+                    value={addProxyFolderId}
+                    onChange={e => setAddProxyFolderId(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg text-[13px]"
+                    style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
+                  >
+                    <option value="">No folder</option>
+                    {folders.map(f => (
+                      <option key={f.id} value={f.id}>{f.icon ? f.icon + ' ' : ''}{f.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
               <div className="relative">
                 <textarea
                   value={bulkProxies}
@@ -937,7 +1138,7 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], onUp
             </div>
 
             <div className="px-6 py-4 flex justify-end gap-3" style={{ borderTop: '1px solid var(--border-subtle)' }}>
-              <button onClick={() => { setShowAddModal(false); setBulkProxies(''); }}
+              <button onClick={() => { setShowAddModal(false); setBulkProxies(''); setAddProxyFolderId(''); }}
                 className="px-4 py-2 rounded-lg text-[13px] font-medium transition-colors"
                 style={{ color: 'var(--text-secondary)', background: 'var(--bg-elevated)' }}>
                 Cancel

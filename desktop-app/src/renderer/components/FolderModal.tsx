@@ -4,31 +4,38 @@ import { X } from 'lucide-react';
 interface FolderModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSubmit: (data: { name: string; icon?: string; color?: string }) => void;
-  folder?: { id: string; name: string; icon?: string; color?: string };
+  onSubmit: (data: { name: string; icon?: string; color?: string; parentId?: string | null }) => void;
+  folder?: { id: string; name: string; icon?: string; color?: string; parentId?: string | null };
+  folders?: { id: string; name: string; icon?: string; parentId?: string | null }[];
 }
 
 const FOLDER_ICONS = ['📁', '📂', '🗂️', '📋', '📦', '🎯', '💼', '🏪', '🛒', '💎'];
 const FOLDER_COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6', '#f97316', '#3b82f6', '#84cc16'];
 
-const FolderModal: React.FC<FolderModalProps> = ({ isOpen, onClose, onSubmit, folder }) => {
+const FolderModal: React.FC<FolderModalProps> = ({ isOpen, onClose, onSubmit, folder, folders = [] }) => {
   const [name, setName] = useState(folder?.name || '');
   const [selectedIcon, setSelectedIcon] = useState(folder?.icon || '📁');
   const [selectedColor, setSelectedColor] = useState(folder?.color || '#6366f1');
+  const [parentId, setParentId] = useState<string>(folder?.parentId || '');
+
+  // Only show root folders as possible parents (no sub-sub-folders)
+  const rootFolders = folders.filter(f => !f.parentId && f.id !== folder?.id);
 
   React.useEffect(() => {
     if (isOpen) {
       setName(folder?.name || '');
       setSelectedIcon(folder?.icon || '📁');
       setSelectedColor(folder?.color || '#6366f1');
+      setParentId(folder?.parentId || '');
     }
   }, [isOpen, folder]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (name.trim()) {
-      onSubmit({ name: name.trim(), icon: selectedIcon, color: selectedColor });
+      onSubmit({ name: name.trim(), icon: selectedIcon, color: selectedColor, parentId: parentId || null });
       setName('');
+      setParentId('');
       onClose();
     }
   };
@@ -88,6 +95,23 @@ const FolderModal: React.FC<FolderModalProps> = ({ isOpen, onClose, onSubmit, fo
               ))}
             </div>
           </div>
+
+          {rootFolders.length > 0 && (
+            <div>
+              <label className="block text-[12px] font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>Parent Folder</label>
+              <select
+                value={parentId}
+                onChange={e => setParentId(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg text-[13px] focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
+              >
+                <option value="">No parent (root folder)</option>
+                {rootFolders.map(f => (
+                  <option key={f.id} value={f.id}>{f.icon || '📁'} {f.name}</option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div className="flex justify-end gap-3 pt-2">
             <button type="button" onClick={onClose}

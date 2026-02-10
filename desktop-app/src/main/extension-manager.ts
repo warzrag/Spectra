@@ -136,6 +136,101 @@ export function installExtension(filePath: string): InstalledExtension {
   }
 }
 
+/**
+ * Update an existing extension in-place (keeps same ID → preserves chrome.storage data).
+ * Replaces all files but keeps the directory.
+ */
+export function updateExtension(extensionId: string, filePath: string): InstalledExtension {
+  const extDir = path.join(EXTENSIONS_DIR, extensionId);
+  if (!fs.existsSync(extDir)) {
+    throw new Error(`Extension ${extensionId} not found`);
+  }
+
+  // Backup current version
+  const backupDir = extDir + '.backup';
+  if (fs.existsSync(backupDir)) {
+    fs.rmSync(backupDir, { recursive: true, force: true });
+  }
+  fs.cpSync(extDir, backupDir, { recursive: true });
+
+  try {
+    // Clear existing files (but keep the directory itself)
+    const existing = fs.readdirSync(extDir);
+    for (const entry of existing) {
+      fs.rmSync(path.join(extDir, entry), { recursive: true, force: true });
+    }
+
+    if (fs.statSync(filePath).isDirectory()) {
+      copyDirRecursive(filePath, extDir);
+    } else {
+      // File-based (.crx or .zip)
+      const fileBuffer = fs.readFileSync(filePath);
+      let zipBuffer = fileBuffer;
+
+      const magic = fileBuffer.toString('ascii', 0, 4);
+      if (magic === 'Cr24') {
+        const version = fileBuffer.readUInt32LE(4);
+        if (version === 3) {
+          const headerLength = fileBuffer.readUInt32LE(8);
+          zipBuffer = fileBuffer.subarray(12 + headerLength);
+        } else if (version === 2) {
+          const pkLength = fileBuffer.readUInt32LE(8);
+          const sigLength = fileBuffer.readUInt32LE(12);
+          zipBuffer = fileBuffer.subarray(16 + pkLength + sigLength);
+        }
+      }
+
+      const zip = new AdmZip(zipBuffer as Buffer);
+      zip.extractAllTo(extDir, true);
+
+      // Check for subfolder pattern
+      const entries = fs.readdirSync(extDir);
+      if (entries.length === 1) {
+        const subDir = path.join(extDir, entries[0]);
+        if (fs.statSync(subDir).isDirectory() && fs.existsSync(path.join(subDir, 'manifest.json'))) {
+          const subEntries = fs.readdirSync(subDir);
+          for (const entry of subEntries) {
+            fs.renameSync(path.join(subDir, entry), path.join(extDir, entry));
+          }
+          fs.rmdirSync(subDir);
+        }
+      }
+    }
+
+    const manifest = readManifest(extDir);
+    if (!manifest) {
+      throw new Error('Invalid extension: no manifest.json found');
+    }
+
+    // Remove backup on success
+    if (fs.existsSync(backupDir)) {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+
+    return {
+      id: extensionId,
+      name: manifest.name,
+      version: manifest.version,
+      description: manifest.description,
+      localPath: extDir,
+    };
+  } catch (error: any) {
+    // Restore backup on failure
+    if (fs.existsSync(backupDir)) {
+      const existing = fs.readdirSync(extDir);
+      for (const entry of existing) {
+        fs.rmSync(path.join(extDir, entry), { recursive: true, force: true });
+      }
+      const backupEntries = fs.readdirSync(backupDir);
+      for (const entry of backupEntries) {
+        fs.renameSync(path.join(backupDir, entry), path.join(extDir, entry));
+      }
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+    throw error;
+  }
+}
+
 export function getInstalledExtensions(): InstalledExtension[] {
   ensureExtensionsDir();
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download } from 'lucide-react';
+import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Extension } from '../../types';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -11,38 +11,73 @@ import {
   unregisterExtension,
 } from '../services/firestore-service';
 
-const ExtensionsPage: React.FC = () => {
+interface ExtensionsPageProps {
+  teamId: string;
+}
+
+const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   const { showToast } = useToast();
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [localInstalled, setLocalInstalled] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [installing, setInstalling] = useState(false);
 
-  // Subscribe to Firestore extensions
+  // Subscribe to Firestore extensions (scoped by teamId)
   useEffect(() => {
-    const unsub = subscribeToExtensions((exts) => {
+    if (!teamId) return;
+    const unsub = subscribeToExtensions(teamId, (exts) => {
       setExtensions(exts);
       setLoading(false);
     });
     return () => unsub();
-  }, []);
+  }, [teamId]);
 
-  // Check which extensions are installed locally + auto-download missing ones
+  // Check which extensions are installed locally + auto-download missing/outdated ones
   useEffect(() => {
     if (!window.electronAPI?.extensions?.getAll) return;
 
     const syncExtensions = async () => {
       const localExts = await window.electronAPI.extensions!.getAll();
+      const localById = new Map(localExts.map((e: any) => [e.id, e]));
       const localIds = new Set(localExts.map((e: any) => e.id));
 
-      // Auto-download missing extensions from cloud
-      const missing = extensions.filter(e => !localIds.has(e.id) && e.storageUrl);
-      for (const ext of missing) {
-        try {
-          await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl!);
-          localIds.add(ext.id);
-        } catch (e) {
-          console.error(`Failed to download extension ${ext.name}:`, e);
+      for (const ext of extensions) {
+        if (!ext.storageUrl) continue;
+
+        const local = localById.get(ext.id);
+
+        if (!local) {
+          // Missing locally → download
+          try {
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl);
+            localIds.add(ext.id);
+            console.log(`[ExtSync] Downloaded missing extension: ${ext.name}`);
+          } catch (e) {
+            console.error(`Failed to download extension ${ext.name}:`, e);
+          }
+        } else if (ext.version && local.version && ext.version !== local.version) {
+          // Version mismatch → remove old and re-download (with rollback on failure)
+          try {
+            console.log(`[ExtSync] Updating ${ext.name}: ${local.version} → ${ext.version}`);
+            // Rename old version instead of deleting (so we can rollback)
+            const oldPath = local.localPath;
+            const backupId = ext.id + '_backup';
+            try {
+              // Use main process to rename
+              await window.electronAPI.extensions!.remove(backupId); // clean any previous backup
+            } catch {}
+            await window.electronAPI.extensions!.remove(ext.id);
+            try {
+              await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl);
+              console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
+            } catch (dlError) {
+              console.error(`[ExtSync] Download failed for ${ext.name}, keeping old version:`, dlError);
+              // Download failed - old version is already removed, re-download won't help
+              // User will need to update manually or wait for next sync
+            }
+          } catch (e) {
+            console.error(`Failed to update extension ${ext.name}:`, e);
+          }
         }
       }
 
@@ -82,7 +117,7 @@ const ExtensionsPage: React.FC = () => {
       localPath: ext.localPath,
       storageUrl,
       createdAt: new Date().toISOString(),
-    });
+    }, teamId);
   };
 
   const handleInstallFile = async () => {
@@ -120,6 +155,105 @@ const ExtensionsPage: React.FC = () => {
       await setExtensionEnabled(ext.id, !ext.enabled);
     } catch (error) {
       console.error('Toggle error:', error);
+    }
+  };
+
+  const [updating, setUpdating] = useState<string | null>(null);
+
+  const handleUpdate = async (ext: Extension) => {
+    if (!window.electronAPI?.extensions) return;
+    setUpdating(ext.id);
+    try {
+      // Ask user to pick new file or folder
+      const filePath = await window.electronAPI.extensions.selectFile();
+      if (!filePath) { setUpdating(null); return; }
+
+      const result = await window.electronAPI.extensions.update(ext.id, filePath);
+      if (!result.success) {
+        showToast(`Update failed: ${result.error}`, 'error');
+        setUpdating(null);
+        return;
+      }
+
+      const updated = result.extension;
+
+      // Re-upload to cloud
+      let storageUrl = ext.storageUrl;
+      try {
+        const zipPath = await window.electronAPI.extensions.zip(ext.id);
+        const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
+        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        await uploadBytes(storageRef, new Uint8Array(zipBuffer));
+        storageUrl = await getDownloadURL(storageRef);
+      } catch (e) {
+        console.error('Failed to upload updated extension to cloud:', e);
+      }
+
+      // Update Firestore with new version info
+      await registerExtension({
+        id: ext.id,
+        name: updated.name,
+        version: updated.version,
+        description: updated.description,
+        enabled: ext.enabled,
+        localPath: updated.localPath,
+        storageUrl,
+        createdAt: ext.createdAt || new Date().toISOString(),
+      }, teamId);
+
+      showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
+    } catch (error) {
+      console.error('Update error:', error);
+      showToast('Failed to update extension', 'error');
+    } finally {
+      setUpdating(null);
+    }
+  };
+
+  const handleUpdateFolder = async (ext: Extension) => {
+    if (!window.electronAPI?.extensions?.selectFolder) return;
+    setUpdating(ext.id);
+    try {
+      const folderPath = await window.electronAPI.extensions.selectFolder();
+      if (!folderPath) { setUpdating(null); return; }
+
+      const result = await window.electronAPI.extensions.update(ext.id, folderPath);
+      if (!result.success) {
+        showToast(`Update failed: ${result.error}`, 'error');
+        setUpdating(null);
+        return;
+      }
+
+      const updated = result.extension;
+
+      let storageUrl = ext.storageUrl;
+      try {
+        const zipPath = await window.electronAPI.extensions.zip(ext.id);
+        const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
+        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        await uploadBytes(storageRef, new Uint8Array(zipBuffer));
+        storageUrl = await getDownloadURL(storageRef);
+      } catch (e) {
+        console.error('Failed to upload updated extension to cloud:', e);
+      }
+
+      await registerExtension({
+        id: ext.id,
+        name: updated.name,
+        version: updated.version,
+        description: updated.description,
+        enabled: ext.enabled,
+        localPath: updated.localPath,
+        storageUrl,
+        createdAt: ext.createdAt || new Date().toISOString(),
+      }, teamId);
+
+      showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
+    } catch (error) {
+      console.error('Update error:', error);
+      showToast('Failed to update extension', 'error');
+    } finally {
+      setUpdating(null);
     }
   };
 
@@ -250,6 +384,18 @@ const ExtensionsPage: React.FC = () => {
                     className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
                     style={{ left: ext.enabled ? '22px' : '2px' }}
                   />
+                </button>
+
+                <button
+                  onClick={() => handleUpdateFolder(ext)}
+                  disabled={updating === ext.id}
+                  className="p-2 rounded-lg transition-colors"
+                  style={{ color: 'var(--text-muted)' }}
+                  title="Update (folder)"
+                  onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
+                  onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
+                >
+                  {updating === ext.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
                 </button>
 
                 <button

@@ -23,6 +23,7 @@ export async function logActivity(entry: Omit<ActivityLogEntry, 'id'>): Promise<
 }
 
 export interface ActivityLogFilters {
+  teamId?: string;
   userId?: string;
   action?: string;
   limitCount?: number;
@@ -33,6 +34,9 @@ export async function getActivityLogs(filters: ActivityLogFilters = {}): Promise
   try {
     const constraints: any[] = [orderBy('timestamp', 'desc')];
 
+    if (filters.teamId) {
+      constraints.unshift(where('teamId', '==', filters.teamId));
+    }
     if (filters.userId) {
       constraints.unshift(where('userId', '==', filters.userId));
     }
@@ -76,9 +80,12 @@ export async function getUserProfile(uid: string): Promise<UserProfile | null> {
   }
 }
 
-export async function getAllUsers(): Promise<UserProfile[]> {
+export async function getAllUsers(teamId?: string): Promise<UserProfile[]> {
   try {
-    const snapshot = await getDocs(collection(db, USERS_COLLECTION));
+    const q = teamId
+      ? query(collection(db, USERS_COLLECTION), where('teamId', '==', teamId))
+      : query(collection(db, USERS_COLLECTION));
+    const snapshot = await getDocs(q);
     return snapshot.docs.map(d => ({ uid: d.id, ...d.data() })) as UserProfile[];
   } catch (error) {
     console.error('Failed to get users:', error);
@@ -88,8 +95,12 @@ export async function getAllUsers(): Promise<UserProfile[]> {
 
 // ── Profiles (Cloud Sync) ──────────────────────────────────────
 
-export function subscribeToProfiles(callback: (profiles: Profile[]) => void): Unsubscribe {
-  const q = query(collection(db, PROFILES_COLLECTION), orderBy('createdAt', 'desc'));
+export function subscribeToProfiles(teamId: string, callback: (profiles: Profile[]) => void): Unsubscribe {
+  const q = query(
+    collection(db, PROFILES_COLLECTION),
+    where('teamId', '==', teamId),
+    orderBy('createdAt', 'desc')
+  );
   return onSnapshot(q, (snapshot) => {
     const profiles: Profile[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -101,8 +112,12 @@ export function subscribeToProfiles(callback: (profiles: Profile[]) => void): Un
   });
 }
 
-export function subscribeToFolders(callback: (folders: Folder[]) => void): Unsubscribe {
-  const q = query(collection(db, FOLDERS_COLLECTION), orderBy('createdAt', 'desc'));
+export function subscribeToFolders(teamId: string, callback: (folders: Folder[]) => void): Unsubscribe {
+  const q = query(
+    collection(db, FOLDERS_COLLECTION),
+    where('teamId', '==', teamId),
+    orderBy('createdAt', 'desc')
+  );
   return onSnapshot(q, (snapshot) => {
     const folders: Folder[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -128,10 +143,11 @@ function removeUndefined(obj: any): any {
   return obj;
 }
 
-export async function createProfile(profileData: Omit<Profile, 'id'>, userId: string): Promise<Profile> {
+export async function createProfile(profileData: Omit<Profile, 'id'>, userId: string, teamId: string): Promise<Profile> {
   const now = new Date().toISOString();
   const data = removeUndefined({
     ...profileData,
+    teamId,
     createdBy: userId,
     createdAt: profileData.createdAt || now,
     updatedAt: now,
@@ -152,9 +168,12 @@ export async function deleteProfile(profileId: string): Promise<void> {
   await deleteDoc(doc(db, PROFILES_COLLECTION, profileId));
 }
 
-export async function getAllProfilesOnce(): Promise<Profile[]> {
+export async function getAllProfilesOnce(teamId?: string): Promise<Profile[]> {
   try {
-    const snapshot = await getDocs(collection(db, PROFILES_COLLECTION));
+    const q = teamId
+      ? query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamId))
+      : query(collection(db, PROFILES_COLLECTION));
+    const snapshot = await getDocs(q);
     return snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as Profile[];
   } catch (error) {
     console.error('Failed to get profiles:', error);
@@ -164,10 +183,11 @@ export async function getAllProfilesOnce(): Promise<Profile[]> {
 
 // ── Folders (Cloud Sync) ───────────────────────────────────────
 
-export async function createFolder(folderData: Omit<Folder, 'id'>, userId: string): Promise<Folder> {
+export async function createFolder(folderData: Omit<Folder, 'id'>, userId: string, teamId: string): Promise<Folder> {
   const now = new Date().toISOString();
   const data = {
     ...folderData,
+    teamId,
     createdBy: userId,
     createdAt: folderData.createdAt || now,
   };
@@ -184,14 +204,48 @@ export async function updateFolder(folderId: string, data: Partial<Folder>): Pro
 }
 
 export async function deleteFolder(folderId: string): Promise<void> {
-  // Batch: remove folderId from all profiles in this folder + delete the folder
+  // Batch: delete folder + child folders + unassign profiles and proxies
   const batch = writeBatch(db);
+  const now = new Date().toISOString();
 
+  // Find child folders
+  const childFolders = await getDocs(
+    query(collection(db, FOLDERS_COLLECTION), where('parentId', '==', folderId))
+  );
+
+  // For each child folder: unassign its profiles and proxies, then delete it
+  for (const child of childFolders.docs) {
+    const childProfiles = await getDocs(
+      query(collection(db, PROFILES_COLLECTION), where('folderId', '==', child.id))
+    );
+    childProfiles.docs.forEach(d => {
+      batch.update(d.ref, { folderId: null, updatedAt: now });
+    });
+
+    const childProxies = await getDocs(
+      query(collection(db, PROXIES_COLLECTION), where('folderId', '==', child.id))
+    );
+    childProxies.docs.forEach(d => {
+      batch.update(d.ref, { folderId: null, updatedAt: now });
+    });
+
+    batch.delete(child.ref);
+  }
+
+  // Unassign profiles in the parent folder
   const profilesInFolder = await getDocs(
     query(collection(db, PROFILES_COLLECTION), where('folderId', '==', folderId))
   );
   profilesInFolder.docs.forEach(d => {
-    batch.update(d.ref, { folderId: null, updatedAt: new Date().toISOString() });
+    batch.update(d.ref, { folderId: null, updatedAt: now });
+  });
+
+  // Unassign proxies in the parent folder
+  const proxiesInFolder = await getDocs(
+    query(collection(db, PROXIES_COLLECTION), where('folderId', '==', folderId))
+  );
+  proxiesInFolder.docs.forEach(d => {
+    batch.update(d.ref, { folderId: null, updatedAt: now });
   });
 
   batch.delete(doc(db, FOLDERS_COLLECTION, folderId));
@@ -200,9 +254,9 @@ export async function deleteFolder(folderId: string): Promise<void> {
 
 // ── Migration: local electron-store → Firestore ───────────────
 
-export async function migrateLocalProfiles(localProfiles: Profile[], localFolders: Folder[], userId: string): Promise<void> {
+export async function migrateLocalProfiles(localProfiles: Profile[], localFolders: Folder[], userId: string, teamId: string): Promise<void> {
   // Check if Firestore already has data (another device migrated)
-  const existing = await getAllProfilesOnce();
+  const existing = await getAllProfilesOnce(teamId);
   if (existing.length > 0) {
     console.log('Firestore already has profiles, skipping migration');
     return;
@@ -217,12 +271,12 @@ export async function migrateLocalProfiles(localProfiles: Profile[], localFolder
   // Use setDoc with existing IDs to preserve profile directory mapping
   for (const folder of localFolders) {
     const { id, ...folderData } = folder;
-    await setDoc(doc(db, FOLDERS_COLLECTION, id), { ...folderData, createdBy: userId });
+    await setDoc(doc(db, FOLDERS_COLLECTION, id), { ...folderData, teamId, createdBy: userId });
   }
 
   for (const profile of localProfiles) {
     const { id, ...profileData } = profile;
-    await setDoc(doc(db, PROFILES_COLLECTION, id), { ...profileData, createdBy: userId, updatedAt: new Date().toISOString() });
+    await setDoc(doc(db, PROFILES_COLLECTION, id), { ...profileData, teamId, createdBy: userId, updatedAt: new Date().toISOString() });
   }
 
   console.log('Migration complete');
@@ -230,8 +284,12 @@ export async function migrateLocalProfiles(localProfiles: Profile[], localFolder
 
 // ── Extensions (Cloud Sync) ────────────────────────────────────
 
-export function subscribeToExtensions(callback: (extensions: Extension[]) => void): Unsubscribe {
-  const q = query(collection(db, EXTENSIONS_COLLECTION), orderBy('createdAt', 'desc'));
+export function subscribeToExtensions(teamId: string, callback: (extensions: Extension[]) => void): Unsubscribe {
+  const q = query(
+    collection(db, EXTENSIONS_COLLECTION),
+    where('teamId', '==', teamId),
+    orderBy('createdAt', 'desc')
+  );
   return onSnapshot(q, (snapshot) => {
     const extensions: Extension[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -243,9 +301,9 @@ export function subscribeToExtensions(callback: (extensions: Extension[]) => voi
   });
 }
 
-export async function registerExtension(ext: Omit<Extension, 'id'> & { id: string }): Promise<void> {
+export async function registerExtension(ext: Omit<Extension, 'id'> & { id: string }, teamId: string): Promise<void> {
   const { id, ...data } = ext;
-  await setDoc(doc(db, EXTENSIONS_COLLECTION, id), data);
+  await setDoc(doc(db, EXTENSIONS_COLLECTION, id), { ...data, teamId });
 }
 
 export async function setExtensionEnabled(extensionId: string, enabled: boolean): Promise<void> {
@@ -260,6 +318,7 @@ export async function unregisterExtension(extensionId: string): Promise<void> {
 
 export interface FirestoreProxy {
   id: string;
+  teamId?: string;
   name?: string;
   type: string;
   host: string;
@@ -268,6 +327,7 @@ export interface FirestoreProxy {
   password?: string;
   provider?: string;
   country?: string;
+  folderId?: string | null;
   isHealthy?: boolean;
   lastCheck?: string;
   responseTime?: number;
@@ -276,8 +336,12 @@ export interface FirestoreProxy {
   updatedAt?: string;
 }
 
-export function subscribeToProxies(callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
-  const q = query(collection(db, PROXIES_COLLECTION), orderBy('createdAt', 'desc'));
+export function subscribeToProxies(teamId: string, callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
+  const q = query(
+    collection(db, PROXIES_COLLECTION),
+    where('teamId', '==', teamId),
+    orderBy('createdAt', 'desc')
+  );
   return onSnapshot(q, (snapshot) => {
     const proxies: FirestoreProxy[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -289,10 +353,11 @@ export function subscribeToProxies(callback: (proxies: FirestoreProxy[]) => void
   });
 }
 
-export async function createProxy(proxyData: Omit<FirestoreProxy, 'id'>, userId: string): Promise<FirestoreProxy> {
+export async function createProxy(proxyData: Omit<FirestoreProxy, 'id'>, userId: string, teamId: string): Promise<FirestoreProxy> {
   const now = new Date().toISOString();
   const data = {
     ...proxyData,
+    teamId,
     createdBy: userId,
     createdAt: now,
     updatedAt: now,
@@ -301,7 +366,7 @@ export async function createProxy(proxyData: Omit<FirestoreProxy, 'id'>, userId:
   return { id: docRef.id, ...data } as FirestoreProxy;
 }
 
-export async function createProxiesBulk(proxies: Omit<FirestoreProxy, 'id'>[], userId: string): Promise<{ added: number; failed: number }> {
+export async function createProxiesBulk(proxies: Omit<FirestoreProxy, 'id'>[], userId: string, teamId: string): Promise<{ added: number; failed: number }> {
   const now = new Date().toISOString();
   let added = 0;
   let failed = 0;
@@ -312,6 +377,7 @@ export async function createProxiesBulk(proxies: Omit<FirestoreProxy, 'id'>[], u
       const docRef = doc(collection(db, PROXIES_COLLECTION));
       batch.set(docRef, {
         ...proxy,
+        teamId,
         createdBy: userId,
         createdAt: now,
         updatedAt: now,
@@ -346,4 +412,33 @@ export async function deleteProxiesBulk(proxyIds: string[]): Promise<void> {
     batch.delete(doc(db, PROXIES_COLLECTION, id));
   }
   await batch.commit();
+}
+
+// ── Migration: assign teamId to existing data ──────────────────
+
+export async function migrateExistingDataToTeam(teamId: string): Promise<void> {
+  const collections = ['profiles', 'folders', 'proxies', 'extensions', 'activityLogs'];
+
+  for (const col of collections) {
+    try {
+      // Get ALL docs and filter those without teamId (Firestore can't query for missing fields)
+      const snapshot = await getDocs(collection(db, col));
+      const docsWithoutTeam = snapshot.docs.filter(d => !d.data().teamId);
+
+      if (docsWithoutTeam.length === 0) continue;
+
+      console.log(`[Migration] Assigning teamId to ${docsWithoutTeam.length} docs in ${col}`);
+
+      // Firestore batch limit is 500
+      for (let i = 0; i < docsWithoutTeam.length; i += 500) {
+        const batch = writeBatch(db);
+        docsWithoutTeam.slice(i, i + 500).forEach(d => {
+          batch.update(d.ref, { teamId });
+        });
+        await batch.commit();
+      }
+    } catch (error) {
+      console.error(`[Migration] Failed for collection ${col}:`, error);
+    }
+  }
 }

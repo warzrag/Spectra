@@ -31,6 +31,7 @@ import {
   updateFolder as firestoreUpdateFolder,
   deleteFolder as firestoreDeleteFolder,
   migrateLocalProfiles,
+  migrateExistingDataToTeam,
 } from './services/firestore-service';
 import { Profile, Folder, Extension, AppPage, AppSettings, AppUser } from '../types';
 import {
@@ -115,6 +116,7 @@ declare global {
         selectFile: () => Promise<string | null>;
         selectFolder: () => Promise<string | null>;
         install: (filePath: string) => Promise<{ success: boolean; extension?: any; error?: string }>;
+        update: (extensionId: string, filePath: string) => Promise<{ success: boolean; extension?: any; error?: string }>;
         getAll: () => Promise<any[]>;
         remove: (extensionId: string) => Promise<boolean>;
         getPaths: (extensionIds: string[]) => Promise<string[]>;
@@ -259,7 +261,7 @@ function App() {
     }
   }, []);
 
-  // Firestore real-time sync for profiles and folders
+  // Firestore real-time sync for profiles and folders (scoped by teamId)
   useEffect(() => {
     if (!user) return;
     setLoading(true);
@@ -273,7 +275,7 @@ function App() {
             window.electronAPI.profiles.getAll(),
             window.electronAPI.folders.getAll(),
           ]);
-          await migrateLocalProfiles(localProfiles, localFolders, user.uid);
+          await migrateLocalProfiles(localProfiles, localFolders, user.uid, user.teamId);
         } catch (e) {
           console.error('Migration error:', e);
         }
@@ -282,17 +284,27 @@ function App() {
     };
     migrate();
 
-    // Subscribe to Firestore collections (real-time)
-    const unsubProfiles = subscribeToProfiles((allProfiles) => {
+    // Migration: assign teamId to legacy data without teamId
+    const migrateTeam = async () => {
+      try {
+        await migrateExistingDataToTeam(user.teamId);
+      } catch (e) {
+        console.error('Team migration error:', e);
+      }
+    };
+    migrateTeam();
+
+    // Subscribe to Firestore collections (real-time, scoped by teamId)
+    const unsubProfiles = subscribeToProfiles(user.teamId, (allProfiles) => {
       setProfiles(allProfiles);
       setLoading(false);
     });
 
-    const unsubFolders = subscribeToFolders((allFolders) => {
+    const unsubFolders = subscribeToFolders(user.teamId, (allFolders) => {
       setFolders(allFolders);
     });
 
-    const unsubExtensions = subscribeToExtensions((allExtensions) => {
+    const unsubExtensions = subscribeToExtensions(user.teamId, (allExtensions) => {
       setExtensions(allExtensions);
     });
 
@@ -302,6 +314,28 @@ function App() {
       unsubExtensions();
     };
   }, [user]);
+
+  // On startup: release only TRULY stale locks (older than 2h) owned by this user
+  const startupLockCleanupDone = useRef(false);
+  useEffect(() => {
+    if (!user || profiles.length === 0 || startupLockCleanupDone.current) return;
+    startupLockCleanupDone.current = true;
+
+    const STALE_LOCK_MS = 2 * 60 * 60 * 1000; // 2 hours
+    const cleanupLocks = async () => {
+      const myLockedProfiles = profiles.filter(p => p.lockedBy === user.uid && p.lockedAt);
+      for (const p of myLockedProfiles) {
+        const lockAge = Date.now() - new Date(p.lockedAt!).getTime();
+        if (lockAge > STALE_LOCK_MS) {
+          try {
+            await releaseProfileLock(p.id);
+            console.log(`[Startup] Released stale lock on "${p.name}" (${Math.round(lockAge / 60000)}min old)`);
+          } catch {}
+        }
+      }
+    };
+    cleanupLocks();
+  }, [user, profiles.length > 0]);
 
   // Keep a ref of profile IDs so the URL listener always has the latest
   const profileIdsRef = useRef<Set<string>>(new Set());
@@ -334,14 +368,7 @@ function App() {
       const profile = profilesRef.current.find(p => p.id === profileId);
       const profileName = profile?.name || profileId;
 
-      // Release lock IMMEDIATELY so other users can see it's free
-      try {
-        await releaseProfileLock(profileId);
-      } catch (error) {
-        console.error('[ProfileSync] Failed to release lock:', error);
-      }
-
-      // Then upload to cloud in background
+      // Upload to cloud FIRST, then release lock
       try {
         setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
 
@@ -352,11 +379,18 @@ function App() {
         );
 
         setSyncProgress(null);
-        showToast(`"${profileName}" synchronis\u00e9`, 'success');
+        showToast(`"${profileName}" synchronisé`, 'success');
       } catch (error) {
         console.error('[ProfileSync] Upload failed:', error);
         setSyncProgress(null);
-        showToast(`\u00c9chec sync "${profileName}"`, 'error');
+        showToast(`Échec sync "${profileName}"`, 'error');
+      }
+
+      // Release lock AFTER upload is done (or failed)
+      try {
+        await releaseProfileLock(profileId);
+      } catch (error) {
+        console.error('[ProfileSync] Failed to release lock:', error);
       }
     });
 
@@ -366,6 +400,7 @@ function App() {
   const handleLogout = async () => {
     if (user) {
       logActivity({
+        teamId: user.teamId,
         userId: user.uid,
         userName: user.email,
         action: 'user_logout',
@@ -379,10 +414,11 @@ function App() {
 
   const handleCreateProfile = async (profileData: any) => {
     try {
-      const newProfile = await firestoreCreateProfile(profileData, user!.uid);
+      const newProfile = await firestoreCreateProfile(profileData, user!.uid, user!.teamId);
       showToast(`"${newProfile.name}" created`, 'success');
       if (user) {
         logActivity({
+          teamId: user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_created', targetProfileId: newProfile.id, targetProfileName: newProfile.name,
           timestamp: new Date().toISOString(),
@@ -430,10 +466,11 @@ function App() {
         platform: profile.platform,
         createdAt: new Date().toISOString(),
       };
-      const newProfile = await firestoreCreateProfile(cloneData, user!.uid);
+      const newProfile = await firestoreCreateProfile(cloneData, user!.uid, user!.teamId);
       showToast(`"${profile.name}" cloned as "${newProfile.name}"`, 'success');
       if (user) {
         logActivity({
+          teamId: user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_created', targetProfileId: newProfile.id, targetProfileName: newProfile.name,
           timestamp: new Date().toISOString(),
@@ -457,6 +494,7 @@ function App() {
       showToast(`"${profile?.name}" moved to recycle bin`, 'success');
       if (user && profile) {
         logActivity({
+          teamId: user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_deleted', targetProfileId: profileId, targetProfileName: profile.name,
           timestamp: new Date().toISOString(),
@@ -479,6 +517,7 @@ function App() {
       showToast(`"${profile?.name}" restored`, 'success');
       if (user && profile) {
         logActivity({
+          teamId: user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_restored', targetProfileId: profileId, targetProfileName: profile.name,
           timestamp: new Date().toISOString(),
@@ -502,6 +541,7 @@ function App() {
       // onSnapshot handles state update
       if (user && profile) {
         logActivity({
+          teamId: user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_permanently_deleted', targetProfileId: profileId, targetProfileName: profile.name,
           timestamp: new Date().toISOString(),
@@ -583,6 +623,7 @@ function App() {
         showToast(`"${profile.name}" launched successfully`, 'success');
         if (user) {
           logActivity({
+            teamId: user.teamId,
             userId: user.uid, userName: user.email,
             action: 'profile_launched', targetProfileId: profile.id, targetProfileName: profile.name,
             timestamp: new Date().toISOString(),
@@ -604,9 +645,37 @@ function App() {
     }
   };
 
+  const [bulkLaunching, setBulkLaunching] = useState<{ total: number; current: number; name: string } | null>(null);
+
+  const handleBulkLaunch = async (profileIds: string[]) => {
+    const profilesToLaunch = visibleProfiles.filter(p => profileIds.includes(p.id));
+
+    if (profilesToLaunch.length === 0) {
+      showToast('Toutes les instances sont déjà lancées', 'info');
+      return;
+    }
+
+    setBulkLaunching({ total: profilesToLaunch.length, current: 0, name: '' });
+
+    for (let i = 0; i < profilesToLaunch.length; i++) {
+      const profile = profilesToLaunch[i];
+      setBulkLaunching({ total: profilesToLaunch.length, current: i + 1, name: profile.name });
+
+      await handleLaunchProfile(profile);
+
+      // Small delay between launches to avoid overwhelming the system
+      if (i < profilesToLaunch.length - 1) {
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    setBulkLaunching(null);
+    showToast(`${profilesToLaunch.length} instances lancées`, 'success');
+  };
+
   const handleCreateFolder = async (folderData: any) => {
     try {
-      await firestoreCreateFolder(folderData, user!.uid);
+      await firestoreCreateFolder(folderData, user!.uid, user!.teamId);
       // onSnapshot handles state update
     } catch (error) {
       console.error('Failed to create folder:', error);
@@ -661,7 +730,14 @@ function App() {
   const deletedProfiles = profiles.filter(p => p.deleted);
 
   const profileCounts = visibleProfiles.reduce((acc, profile) => {
-    if (profile.folderId) acc[profile.folderId] = (acc[profile.folderId] || 0) + 1;
+    if (profile.folderId) {
+      acc[profile.folderId] = (acc[profile.folderId] || 0) + 1;
+      // Also count towards parent folder
+      const folder = folders.find(f => f.id === profile.folderId);
+      if (folder?.parentId) {
+        acc[folder.parentId] = (acc[folder.parentId] || 0) + 1;
+      }
+    }
     return acc;
   }, {} as { [folderId: string]: number });
 
@@ -680,6 +756,8 @@ function App() {
             onUpdateProfile={handleUpdateProfile}
             onDeleteProfile={handleDeleteProfile}
             onLaunchProfile={handleLaunchProfile}
+            onBulkLaunch={handleBulkLaunch}
+            bulkLaunching={bulkLaunching}
             onMoveProfile={handleMoveProfile}
             onShowCreateModal={() => setShowCreateModal(true)}
             onEditProfile={(profile) => { setEditingProfile(profile); setShowCreateModal(true); }}
@@ -687,15 +765,15 @@ function App() {
           />
         );
       case 'proxies':
-        return <ProxyManagerPage profiles={profiles} onUpdateProfile={handleUpdateProfile} userId={user?.uid} />;
+        return <ProxyManagerPage profiles={visibleProfiles} folders={folders} onUpdateProfile={handleUpdateProfile} userId={user?.uid} teamId={user?.teamId} />;
       case 'extensions':
-        return <ExtensionsPage />;
+        return <ExtensionsPage teamId={user?.teamId || ''} />;
       case 'settings':
         return <SettingsPage settings={settings} onSettingsChange={handleSettingsChange} user={user} onLogout={handleLogout} />;
       case 'activity':
-        return user?.role === 'admin' ? <ActivityLogPage /> : null;
+        return (user?.role === 'admin' || user?.role === 'owner') ? <ActivityLogPage teamId={user?.teamId || ''} /> : null;
       case 'recycle-bin':
-        return user?.role === 'admin' ? (
+        return (user?.role === 'admin' || user?.role === 'owner') ? (
           <RecycleBinPage
             deletedProfiles={deletedProfiles}
             onRestore={handleRestoreProfile}
@@ -704,9 +782,9 @@ function App() {
           />
         ) : null;
       case 'billing':
-        return user?.role === 'admin' ? <BillingPage /> : null;
+        return (user?.role === 'admin' || user?.role === 'owner') ? <BillingPage /> : null;
       case 'members':
-        return user?.role === 'admin' ? <MembersPage /> : null;
+        return (user?.role === 'admin' || user?.role === 'owner') ? <MembersPage teamId={user?.teamId || ''} /> : null;
       default:
         return null;
     }
@@ -796,6 +874,7 @@ function App() {
               : (data) => { handleCreateFolder(data); setShowFolderModal(false); }
             }
             folder={editingFolder || undefined}
+            folders={folders}
           />
         )}
 

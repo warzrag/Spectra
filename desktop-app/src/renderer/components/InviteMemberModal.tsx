@@ -20,9 +20,10 @@ const firebaseConfig = {
 interface InviteMemberModalProps {
   onClose: () => void;
   onMemberAdded: () => void;
+  teamId: string;
 }
 
-const InviteMemberModal: React.FC<InviteMemberModalProps> = ({ onClose, onMemberAdded }) => {
+const InviteMemberModal: React.FC<InviteMemberModalProps> = ({ onClose, onMemberAdded, teamId }) => {
   const { showToast } = useToast();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -48,11 +49,12 @@ const InviteMemberModal: React.FC<InviteMemberModalProps> = ({ onClose, onMember
       // Create the user account
       const credential = await createUserWithEmailAndPassword(secondaryAuth, email, password);
 
-      // Create Firestore user document
+      // Create Firestore user document (inherits teamId from inviter)
       await setDoc(doc(db, 'users', credential.user.uid), {
         uid: credential.user.uid,
         email: email,
         role: role,
+        teamId: teamId,
         createdAt: new Date().toISOString(),
       });
 

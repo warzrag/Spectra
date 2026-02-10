@@ -100,6 +100,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     selectFile: () => ipcRenderer.invoke('extensions:selectFile'),
     selectFolder: () => ipcRenderer.invoke('extensions:selectFolder'),
     install: (filePath: string) => ipcRenderer.invoke('extensions:install', filePath),
+    update: (extensionId: string, filePath: string) => ipcRenderer.invoke('extensions:update', extensionId, filePath),
     getAll: () => ipcRenderer.invoke('extensions:getAll'),
     remove: (extensionId: string) => ipcRenderer.invoke('extensions:remove', extensionId),
     getPaths: (extensionIds: string[]) => ipcRenderer.invoke('extensions:getPaths', extensionIds),

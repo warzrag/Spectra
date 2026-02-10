@@ -1,5 +1,5 @@
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged as firebaseOnAuthStateChanged, User } from 'firebase/auth';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc, addDoc, collection } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import { AppUser, UserRole } from '../../types';
 
@@ -8,65 +8,61 @@ const ADMIN_UIDS = [
   'EsZbVc0qtNYwTsUmXm9drmF5hu53',
 ];
 
-async function resolveUserRole(user: User): Promise<UserRole> {
-  // Check hardcoded admin list first
-  if (ADMIN_UIDS.includes(user.uid)) {
-    // Auto-create Firestore doc if missing
-    try {
-      const userRef = doc(db, 'users', user.uid);
-      const userDoc = await getDoc(userRef);
-      if (!userDoc.exists()) {
-        await setDoc(userRef, {
-          uid: user.uid,
-          email: user.email,
-          role: 'admin',
-          createdAt: new Date().toISOString(),
-        });
-      }
-    } catch {}
-    return 'admin';
-  }
+async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string }> {
+  const userRef = doc(db, 'users', user.uid);
+  const userDoc = await getDoc(userRef);
 
-  // Try custom claims
-  try {
-    const tokenResult = await user.getIdTokenResult();
-    if (tokenResult.claims.role === 'admin' || tokenResult.claims.role === 'va') {
-      return tokenResult.claims.role as UserRole;
-    }
-  } catch {}
+  if (userDoc.exists()) {
+    const data = userDoc.data();
+    const role: UserRole = ADMIN_UIDS.includes(user.uid)
+      ? 'owner'
+      : (data.role as UserRole) || 'va';
+    const teamId = data.teamId;
 
-  // Fallback: check Firestore users collection
-  try {
-    const userRef = doc(db, 'users', user.uid);
-    const userDoc = await getDoc(userRef);
-    if (userDoc.exists()) {
-      const data = userDoc.data();
-      if (data.role === 'admin' || data.role === 'va') {
-        return data.role as UserRole;
-      }
-    } else {
-      // Auto-create as VA if no document exists
-      await setDoc(userRef, {
-        uid: user.uid,
-        email: user.email,
-        role: 'va',
+    // Safety: if existing user has no teamId (legacy), create a team for them
+    if (!teamId) {
+      const teamRef = await addDoc(collection(db, 'teams'), {
+        name: user.email || 'My Team',
+        ownerId: user.uid,
         createdAt: new Date().toISOString(),
       });
+      await setDoc(userRef, { ...data, teamId: teamRef.id, role }, { merge: true });
+      return { role, teamId: teamRef.id };
     }
-  } catch {}
 
-  // Default to VA (least privilege)
-  return 'va';
+    return { role, teamId };
+  }
+
+  // First login ever → create team + user document
+  const isAdmin = ADMIN_UIDS.includes(user.uid);
+  const role: UserRole = isAdmin ? 'owner' : 'owner'; // New users are always owner of their own team
+
+  const teamRef = await addDoc(collection(db, 'teams'), {
+    name: user.email || 'My Team',
+    ownerId: user.uid,
+    createdAt: new Date().toISOString(),
+  });
+
+  await setDoc(userRef, {
+    uid: user.uid,
+    email: user.email,
+    role,
+    teamId: teamRef.id,
+    createdAt: new Date().toISOString(),
+  });
+
+  return { role, teamId: teamRef.id };
 }
 
 export async function loginWithEmail(email: string, password: string): Promise<AppUser> {
   const credential = await signInWithEmailAndPassword(auth, email, password);
-  const role = await resolveUserRole(credential.user);
+  const { role, teamId } = await resolveUser(credential.user);
   return {
     uid: credential.user.uid,
     email: credential.user.email || email,
     displayName: credential.user.displayName,
     role,
+    teamId,
   };
 }
 
@@ -77,12 +73,13 @@ export async function logout(): Promise<void> {
 export function onAuthStateChanged(callback: (user: AppUser | null) => void): () => void {
   return firebaseOnAuthStateChanged(auth, async (firebaseUser) => {
     if (firebaseUser) {
-      const role = await resolveUserRole(firebaseUser);
+      const { role, teamId } = await resolveUser(firebaseUser);
       callback({
         uid: firebaseUser.uid,
         email: firebaseUser.email || '',
         displayName: firebaseUser.displayName,
         role,
+        teamId,
       });
     } else {
       callback(null);

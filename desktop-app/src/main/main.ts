@@ -9,7 +9,7 @@ import { PuppeteerLauncher } from './puppeteer-launcher';
 import { UrlTrackingServer } from './url-server';
 import ProxyManager from './proxy-manager';
 import NetworkManager from './network-manager';
-import { installExtension, getInstalledExtensions, removeExtension, getExtensionPaths, zipExtension, readZipFile, downloadAndInstallExtension } from './extension-manager';
+import { installExtension, updateExtension, getInstalledExtensions, removeExtension, getExtensionPaths, zipExtension, readZipFile, downloadAndInstallExtension } from './extension-manager';
 import { generateFingerprint } from './fingerprint-generator';
 import { zipProfileDir, unzipProfileDir, profileDirExists, getLocalSyncVersion, setLocalSyncVersion } from './profile-sync';
 
@@ -561,6 +561,16 @@ ipcMain.handle('extensions:install', async (_, filePath: string) => {
     return { success: true, extension: ext };
   } catch (error: any) {
     console.error('Extension install error:', error);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('extensions:update', async (_, extensionId: string, filePath: string) => {
+  try {
+    const ext = updateExtension(extensionId, filePath);
+    return { success: true, extension: ext };
+  } catch (error: any) {
+    console.error('Extension update error:', error);
     return { success: false, error: error.message };
   }
 });

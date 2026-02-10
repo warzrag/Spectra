@@ -44,6 +44,7 @@ const Sidebar: React.FC<SidebarProps> = ({
   const [contextMenuId, setContextMenuId] = useState<string | null>(null);
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null);
   const [foldersExpanded, setFoldersExpanded] = useState(true);
+  const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
   const [showNewDropdown, setShowNewDropdown] = useState(false);
   const [appVersion, setAppVersion] = useState('');
 
@@ -269,25 +270,49 @@ const Sidebar: React.FC<SidebarProps> = ({
               )}
             </div>
 
-            {foldersExpanded && (
-              <div className="space-y-0.5">
-                {folders.map((folder) => {
-                  const count = profileCounts[folder.id] || 0;
-                  return (
-                    <div key={folder.id} className="relative group">
+            {foldersExpanded && (() => {
+              const rootFolders = folders.filter(f => !f.parentId);
+              const getChildren = (parentId: string) => folders.filter(f => f.parentId === parentId);
+              const toggleParent = (folderId: string, e: React.MouseEvent) => {
+                e.stopPropagation();
+                setExpandedParents(prev => {
+                  const next = new Set(prev);
+                  if (next.has(folderId)) next.delete(folderId); else next.add(folderId);
+                  return next;
+                });
+              };
+
+              const renderFolder = (folder: FolderType, isChild = false) => {
+                const children = getChildren(folder.id);
+                const hasChildren = children.length > 0;
+                const isExpanded = expandedParents.has(folder.id);
+                const count = profileCounts[folder.id] || 0;
+                const isSelected = selectedFolderId === folder.id;
+
+                return (
+                  <div key={folder.id}>
+                    <div className="relative group">
                       <button
                         onClick={() => onSelectFolder(folder.id)}
                         onDragOver={(e) => handleDragOver(e, folder.id)}
                         onDragLeave={handleDragLeave}
                         onDrop={(e) => handleDrop(e, folder.id)}
-                        className="w-full text-left px-3 py-2 rounded-lg flex items-center gap-2.5 text-[13px] transition-colors"
+                        className="w-full text-left py-2 rounded-lg flex items-center gap-2 text-[13px] transition-colors"
                         style={{
-                          background: selectedFolderId === folder.id ? 'var(--bg-elevated)' : 'transparent',
-                          color: selectedFolderId === folder.id ? 'var(--text-primary)' : 'var(--text-secondary)',
+                          paddingLeft: isChild ? '2rem' : '0.75rem',
+                          paddingRight: '0.75rem',
+                          background: isSelected ? 'var(--bg-elevated)' : 'transparent',
+                          color: isSelected ? 'var(--text-primary)' : 'var(--text-secondary)',
                           border: dragOverFolder === folder.id ? '1px solid var(--accent)' : '1px solid transparent',
                         }}
                       >
-                        <span className="text-sm" style={{ color: folder.color }}>{folder.icon || '\uD83D\uDCC1'}</span>
+                        {hasChildren && (
+                          <span onClick={(e) => toggleParent(folder.id, e)} className="cursor-pointer shrink-0" style={{ color: 'var(--text-muted)' }}>
+                            {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                          </span>
+                        )}
+                        {!hasChildren && !isChild && <span className="w-3 shrink-0" />}
+                        <span className="text-sm shrink-0" style={{ color: folder.color }}>{folder.icon || '\uD83D\uDCC1'}</span>
                         <span className="flex-1 truncate">{folder.name}</span>
                         <span className="text-[11px] tabular-nums" style={{ color: 'var(--text-muted)' }}>{count}</span>
                         {isAdmin && (
@@ -328,16 +353,28 @@ const Sidebar: React.FC<SidebarProps> = ({
                         </div>
                       )}
                     </div>
-                  );
-                })}
 
-                {folders.length === 0 && (
-                  <p className="text-[12px] px-3 py-2" style={{ color: 'var(--text-muted)' }}>
-                    No folders yet
-                  </p>
-                )}
-              </div>
-            )}
+                    {/* Render children if expanded */}
+                    {hasChildren && isExpanded && (
+                      <div className="space-y-0.5">
+                        {children.map(child => renderFolder(child, true))}
+                      </div>
+                    )}
+                  </div>
+                );
+              };
+
+              return (
+                <div className="space-y-0.5">
+                  {rootFolders.map(folder => renderFolder(folder))}
+                  {folders.length === 0 && (
+                    <p className="text-[12px] px-3 py-2" style={{ color: 'var(--text-muted)' }}>
+                      No folders yet
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

@@ -2,15 +2,24 @@ export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'acti
 
 export type UserRole = 'owner' | 'admin' | 'va';
 
+export interface Team {
+  id: string;
+  name: string;
+  ownerId: string;
+  createdAt: string;
+}
+
 export interface AppUser {
   uid: string;
   email: string;
   displayName: string | null;
   role: UserRole;
+  teamId: string;
 }
 
 export interface ActivityLogEntry {
   id?: string;
+  teamId?: string;
   userId: string;
   userName: string;
   action: 'profile_launched' | 'profile_closed' | 'profile_created' | 'profile_deleted' | 'profile_restored' | 'profile_permanently_deleted' | 'user_login' | 'user_logout' | 'cookies_imported' | 'cookies_exported';
@@ -24,6 +33,7 @@ export interface UserProfile {
   uid: string;
   email: string;
   role: UserRole;
+  teamId?: string;
   displayName?: string;
   createdAt: string;
 }
@@ -34,6 +44,7 @@ export type ProfileStatus = 'active' | 'banned' | 'warming' | 'limited' | 'revie
 
 export interface Profile {
   id: string;
+  teamId?: string;
   name: string;
   platform?: Platform;
   folderId?: string;
@@ -87,6 +98,7 @@ export interface Profile {
 
 export interface Folder {
   id: string;
+  teamId?: string;
   name: string;
   parentId?: string;
   icon?: string;
@@ -99,6 +111,7 @@ export interface Folder {
 
 export interface Extension {
   id: string;
+  teamId?: string;
   name: string;
   version?: string;
   description?: string;

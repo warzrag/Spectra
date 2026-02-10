@@ -23,7 +23,7 @@ interface AuthProviderProps {
 export const AuthProvider: React.FC<AuthProviderProps> = ({ user, children }) => {
   const value: AuthContextValue = {
     user,
-    isAdmin: user?.role === 'admin',
+    isAdmin: user?.role === 'admin' || user?.role === 'owner',
     isVA: user?.role === 'va',
   };
 

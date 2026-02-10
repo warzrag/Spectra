@@ -16,7 +16,11 @@ const actionLabels: Record<string, { label: string; color: string; bg: string }>
   cookies_exported: { label: 'Cookies Out', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
 };
 
-const ActivityLogPage: React.FC = () => {
+interface ActivityLogPageProps {
+  teamId: string;
+}
+
+const ActivityLogPage: React.FC<ActivityLogPageProps> = ({ teamId }) => {
   const [entries, setEntries] = useState<ActivityLogEntry[]>([]);
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [loading, setLoading] = useState(true);
@@ -28,12 +32,12 @@ const ActivityLogPage: React.FC = () => {
 
   useEffect(() => {
     loadInitial();
-    getAllUsers().then(setUsers).catch(() => {});
+    getAllUsers(teamId).then(setUsers).catch(() => {});
   }, [filterUser, filterAction]);
 
   const loadInitial = async () => {
     setLoading(true);
-    const filters: ActivityLogFilters = { limitCount: 50 };
+    const filters: ActivityLogFilters = { limitCount: 50, teamId };
     if (filterUser) filters.userId = filterUser;
     if (filterAction) filters.action = filterAction;
     const result = await getActivityLogs(filters);
@@ -46,7 +50,7 @@ const ActivityLogPage: React.FC = () => {
   const loadMore = async () => {
     if (!lastDoc || loadingMore) return;
     setLoadingMore(true);
-    const filters: ActivityLogFilters = { limitCount: 50, lastDoc };
+    const filters: ActivityLogFilters = { limitCount: 50, lastDoc, teamId };
     if (filterUser) filters.userId = filterUser;
     if (filterAction) filters.action = filterAction;
     const result = await getActivityLogs(filters);

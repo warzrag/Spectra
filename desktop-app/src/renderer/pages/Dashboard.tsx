@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, Lock } from 'lucide-react';
+import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, Lock, Loader2, Rocket } from 'lucide-react';
 import MoveFolderModal from '../components/MoveFolderModal';
 import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -19,6 +19,8 @@ interface DashboardProps {
   onUpdateProfile: (profileId: string, profileData: any) => void;
   onDeleteProfile: (profileId: string) => void;
   onLaunchProfile: (profile: any) => void;
+  onBulkLaunch: (profileIds: string[]) => void;
+  bulkLaunching: { total: number; current: number; name: string } | null;
   onMoveProfile: (profileId: string, folderId: string | null) => void;
   onShowCreateModal: () => void;
   onEditProfile: (profile: Profile) => void;
@@ -36,6 +38,8 @@ const Dashboard: React.FC<DashboardProps> = ({
   onUpdateProfile,
   onDeleteProfile,
   onLaunchProfile,
+  onBulkLaunch,
+  bulkLaunching,
   onMoveProfile,
   onShowCreateModal,
   onEditProfile,
@@ -93,6 +97,10 @@ const Dashboard: React.FC<DashboardProps> = ({
   // Get all unique tags
   const allTags = Array.from(new Set(profiles.flatMap(p => p.tags || [])));
 
+  // Get child folder IDs for hierarchical filtering
+  const getChildFolderIds = (parentId: string) =>
+    folders.filter(f => f.parentId === parentId).map(f => f.id);
+
   // Filter profiles for the instance table view
   const filteredProfiles = profiles
     .filter(profile => {
@@ -101,7 +109,8 @@ const Dashboard: React.FC<DashboardProps> = ({
         ? !profile.folderId
         : selectedFolderId === null
           ? true
-          : profile.folderId === selectedFolderId;
+          : profile.folderId === selectedFolderId ||
+            getChildFolderIds(selectedFolderId).includes(profile.folderId || '');
       const matchesTag = filterTag === null ? true : (profile.tags || []).includes(filterTag);
       return matchesSearch && matchesFolder && matchesTag;
     })
@@ -288,12 +297,15 @@ const Dashboard: React.FC<DashboardProps> = ({
   if (selectedFolderId === null) {
     const unassignedProfiles = profiles.filter(p => !p.folderId);
     const gridSearchTerm = searchTerm.toLowerCase();
+    // Only show root folders in grid view
+    const rootFolders = folders.filter(f => !f.parentId);
     const filteredFolders = gridSearchTerm
-      ? folders.filter(f => {
-          const fp = profiles.filter(p => p.folderId === f.id);
+      ? rootFolders.filter(f => {
+          const childIds = getChildFolderIds(f.id);
+          const fp = profiles.filter(p => p.folderId === f.id || childIds.includes(p.folderId || ''));
           return f.name.toLowerCase().includes(gridSearchTerm) || fp.some(p => p.name.toLowerCase().includes(gridSearchTerm));
         })
-      : folders;
+      : rootFolders;
     const filteredUnassigned = gridSearchTerm
       ? unassignedProfiles.filter(p => p.name.toLowerCase().includes(gridSearchTerm))
       : unassignedProfiles;
@@ -311,16 +323,16 @@ const Dashboard: React.FC<DashboardProps> = ({
         {/* Header */}
         <header className="px-6 py-4 flex items-center justify-between gap-4" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
           <div>
-            <h1 className="text-[18px] font-bold" style={{ color: 'var(--text-primary)' }}>Models</h1>
+            <h1 className="text-[18px] font-bold" style={{ color: 'var(--text-primary)' }}>Folders</h1>
             <p className="text-[12px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-              {folders.length} model{folders.length !== 1 ? 's' : ''} &middot; {profiles.length} instance{profiles.length !== 1 ? 's' : ''} total
+              {folders.length} folder{folders.length !== 1 ? 's' : ''} &middot; {profiles.length} instance{profiles.length !== 1 ? 's' : ''} total
             </p>
           </div>
           <div className="relative w-64">
             <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-muted)' }} />
             <input
               type="text"
-              placeholder="Search models & instances..."
+              placeholder="Search folders & instances..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="w-full pl-9 pr-3 py-1.5 rounded-lg text-[13px]"
@@ -337,16 +349,17 @@ const Dashboard: React.FC<DashboardProps> = ({
                 <FolderOpen size={36} style={{ color: 'var(--text-muted)' }} />
               </div>
               <div className="text-center">
-                <p className="text-[14px] font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>No models yet</p>
+                <p className="text-[14px] font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>No folders yet</p>
                 <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                  Create a folder in the sidebar to add your first model
+                  Create a folder in the sidebar to get started
                 </p>
               </div>
             </div>
           ) : (
             <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
               {filteredFolders.map(folder => {
-                const folderProfiles = profiles.filter(p => p.folderId === folder.id);
+                const childIds = getChildFolderIds(folder.id);
+                const folderProfiles = profiles.filter(p => p.folderId === folder.id || childIds.includes(p.folderId || ''));
                 const activeCount = folderProfiles.filter(p => activeProfiles.includes(p.id)).length;
                 const lastActivity = folderProfiles.reduce((max, p) => {
                   const t = p.lastUsed || p.createdAt || '';
@@ -390,6 +403,11 @@ const Dashboard: React.FC<DashboardProps> = ({
                     {/* Name */}
                     <h3 className="text-[14px] font-semibold truncate mb-1" style={{ color: 'var(--text-primary)' }}>
                       {folder.name}
+                      {childIds.length > 0 && (
+                        <span className="ml-1.5 text-[10px] font-normal" style={{ color: 'var(--text-muted)' }}>
+                          ({childIds.length} sub)
+                        </span>
+                      )}
                     </h3>
 
                     {/* Stats */}
@@ -498,6 +516,24 @@ const Dashboard: React.FC<DashboardProps> = ({
           {selectedProfiles.length > 0 && (
             <>
               <button
+                onClick={() => onBulkLaunch(selectedProfiles)}
+                disabled={!!bulkLaunching}
+                className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
+                style={{ background: 'var(--success-subtle, rgba(34,197,94,0.1))', border: '1px solid var(--success, #22c55e)', color: 'var(--success, #22c55e)' }}
+              >
+                {bulkLaunching ? (
+                  <>
+                    <Loader2 size={14} className="animate-spin" />
+                    {bulkLaunching.current}/{bulkLaunching.total}
+                  </>
+                ) : (
+                  <>
+                    <Rocket size={14} />
+                    Launch ({selectedProfiles.length})
+                  </>
+                )}
+              </button>
+              <button
                 onClick={() => setShowMoveModal(true)}
                 className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
                 style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)' }}
@@ -563,6 +599,43 @@ const Dashboard: React.FC<DashboardProps> = ({
           </span>
         </div>
       </header>
+
+      {/* Subfolder tabs when viewing a parent folder */}
+      {currentFolder && (() => {
+        const subfolders = folders.filter(f => f.parentId === currentFolder.id);
+        if (subfolders.length === 0) return null;
+        return (
+          <div className="px-5 py-2 flex items-center gap-1.5 overflow-x-auto" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+            <button
+              onClick={() => onSelectFolder(currentFolder.id)}
+              className="px-2.5 py-1 rounded-lg text-[12px] font-medium transition-colors whitespace-nowrap"
+              style={{
+                background: selectedFolderId === currentFolder.id ? 'var(--accent-subtle)' : 'transparent',
+                color: selectedFolderId === currentFolder.id ? 'var(--accent-light)' : 'var(--text-muted)',
+                border: selectedFolderId === currentFolder.id ? '1px solid var(--accent)' : '1px solid transparent',
+              }}
+            >
+              All
+            </button>
+            {subfolders.map(sub => (
+              <button
+                key={sub.id}
+                onClick={() => onSelectFolder(sub.id)}
+                className="px-2.5 py-1 rounded-lg text-[12px] font-medium transition-colors whitespace-nowrap flex items-center gap-1"
+                style={{
+                  background: selectedFolderId === sub.id ? 'var(--accent-subtle)' : 'transparent',
+                  color: selectedFolderId === sub.id ? 'var(--accent-light)' : 'var(--text-muted)',
+                  border: selectedFolderId === sub.id ? '1px solid var(--accent)' : '1px solid transparent',
+                }}
+              >
+                {sub.icon && <span className="text-[12px]">{sub.icon}</span>}
+                {sub.name}
+                <span className="text-[10px] opacity-70">{profiles.filter(p => p.folderId === sub.id).length}</span>
+              </button>
+            ))}
+          </div>
+        );
+      })()}
 
       {/* Tag filter bar */}
       {allTags.length > 0 && (

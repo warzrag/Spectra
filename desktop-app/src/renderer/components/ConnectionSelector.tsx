@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { CheckCircle, XCircle, Loader, Eye, EyeOff } from 'lucide-react';
 import { subscribeToProxies, FirestoreProxy } from '../services/firestore-service';
+import { useAuth } from '../contexts/AuthContext';
 
 interface ConnectionSelectorProps {
   value?: any;
@@ -32,6 +33,7 @@ const labelStyle: React.CSSProperties = {
 };
 
 const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ value, onChange }) => {
+  const { user } = useAuth();
   // Determine initial state from value
   const hasProxy = value?.type === 'proxy' && value?.proxy?.host;
 
@@ -48,10 +50,10 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ value, onChange
   const [selectedSavedId, setSelectedSavedId] = useState('');
   const [provider, setProvider] = useState(hasProxy ? (value.proxy.provider || 'brightdata') : 'brightdata');
 
-  // Load saved proxies from Firestore (real-time sync)
+  // Load saved proxies from Firestore (real-time sync, scoped by teamId)
   useEffect(() => {
-    if (mode !== 'saved') return;
-    const unsub = subscribeToProxies((allProxies: FirestoreProxy[]) => {
+    if (mode !== 'saved' || !user?.teamId) return;
+    const unsub = subscribeToProxies(user.teamId, (allProxies: FirestoreProxy[]) => {
       setSavedProxies(allProxies.map(p => ({
         id: p.id,
         type: p.type,
@@ -64,7 +66,7 @@ const ConnectionSelector: React.FC<ConnectionSelectorProps> = ({ value, onChange
       })));
     });
     return () => unsub();
-  }, [mode]);
+  }, [mode, user?.teamId]);
 
   // Emit onChange whenever proxy fields change
   useEffect(() => {
