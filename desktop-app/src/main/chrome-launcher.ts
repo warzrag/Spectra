@@ -149,58 +149,36 @@ export class ChromeLauncher {
       }
     }
     
-    // Build arguments with commercial-grade flags
+    // Build arguments — minimal flags to avoid detection
     const args = [
       `--user-data-dir=${profilePath}`,
       '--no-default-browser-check',
       '--no-first-run',
-      '--restore-last-session', // IMPORTANT: Force Chrome to restore previous session
-      
-      // Anti-detection flags (similar to AdsPower/GoLogin)
+      '--restore-last-session',
+
+      // Anti-automation detection
       '--disable-blink-features=AutomationControlled',
-      '--disable-features=VizDisplayCompositor,TranslateUI,BlinkGenPropertyTrees',
-      '--disable-web-security',
-      '--disable-extensions-file-access-check',
-      '--disable-ipc-flooding-protection',
+      '--exclude-switches=enable-automation',
+
+      // Performance & background
       '--disable-renderer-backgrounding',
       '--disable-backgrounding-occluded-windows',
-      '--disable-field-trial-config',
+      '--disable-background-timer-throttling',
+      '--disable-ipc-flooding-protection',
       '--disable-client-side-phishing-detection',
-      '--disable-component-extensions-with-background-pages',
       '--disable-default-apps',
       '--disable-dev-shm-usage',
       '--disable-hang-monitor',
-      '--disable-gpu-sandbox',
-      '--disable-software-rasterizer',
-      '--disable-background-timer-throttling',
+
+      // Disable sync & promos
       '--disable-sync',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-site-isolation-trials',
-      
-      // URL persistence and anti-redirect
-      '--restore-last-session',
-      '--no-service-autorun',
       '--disable-signin-promo',
       '--disable-sync-promos',
-      
-      // Additional anti-detection flags
-      '--disable-blink-features=AutomationControlled',
-      '--exclude-switches=enable-automation',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--disable-web-security',
-      '--allow-running-insecure-content',
-      
-      // Remove automation indicators
+      '--no-service-autorun',
+
+      // UI
       '--disable-infobars',
       '--disable-popup-blocking',
-      
-      // Language settings for French sites
-      '--lang=fr-FR',
-      '--accept-lang=fr-FR,fr,en-US,en',
-      
-      // Inject our anti-detection script
-      `--user-data-dir=${profilePath}`
     ];
     
     // Don't load the tracking extension as it can be detected
