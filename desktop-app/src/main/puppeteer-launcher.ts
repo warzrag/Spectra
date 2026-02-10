@@ -159,9 +159,11 @@ export class PuppeteerLauncher {
       // This prevents the proxy auth popup race condition
       console.log(`Start URL (will navigate after auth setup): ${startUrl}`);
 
-      // Get portable Chrome (downloads on first use)
-      const chromePath = await this.getPortableChrome();
-      console.log(`Launching Chrome: ${chromePath}`);
+      // On macOS, prefer real Google Chrome (Chrome for Testing is detectable)
+      // On Windows, keep using Chrome for Testing (already works fine)
+      const realChrome = process.platform === 'darwin' ? this.findRealChrome() : null;
+      const chromePath = realChrome || await this.getPortableChrome();
+      console.log(`Launching Chrome: ${chromePath} (${realChrome ? 'system' : 'portable'})`);
 
       // Clean environment: remove Electron-specific env vars that crash Chrome
       const cleanEnv: Record<string, string | undefined> = {};
@@ -515,6 +517,32 @@ export class PuppeteerLauncher {
   }
 
   private static browserPath: string | null = null;
+
+  /** Find real Google Chrome installed on the system */
+  private static findRealChrome(): string | null {
+    const platform = os.platform();
+    const paths: string[] = [];
+
+    if (platform === 'darwin') {
+      paths.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+      paths.push(path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'));
+    } else if (platform === 'win32') {
+      paths.push('C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe');
+      paths.push('C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe');
+      paths.push(path.join(os.homedir(), 'AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'));
+    } else {
+      paths.push('/usr/bin/google-chrome');
+      paths.push('/usr/bin/google-chrome-stable');
+    }
+
+    for (const p of paths) {
+      if (fs.existsSync(p)) {
+        console.log(`[Browser] Found system Chrome: ${p}`);
+        return p;
+      }
+    }
+    return null;
+  }
 
   /** Download Chrome for Testing on first use, then reuse */
   private static async getPortableChrome(): Promise<string> {
