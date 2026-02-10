@@ -1,0 +1,54 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: desktop-app
+        run: npm ci
+
+      - name: Build app
+        working-directory: desktop-app
+        run: npm run build
+
+      - name: Build installer (Windows)
+        if: matrix.platform == 'win'
+        working-directory: desktop-app
+        run: npx electron-builder --config electron-builder.json --win
+
+      - name: Build installer (Mac)
+        if: matrix.platform == 'mac'
+        working-directory: desktop-app
+        run: npx electron-builder --config electron-builder.json --mac
+
+      - name: Upload artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            desktop-app/build/*.exe
+            desktop-app/build/*.dmg
+            desktop-app/build/*.yml
+            desktop-app/build/*.blockmap
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

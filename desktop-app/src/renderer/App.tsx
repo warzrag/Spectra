@@ -359,39 +359,55 @@ function App() {
     return () => unsubscribe();
   }, [user]);
 
-  // Listen for profile:closed events → upload to cloud + release lock
+  // Listen for profile:closed events → queue uploads one by one
   useEffect(() => {
     if (!user) return;
     if (!window.electronAPI?.profileSync?.onProfileClosed) return;
 
+    const uploadQueue: { profileId: string; profileName: string }[] = [];
+    let isProcessing = false;
+
+    const processQueue = async () => {
+      if (isProcessing || uploadQueue.length === 0) return;
+      isProcessing = true;
+
+      while (uploadQueue.length > 0) {
+        const { profileId, profileName } = uploadQueue.shift()!;
+
+        // Upload to cloud FIRST, then release lock
+        try {
+          setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
+
+          await uploadProfileToCloud(
+            profileId,
+            { uid: user.uid, email: user.email },
+            (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
+          );
+
+          setSyncProgress(null);
+          showToast(`"${profileName}" synchronisé`, 'success');
+        } catch (error) {
+          console.error('[ProfileSync] Upload failed:', error);
+          setSyncProgress(null);
+          showToast(`Échec sync "${profileName}"`, 'error');
+        }
+
+        // Release lock AFTER upload is done (or failed)
+        try {
+          await releaseProfileLock(profileId);
+        } catch (error) {
+          console.error('[ProfileSync] Failed to release lock:', error);
+        }
+      }
+
+      isProcessing = false;
+    };
+
     const unsubscribe = window.electronAPI.profileSync.onProfileClosed(async (profileId) => {
       const profile = profilesRef.current.find(p => p.id === profileId);
       const profileName = profile?.name || profileId;
-
-      // Upload to cloud FIRST, then release lock
-      try {
-        setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
-
-        await uploadProfileToCloud(
-          profileId,
-          { uid: user.uid, email: user.email },
-          (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
-        );
-
-        setSyncProgress(null);
-        showToast(`"${profileName}" synchronisé`, 'success');
-      } catch (error) {
-        console.error('[ProfileSync] Upload failed:', error);
-        setSyncProgress(null);
-        showToast(`Échec sync "${profileName}"`, 'error');
-      }
-
-      // Release lock AFTER upload is done (or failed)
-      try {
-        await releaseProfileLock(profileId);
-      } catch (error) {
-        console.error('[ProfileSync] Failed to release lock:', error);
-      }
+      uploadQueue.push({ profileId, profileName });
+      processQueue();
     });
 
     return () => unsubscribe();
