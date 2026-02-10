@@ -5,6 +5,9 @@ export const metadata: Metadata = {
   title: 'Spectra — The Next-Gen Antidetect Browser',
   description: 'Manage multiple browser profiles with unique fingerprints. Stay undetected with advanced anti-fingerprinting, proxy support, and team collaboration.',
   keywords: ['antidetect browser', 'browser fingerprint', 'multi-account', 'privacy', 'spectra'],
+  icons: {
+    icon: '/favicon.svg',
+  },
   openGraph: {
     title: 'Spectra — The Next-Gen Antidetect Browser',
     description: 'Manage multiple browser profiles with unique fingerprints. Stay undetected.',

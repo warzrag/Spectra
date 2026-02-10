@@ -1,26 +1,10 @@
-import { Shield, Twitter } from "lucide-react";
+import { Shield } from "lucide-react";
 
 const productLinks = [
   { label: "Features", href: "#features" },
   { label: "Pricing", href: "#pricing" },
+  { label: "FAQ", href: "#faq" },
   { label: "Get Started", href: "/signup" },
-];
-
-const resourceLinks = [
-  { label: "Documentation", href: "#" },
-  { label: "API Reference", href: "#" },
-  { label: "Community", href: "#" },
-  { label: "Support", href: "#" },
-];
-
-const legalLinks = [
-  { label: "Privacy Policy", href: "#" },
-  { label: "Terms of Service", href: "#" },
-  { label: "Cookie Policy", href: "#" },
-];
-
-const socialLinks = [
-  { icon: Twitter, href: "#", label: "Twitter" },
 ];
 
 export default function Footer() {
@@ -31,10 +15,10 @@ export default function Footer() {
     >
       <div className="mx-auto max-w-6xl px-6 py-16">
         {/* Top section */}
-        <div className="grid grid-cols-1 gap-12 md:grid-cols-4">
+        <div className="grid grid-cols-1 gap-12 md:grid-cols-2">
           {/* Brand column */}
           <div>
-            <a href="#" className="flex items-center gap-2.5">
+            <a href="/" className="flex items-center gap-2.5">
               <div
                 className="flex h-8 w-8 items-center justify-center rounded-lg"
                 style={{
@@ -70,38 +54,6 @@ export default function Footer() {
               </a>
             ))}
           </div>
-
-          {/* Resources column */}
-          <div>
-            <h3 className="mb-4 text-sm font-semibold uppercase tracking-wider text-[#f0f0f5]">
-              Resources
-            </h3>
-            {resourceLinks.map((link) => (
-              <a
-                key={link.label}
-                href={link.href}
-                className="mb-3 block text-sm text-[#8b8b9e] transition hover:text-[#f0f0f5]"
-              >
-                {link.label}
-              </a>
-            ))}
-          </div>
-
-          {/* Legal column */}
-          <div>
-            <h3 className="mb-4 text-sm font-semibold uppercase tracking-wider text-[#f0f0f5]">
-              Legal
-            </h3>
-            {legalLinks.map((link) => (
-              <a
-                key={link.label}
-                href={link.href}
-                className="mb-3 block text-sm text-[#8b8b9e] transition hover:text-[#f0f0f5]"
-              >
-                {link.label}
-              </a>
-            ))}
-          </div>
         </div>
 
         {/* Bottom section */}
@@ -109,18 +61,6 @@ export default function Footer() {
           <p className="text-sm text-[#8b8b9e]">
             &copy; 2025 Spectra. All rights reserved.
           </p>
-          <div className="flex gap-4">
-            {socialLinks.map((social) => (
-              <a
-                key={social.label}
-                href={social.href}
-                className="text-[#8b8b9e] transition hover:text-[#f0f0f5]"
-                aria-label={social.label}
-              >
-                <social.icon size={18} />
-              </a>
-            ))}
-          </div>
         </div>
       </div>
     </footer>

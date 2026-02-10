@@ -1,30 +1,6 @@
-"use client";
-
-import { useState } from "react";
-import { Download, Github } from "lucide-react";
-
-const DOWNLOAD_URL = "https://github.com/warzrag/Spectra/releases/latest";
-const GITHUB_URL = "https://github.com/warzrag/Spectra";
-
 export default function Hero() {
-  const [showToast, setShowToast] = useState(false);
-
-  const handleDownload = () => {
-    window.open(DOWNLOAD_URL, "_blank");
-    setShowToast(true);
-    setTimeout(() => setShowToast(false), 3000);
-  };
-
   return (
     <section id="hero" className="relative overflow-hidden pt-32 pb-20">
-      {/* Toast notification */}
-      {showToast && (
-        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-xl text-sm font-medium text-white shadow-xl"
-          style={{ background: "linear-gradient(135deg, #6366f1, #7c3aed)", animation: "toast-fade 3s ease forwards" }}>
-          Download starting...
-        </div>
-      )}
-
       {/* Background glow orbs */}
       <div className="hero-glow hero-glow-1" />
       <div className="hero-glow hero-glow-2" />
@@ -41,7 +17,7 @@ export default function Hero() {
               border: "1px solid rgba(99, 102, 241, 0.2)",
             }}
           >
-            v1.0 — Free to use
+            v1.5 — Free to use
           </span>
         </div>
 
@@ -73,11 +49,6 @@ export default function Hero() {
         <p className="text-sm text-[#8b8b9e] mt-4">
           Invite code required
         </p>
-
-        {/* App screenshot placeholder */}
-        <div className="rounded-2xl border border-white/[0.06] bg-[#0f0f17] h-[400px] max-w-4xl mx-auto mt-16 flex items-center justify-center shadow-2xl">
-          <span className="text-[#8b8b9e] text-lg">App Screenshot</span>
-        </div>
       </div>
     </section>
   );
