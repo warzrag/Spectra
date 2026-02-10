@@ -94,30 +94,22 @@ export class PuppeteerLauncher {
         fs.mkdirSync(cacheDir, { recursive: true });
       }
 
-      // Build Chrome args — avoid detectable automation flags
+      // Build Chrome args — minimal flags to look like a real browser
       const args = [
         `--user-data-dir=${profilePath}`,
         `--disk-cache-dir=${cacheDir}`,
         '--no-first-run',
         '--no-default-browser-check',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--disable-popup-blocking',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
-        '--disable-breakpad',
         '--disable-client-side-phishing-detection',
-        '--disable-crash-reporter',
         '--disable-default-apps',
-        '--disable-hang-monitor',
-        '--disable-ipc-flooding-protection',
         '--disable-renderer-backgrounding',
         '--disable-sync',
         '--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints',
-        '--force-color-profile=srgb',
         '--password-store=basic',
         `--window-size=${options.fingerprint?.screenWidth || 1200},${options.fingerprint?.screenHeight || 800}`,
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
@@ -146,9 +138,7 @@ export class PuppeteerLauncher {
         }
       }
 
-      // Set user agent and start URL as Chrome args (avoids Puppeteer viewport emulation)
-      const userAgent = options.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36';
-      args.push(`--user-agent=${userAgent}`);
+      // User agent will be set after fingerprint OS correction (see below)
 
       // Determine start URL
       let startUrl = options.lastUrl || 'https://www.google.com';
@@ -220,8 +210,16 @@ export class PuppeteerLauncher {
         console.log('[ProxyAuth] Proxy authentication configured');
       }
 
-      // Auto-detect proxy country and override fingerprint timezone/language
+      // Force fingerprint OS to match the real OS — prevents cross-OS detection
       let fp = options.fingerprint || {};
+      const realOS = process.platform === 'darwin' ? 'macos' : process.platform === 'linux' ? 'linux' : 'windows';
+      if (fp.os && fp.os !== realOS) {
+        console.log(`[Fingerprint] OS mismatch: profile says ${fp.os}, real OS is ${realOS}. Regenerating fingerprint.`);
+        const { generateFingerprint } = require('./fingerprint-generator');
+        fp = generateFingerprint(realOS);
+      }
+
+      // Auto-detect proxy country and override fingerprint timezone/language
       if (proxy && proxy.host) {
         try {
           const country = await getCountryFromIP(proxy.host, proxy.port, proxy.type);
@@ -233,6 +231,13 @@ export class PuppeteerLauncher {
           console.warn('[GeoIP] Failed to detect proxy country:', e);
         }
       }
+
+      // Set user agent AFTER fingerprint OS is corrected
+      const defaultUA = process.platform === 'darwin'
+        ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.82 Safari/537.36';
+      const userAgent = options.userAgent || fp.userAgent || defaultUA;
+      args.push(`--user-agent=${userAgent}`);
 
       // Extract Chrome version from user agent for Sec-CH-UA consistency
       const chromeVersionMatch = userAgent.match(/Chrome\/(\d+)\.\d+\.\d+\.\d+/);
@@ -253,7 +258,9 @@ export class PuppeteerLauncher {
         ],
         fullVersion: fullVersion,
         platform: fp.platform === 'MacIntel' ? 'macOS' : fp.platform === 'Linux x86_64' ? 'Linux' : 'Windows',
-        platformVersion: fp.platform === 'MacIntel' ? '10.15.7' : fp.platform === 'Linux x86_64' ? '6.5.0' : '15.0.0',
+        platformVersion: fp.platform === 'MacIntel'
+          ? ['14.5.0', '14.6.1', '15.0.0', '15.1.0', '15.2.0'][Math.floor(Math.random() * 5)]
+          : fp.platform === 'Linux x86_64' ? '6.5.0' : '15.0.0',
         architecture: 'x86',
         bitness: '64',
         model: '',
