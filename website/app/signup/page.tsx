@@ -119,9 +119,16 @@ export default function SignupPage() {
           </p>
           <div className="space-y-3">
             <a
-              href="/"
+              href="https://github.com/warzrag/Spectra/releases/download/v1.5.7/Spectra-Setup-1.5.7.exe"
               className="block w-full py-3 rounded-xl text-[14px] font-semibold text-white text-center transition-all"
               style={{ background: "linear-gradient(135deg, #6366f1, #8b5cf6)" }}
+            >
+              Download Spectra (.exe)
+            </a>
+            <a
+              href="/"
+              className="block w-full py-3 rounded-xl text-[14px] font-semibold text-center transition-all"
+              style={{ color: "#8b8b9e", border: "1px solid rgba(255,255,255,0.08)" }}
             >
               Back to Home
             </a>
