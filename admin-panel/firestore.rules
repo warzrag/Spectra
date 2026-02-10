@@ -13,8 +13,8 @@ service cloud.firestore {
         // Block anyone from modifying an owner's doc (except the owner)
         (resource == null || resource.data.role != 'owner' || request.auth.uid == userId)
         &&
-        // Block anyone from setting role to 'owner' (only existing owners keep it)
-        (!('role' in request.resource.data) || request.resource.data.role != 'owner' || (resource != null && resource.data.role == 'owner' && request.auth.uid == userId))
+        // Block anyone from setting role to 'owner' (except: creating own doc, or already owner)
+        (!('role' in request.resource.data) || request.resource.data.role != 'owner' || (resource == null && request.auth.uid == userId) || (resource != null && resource.data.role == 'owner' && request.auth.uid == userId))
         &&
         // Permission: own doc, or owner, or admin
         (

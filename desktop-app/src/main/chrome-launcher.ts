@@ -212,8 +212,10 @@ export class ChromeLauncher {
     //   console.warn('Extension path does not exist:', extensionPath);
     // }
 
-    // Add user agent - use a real Chrome user agent
-    const defaultUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    // Add user agent - match the actual OS with recent Chrome version
+    const defaultUserAgent = process.platform === 'darwin'
+      ? 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
     args.push(`--user-agent="${options.userAgent || defaultUserAgent}"`);
 
     // Add proxy if available
