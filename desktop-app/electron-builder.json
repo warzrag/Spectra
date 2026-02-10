@@ -55,7 +55,8 @@
   "mac": {
     "icon": "assets/icon.png",
     "category": "public.app-category.productivity",
-    "target": ["dmg"]
+    "target": ["dmg"],
+    "identity": null
   },
   "linux": {
     "icon": "assets/icon.png",

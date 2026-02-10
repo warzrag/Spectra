@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -16,6 +17,9 @@ jobs:
             platform: mac
 
     runs-on: ${{ matrix.os }}
+
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: false
 
     steps:
       - uses: actions/checkout@v4
@@ -50,5 +54,6 @@ jobs:
             desktop-app/build/*.dmg
             desktop-app/build/*.yml
             desktop-app/build/*.blockmap
+            desktop-app/build/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
