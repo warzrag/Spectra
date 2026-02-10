@@ -1,4 +1,4 @@
-export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'activity' | 'recycle-bin' | 'billing' | 'members';
+export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'activity' | 'recycle-bin' | 'billing' | 'members' | 'admin-panel';
 
 export type UserRole = 'owner' | 'admin' | 'va';
 

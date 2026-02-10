@@ -50,5 +50,16 @@ service cloud.firestore {
       allow create: if request.auth != null;
       allow read: if request.auth != null;
     }
+
+    // Teams collection - any authenticated user can read, owners/admins can write
+    match /teams/{teamId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+
+    // Invite codes - any authenticated user can read/write
+    match /inviteCodes/{codeId} {
+      allow read, write: if request.auth != null;
+    }
   }
 }

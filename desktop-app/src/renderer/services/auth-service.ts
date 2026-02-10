@@ -1,5 +1,5 @@
-import { signInWithEmailAndPassword, signOut, onAuthStateChanged as firebaseOnAuthStateChanged, User } from 'firebase/auth';
-import { doc, getDoc, setDoc, addDoc, collection } from 'firebase/firestore';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged as firebaseOnAuthStateChanged, User } from 'firebase/auth';
+import { doc, getDoc, setDoc, addDoc, collection, updateDoc } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import { AppUser, UserRole } from '../../types';
 
@@ -64,6 +64,72 @@ export async function loginWithEmail(email: string, password: string): Promise<A
     role,
     teamId,
   };
+}
+
+export async function registerWithInviteCode(email: string, password: string, inviteCode: string): Promise<AppUser> {
+  // 1. Create Firebase Auth account FIRST (so we're authenticated for Firestore)
+  const credential = await createUserWithEmailAndPassword(auth, email, password);
+  const user = credential.user;
+
+  try {
+    // 2. Validate invite code (now authenticated)
+    const codeRef = doc(db, 'inviteCodes', inviteCode);
+    const codeSnap = await getDoc(codeRef);
+    if (!codeSnap.exists()) {
+      await user.delete();
+      throw new Error('Code d\'invitation invalide');
+    }
+    const codeData = codeSnap.data();
+    if (codeData.used) {
+      await user.delete();
+      throw new Error('Ce code a déjà été utilisé');
+    }
+
+    // 3. Determine team based on code type
+    let teamId: string;
+    let role: UserRole;
+
+    if (codeData.codeType === 'team' && codeData.teamId) {
+      teamId = codeData.teamId;
+      role = 'va';
+    } else {
+      const teamRef = await addDoc(collection(db, 'teams'), {
+        name: email,
+        ownerId: user.uid,
+        createdAt: new Date().toISOString(),
+      });
+      teamId = teamRef.id;
+      role = 'owner';
+    }
+
+    // 4. Create user document
+    await setDoc(doc(db, 'users', user.uid), {
+      uid: user.uid,
+      email: user.email,
+      role,
+      teamId,
+      createdAt: new Date().toISOString(),
+    });
+
+    // 5. Mark invite code as used
+    await updateDoc(codeRef, {
+      used: true,
+      usedBy: user.uid,
+      usedByEmail: email,
+      usedAt: new Date().toISOString(),
+    });
+
+    return {
+      uid: user.uid,
+      email: user.email || email,
+      displayName: user.displayName,
+      role,
+      teamId,
+    };
+  } catch (error) {
+    await signOut(auth).catch(() => {});
+    throw error;
+  }
 }
 
 export async function logout(): Promise<void> {

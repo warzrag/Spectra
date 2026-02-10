@@ -7,6 +7,7 @@ import ActivityLogPage from './pages/ActivityLogPage';
 import RecycleBinPage from './pages/RecycleBinPage';
 import BillingPage from './pages/BillingPage';
 import MembersPage from './pages/MembersPage';
+import AdminPage from './pages/AdminPage';
 import LoginPage from './pages/LoginPage';
 import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
@@ -18,7 +19,7 @@ import ProfileSyncNotification from './components/ProfileSyncNotification';
 import ForceUpdateModal from './components/ForceUpdateModal';
 import { AuthProvider } from './contexts/AuthContext';
 import { useToast } from './contexts/ToastContext';
-import { onAuthStateChanged, logout as authLogout } from './services/auth-service';
+import { onAuthStateChanged, logout as authLogout, loginWithEmail } from './services/auth-service';
 import {
   logActivity,
   subscribeToProfiles,
@@ -428,6 +429,19 @@ function App() {
     setActivePage('profiles');
   };
 
+  const handleSwitchAccount = async (email: string, password: string) => {
+    try {
+      await authLogout();
+      setUser(null);
+      const newUser = await loginWithEmail(email, password);
+      setUser(newUser);
+      setActivePage('profiles');
+      showToast(`Switched to ${email}`, 'success');
+    } catch (error: any) {
+      showToast(`Switch failed: ${error.message}`, 'error');
+    }
+  };
+
   const handleCreateProfile = async (profileData: any) => {
     try {
       const newProfile = await firestoreCreateProfile(profileData, user!.uid, user!.teamId);
@@ -801,6 +815,8 @@ function App() {
         return (user?.role === 'admin' || user?.role === 'owner') ? <BillingPage /> : null;
       case 'members':
         return (user?.role === 'admin' || user?.role === 'owner') ? <MembersPage teamId={user?.teamId || ''} /> : null;
+      case 'admin-panel':
+        return user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53' ? <AdminPage /> : null;
       default:
         return null;
     }
@@ -854,6 +870,7 @@ function App() {
             onQuickCreate={() => setShowQuickCreateModal(true)}
             onMoveProfile={handleMoveProfile}
             onLogout={handleLogout}
+            onSwitchAccount={handleSwitchAccount}
             collapsed={sidebarCollapsed}
             onToggleCollapse={toggleSidebar}
           />
