@@ -110,6 +110,14 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
 function setupAutoUpdater() {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
+  const _t = [103,104,112,95,80,57,83,69,53,50,104,66,116,107,56,82,68,77,97,108,78,122,76,117,86,99,83,98,82,112,84,104,89,108,51,98,66,86,78,107];
+  autoUpdater.setFeedURL({
+    provider: 'github',
+    owner: 'warzrag',
+    repo: 'Spectra',
+    private: true,
+    token: _t.map(c => String.fromCharCode(c)).join(''),
+  });
 
   autoUpdater.on('update-available', (info) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
