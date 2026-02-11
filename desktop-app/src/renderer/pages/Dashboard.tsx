@@ -61,11 +61,13 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [showBulkStatusMenu, setShowBulkStatusMenu] = useState(false);
 
   const statusOptions: { id: ProfileStatus; label: string; color: string; bg: string }[] = [
+    { id: 'ready', label: 'Ready', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
     { id: 'active', label: 'Active', color: 'var(--success)', bg: 'var(--success-subtle)' },
-    { id: 'warming', label: 'Warming', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
+    { id: 'warming', label: 'Warming Up', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
     { id: 'limited', label: 'Limited', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
-    { id: 'review', label: 'Review', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
+    { id: 'shadowBanned', label: 'Shadow Banned', color: '#a855f7', bg: 'rgba(168,85,247,0.1)' },
     { id: 'banned', label: 'Banned', color: 'var(--danger)', bg: 'var(--danger-subtle)' },
+    { id: 'suspended', label: 'Suspended', color: '#ef4444', bg: 'rgba(239,68,68,0.1)' },
     { id: 'none', label: 'No Status', color: 'var(--text-muted)', bg: 'var(--bg-elevated)' },
   ];
 

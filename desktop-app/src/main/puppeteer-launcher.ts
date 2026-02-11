@@ -159,11 +159,10 @@ export class PuppeteerLauncher {
       // This prevents the proxy auth popup race condition
       console.log(`Start URL (will navigate after auth setup): ${startUrl}`);
 
-      // On macOS, prefer real Google Chrome (Chrome for Testing is detectable)
-      // On Windows, keep using Chrome for Testing (already works fine)
-      const realChrome = process.platform === 'darwin' ? this.findRealChrome() : null;
-      const chromePath = realChrome || await this.getPortableChrome();
-      console.log(`Launching Chrome: ${chromePath} (${realChrome ? 'system' : 'portable'})`);
+      // Use Chrome for Testing (supports --load-extension for unsigned extensions)
+      // Real Chrome blocks unsigned extensions, so we must use the portable version
+      const chromePath = await this.getPortableChrome();
+      console.log(`Launching Chrome: ${chromePath}`);
 
       // Clean environment: remove Electron-specific env vars that crash Chrome
       const cleanEnv: Record<string, string | undefined> = {};

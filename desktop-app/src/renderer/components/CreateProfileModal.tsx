@@ -334,11 +334,13 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
                 <div className="flex gap-2 flex-wrap">
                   {([
                     { id: 'none' as ProfileStatus, label: 'None', color: 'var(--text-muted)', bg: 'var(--bg-elevated)' },
+                    { id: 'ready' as ProfileStatus, label: 'Ready', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
                     { id: 'active' as ProfileStatus, label: 'Active', color: 'var(--success)', bg: 'var(--success-subtle)' },
-                    { id: 'warming' as ProfileStatus, label: 'Warming', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
+                    { id: 'warming' as ProfileStatus, label: 'Warming Up', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
                     { id: 'limited' as ProfileStatus, label: 'Limited', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
-                    { id: 'review' as ProfileStatus, label: 'Review', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
+                    { id: 'shadowBanned' as ProfileStatus, label: 'Shadow Banned', color: '#a855f7', bg: 'rgba(168,85,247,0.1)' },
                     { id: 'banned' as ProfileStatus, label: 'Banned', color: 'var(--danger)', bg: 'var(--danger-subtle)' },
+                    { id: 'suspended' as ProfileStatus, label: 'Suspended', color: '#ef4444', bg: 'rgba(239,68,68,0.1)' },
                   ]).map(s => (
                     <button key={s.id} type="button" onClick={() => setStatus(s.id)}
                       className="px-3 py-1.5 rounded-lg text-[12px] font-medium transition-all"

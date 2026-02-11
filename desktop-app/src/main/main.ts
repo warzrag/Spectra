@@ -410,11 +410,11 @@ ipcMain.handle('proxy:autoAssign', (_, profiles) => {
 // Profile sync handlers
 ipcMain.handle('profile:zipForSync', async (_, profileId: string) => {
   const result = await zipProfileDir(profileId);
-  return { buffer: Array.from(result.buffer), size: result.size };
+  return { buffer: result.buffer.toString('base64'), size: result.size };
 });
 
-ipcMain.handle('profile:unzipFromSync', async (_, profileId: string, zipData: number[]) => {
-  const buffer = Buffer.from(zipData);
+ipcMain.handle('profile:unzipFromSync', async (_, profileId: string, zipData: string) => {
+  const buffer = Buffer.from(zipData, 'base64');
   await unzipProfileDir(profileId, buffer);
   return true;
 });

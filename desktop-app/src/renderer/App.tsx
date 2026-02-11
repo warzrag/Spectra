@@ -126,8 +126,8 @@ declare global {
         downloadAndInstall: (extensionId: string, url: string) => Promise<boolean>;
       };
       profileSync?: {
-        zipForSync: (profileId: string) => Promise<{ buffer: number[]; size: number }>;
-        unzipFromSync: (profileId: string, zipData: number[]) => Promise<boolean>;
+        zipForSync: (profileId: string) => Promise<{ buffer: string; size: number }>;
+        unzipFromSync: (profileId: string, zipData: string) => Promise<boolean>;
         hasLocalData: (profileId: string) => Promise<boolean>;
         getLocalSyncVersion: (profileId: string) => Promise<number>;
         setLocalSyncVersion: (profileId: string, version: number) => Promise<boolean>;
