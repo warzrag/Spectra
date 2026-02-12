@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, Lock, Loader2, Rocket } from 'lucide-react';
+import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket } from 'lucide-react';
 import MoveFolderModal from '../components/MoveFolderModal';
 import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -82,12 +82,12 @@ const Dashboard: React.FC<DashboardProps> = ({
   }, []);
 
   useEffect(() => {
-    if (openMenuId) {
+    if (openMenuId || statusMenuId) {
       const handler = () => { setOpenMenuId(null); setStatusMenuId(null); };
       document.addEventListener('click', handler);
       return () => document.removeEventListener('click', handler);
     }
-  }, [openMenuId]);
+  }, [openMenuId, statusMenuId]);
 
   // Reset selection when navigating between folders
   useEffect(() => {
@@ -803,25 +803,44 @@ const Dashboard: React.FC<DashboardProps> = ({
 
                     <td className="px-3 py-2.5">
                       {(() => {
-                        const statusMap: Record<string, { label: string; color: string; bg: string }> = {
-                          active: { label: 'Active', color: 'var(--success)', bg: 'var(--success-subtle)' },
-                          banned: { label: 'Banned', color: 'var(--danger)', bg: 'var(--danger-subtle)' },
-                          warming: { label: 'Warming', color: '#f59e0b', bg: 'rgba(245,158,11,0.1)' },
-                          limited: { label: 'Limited', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
-                          review: { label: 'Review', color: 'var(--accent-light)', bg: 'var(--accent-subtle)' },
-                        };
-                        const s = profile.status && statusMap[profile.status];
-                        const currentIdx = statusOptions.findIndex(o => o.id === (profile.status || 'none'));
-                        const nextStatus = statusOptions[(currentIdx + 1) % statusOptions.length];
+                        const s = statusOptions.find(o => o.id === (profile.status || 'none'));
                         return (
-                          <button
-                            onClick={() => onUpdateProfile(profile.id, { status: nextStatus.id === 'none' ? undefined : nextStatus.id })}
-                            className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium cursor-pointer transition-opacity hover:opacity-80"
-                            style={{ background: s ? s.bg : 'var(--bg-elevated)', color: s ? s.color : 'var(--text-muted)', border: 'none' }}
-                            title={`Click to change status → ${nextStatus.label}`}
-                          >
-                            {s ? s.label : '-'}
-                          </button>
+                          <div className="relative">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setStatusMenuId(statusMenuId === `table-${profile.id}` ? null : `table-${profile.id}`); }}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium cursor-pointer transition-all hover:opacity-80"
+                              style={{ background: s ? s.bg : 'var(--bg-elevated)', color: s ? s.color : 'var(--text-muted)', border: `1px solid ${s ? s.color + '33' : 'var(--border-default)'}` }}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full" style={{ background: s ? s.color : 'var(--text-muted)' }} />
+                              {s ? s.label : 'No Status'}
+                              <ChevronDown size={10} style={{ opacity: 0.6 }} />
+                            </button>
+                            {statusMenuId === `table-${profile.id}` && (
+                              <div
+                                className="absolute top-full left-0 mt-1 rounded-lg shadow-xl z-30 py-1 min-w-[150px]"
+                                style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+                                onClick={e => e.stopPropagation()}
+                              >
+                                {statusOptions.map(opt => (
+                                  <button
+                                    key={opt.id}
+                                    onClick={() => {
+                                      onUpdateProfile(profile.id, { status: opt.id === 'none' ? undefined : opt.id });
+                                      setStatusMenuId(null);
+                                    }}
+                                    className="w-full px-3 py-1.5 text-[12px] text-left flex items-center gap-2 transition-colors"
+                                    style={{ color: (profile.status || 'none') === opt.id ? opt.color : 'var(--text-secondary)' }}
+                                    onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                                  >
+                                    <span className="w-2 h-2 rounded-full" style={{ background: opt.color }} />
+                                    {opt.label}
+                                    {(profile.status || 'none') === opt.id && <span className="ml-auto text-[10px]">✓</span>}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
                         );
                       })()}
                     </td>

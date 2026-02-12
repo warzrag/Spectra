@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw } from 'lucide-react';
+import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Extension } from '../../types';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -21,6 +21,8 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   const [localInstalled, setLocalInstalled] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [installing, setInstalling] = useState(false);
+  const [storeUrl, setStoreUrl] = useState('');
+  const [installingFromStore, setInstallingFromStore] = useState(false);
 
   // Subscribe to Firestore extensions (scoped by teamId)
   useEffect(() => {
@@ -118,6 +120,50 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
       storageUrl,
       createdAt: new Date().toISOString(),
     }, teamId);
+  };
+
+  const handleInstallFromStore = async () => {
+    if (!storeUrl.trim() || !window.electronAPI?.extensions) return;
+    setInstallingFromStore(true);
+    try {
+      const result = await (window as any).electronAPI.extensions.installFromStore(storeUrl.trim());
+      if (!result.success) {
+        showToast(`Failed: ${result.error}`, 'error');
+        return;
+      }
+      const ext = result.extension;
+
+      // Upload to Firebase Storage for cloud sync
+      let storageUrl: string | undefined;
+      try {
+        const zipPath = await window.electronAPI.extensions!.zip(ext.id);
+        const zipBuffer = await window.electronAPI.extensions!.readZip(zipPath);
+        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        await uploadBytes(storageRef, new Uint8Array(zipBuffer));
+        storageUrl = await getDownloadURL(storageRef);
+      } catch (e) {
+        console.error('Failed to upload extension to cloud:', e);
+      }
+
+      await registerExtension({
+        id: ext.id,
+        name: ext.name,
+        version: ext.version,
+        description: ext.description,
+        enabled: true,
+        localPath: ext.localPath,
+        storageUrl,
+        createdAt: new Date().toISOString(),
+      }, teamId);
+
+      setStoreUrl('');
+      showToast(`"${ext.name}" installed successfully`, 'success');
+    } catch (error: any) {
+      console.error('Store install error:', error);
+      showToast(error.message || 'Failed to install from Chrome Web Store', 'error');
+    } finally {
+      setInstallingFromStore(false);
+    }
   };
 
   const handleInstallFile = async () => {
@@ -314,6 +360,35 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
             Add .crx / .zip
           </button>
         </div>
+      </div>
+
+      {/* Install from Chrome Web Store */}
+      <div className="flex items-center gap-2 mb-4">
+        <div className="relative flex-1">
+          <Link size={14} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-muted)' }} />
+          <input
+            type="text"
+            value={storeUrl}
+            onChange={e => setStoreUrl(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleInstallFromStore(); }}
+            placeholder="Paste Chrome Web Store link..."
+            className="w-full pl-9 pr-3 py-2.5 rounded-lg text-[13px] border"
+            style={{ background: 'var(--bg-elevated)', borderColor: 'var(--border-default)', color: 'var(--text-primary)' }}
+          />
+        </div>
+        <button
+          onClick={handleInstallFromStore}
+          disabled={installingFromStore || !storeUrl.trim()}
+          className="flex items-center gap-2 px-4 py-2.5 rounded-lg text-[13px] font-medium text-white transition-colors disabled:opacity-50"
+          style={{ background: 'var(--accent)' }}
+        >
+          {installingFromStore ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : (
+            <Download size={14} />
+          )}
+          Install
+        </button>
       </div>
 
       {/* Extension List */}

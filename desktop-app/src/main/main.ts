@@ -620,3 +620,47 @@ ipcMain.handle('extensions:downloadAndInstall', async (_, extensionId: string, u
   await downloadAndInstallExtension(extensionId, url);
   return true;
 });
+
+ipcMain.handle('extensions:installFromStore', async (_, storeUrl: string) => {
+  // Extract extension ID from Chrome Web Store URL
+  const match = storeUrl.match(/chrome\.google\.com\/webstore\/detail\/[^/]*\/([a-z]{32})/i)
+    || storeUrl.match(/chromewebstore\.google\.com\/detail\/[^/]*\/([a-z]{32})/i)
+    || storeUrl.match(/\/([a-z]{32})\/?$/i);
+  if (!match) {
+    throw new Error('Invalid Chrome Web Store URL');
+  }
+  const chromeExtId = match[1];
+  const crxUrl = `https://clients2.google.com/service/update2/crx?response=redirect&prodversion=131.0&acceptformat=crx2,crx3&x=id%3D${chromeExtId}%26installsource%3Dondemand%26uc`;
+
+  // Download CRX to temp file
+  const https = require('https');
+  const tmpPath = path.join(os.tmpdir(), `ext-${chromeExtId}.crx`);
+
+  await new Promise<void>((resolve, reject) => {
+    const doRequest = (url: string) => {
+      https.get(url, (res: any) => {
+        if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
+          doRequest(res.headers.location);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+          return;
+        }
+        const fileStream = fs.createWriteStream(tmpPath);
+        res.pipe(fileStream);
+        fileStream.on('finish', () => { fileStream.close(); resolve(); });
+        fileStream.on('error', reject);
+      }).on('error', reject);
+    };
+    doRequest(crxUrl);
+  });
+
+  // Install the downloaded CRX
+  const ext = installExtension(tmpPath);
+
+  // Cleanup temp file
+  try { fs.unlinkSync(tmpPath); } catch {}
+
+  return { success: true, extension: ext };
+});

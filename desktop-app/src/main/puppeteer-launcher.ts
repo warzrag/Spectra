@@ -94,22 +94,30 @@ export class PuppeteerLauncher {
         fs.mkdirSync(cacheDir, { recursive: true });
       }
 
-      // Build Chrome args — minimal flags to look like a real browser
+      // Build Chrome args — avoid detectable automation flags
       const args = [
         `--user-data-dir=${profilePath}`,
         `--disk-cache-dir=${cacheDir}`,
         '--no-first-run',
         '--no-default-browser-check',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--disable-popup-blocking',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
         '--disable-client-side-phishing-detection',
+        '--disable-crash-reporter',
         '--disable-default-apps',
+        '--disable-hang-monitor',
+        '--disable-ipc-flooding-protection',
         '--disable-renderer-backgrounding',
         '--disable-sync',
         '--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints',
+        '--force-color-profile=srgb',
         '--password-store=basic',
         `--window-size=${options.fingerprint?.screenWidth || 1200},${options.fingerprint?.screenHeight || 800}`,
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
