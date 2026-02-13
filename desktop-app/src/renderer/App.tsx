@@ -126,8 +126,8 @@ declare global {
         downloadAndInstall: (extensionId: string, url: string) => Promise<boolean>;
       };
       profileSync?: {
-        zipForSync: (profileId: string) => Promise<{ buffer: string; size: number }>;
-        unzipFromSync: (profileId: string, zipData: string) => Promise<boolean>;
+        zipForSync: (profileId: string) => Promise<{ buffer: Uint8Array; size: number }>;
+        unzipFromSync: (profileId: string, zipData: Uint8Array) => Promise<boolean>;
         hasLocalData: (profileId: string) => Promise<boolean>;
         getLocalSyncVersion: (profileId: string) => Promise<number>;
         setLocalSyncVersion: (profileId: string, version: number) => Promise<boolean>;
@@ -316,25 +316,32 @@ function App() {
     };
   }, [user]);
 
-  // On startup: release only TRULY stale locks (older than 2h) owned by this user
-  const startupLockCleanupDone = useRef(false);
+  // Release all locks on profiles not currently running on this machine
+  const lockCleanupDone = useRef(false);
   useEffect(() => {
-    if (!user || profiles.length === 0 || startupLockCleanupDone.current) return;
-    startupLockCleanupDone.current = true;
+    if (!user || profiles.length === 0 || lockCleanupDone.current) return;
+    lockCleanupDone.current = true;
 
-    const STALE_LOCK_MS = 2 * 60 * 60 * 1000; // 2 hours
     const cleanupLocks = async () => {
-      const myLockedProfiles = profiles.filter(p => p.lockedBy === user.uid && p.lockedAt);
-      for (const p of myLockedProfiles) {
-        const lockAge = Date.now() - new Date(p.lockedAt!).getTime();
-        if (lockAge > STALE_LOCK_MS) {
+      let activeIds: string[] = [];
+      try {
+        if (window.electronAPI?.profiles?.getActive) {
+          activeIds = await window.electronAPI.profiles.getActive();
+        }
+      } catch {}
+
+      for (const p of profiles) {
+        if (p.lockedBy && !activeIds.includes(p.id)) {
           try {
             await releaseProfileLock(p.id);
-            console.log(`[Startup] Released stale lock on "${p.name}" (${Math.round(lockAge / 60000)}min old)`);
-          } catch {}
+            console.log(`[LockCleanup] Released lock on "${p.name}" (was ${p.lockedByEmail || p.lockedBy})`);
+          } catch (e) {
+            console.error(`[LockCleanup] Failed to release lock on "${p.name}":`, e);
+          }
         }
       }
     };
+
     cleanupLocks();
   }, [user, profiles.length > 0]);
 

@@ -61,7 +61,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   profileSync: {
     zipForSync: (profileId: string) => ipcRenderer.invoke('profile:zipForSync', profileId),
-    unzipFromSync: (profileId: string, zipData: string) => ipcRenderer.invoke('profile:unzipFromSync', profileId, zipData),
+    unzipFromSync: (profileId: string, zipData: Uint8Array) => ipcRenderer.invoke('profile:unzipFromSync', profileId, zipData),
     hasLocalData: (profileId: string) => ipcRenderer.invoke('profile:hasLocalData', profileId),
     getLocalSyncVersion: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncVersion', profileId),
     setLocalSyncVersion: (profileId: string, version: number) => ipcRenderer.invoke('profile:setLocalSyncVersion', profileId, version),

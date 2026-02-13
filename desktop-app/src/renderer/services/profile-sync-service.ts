@@ -16,11 +16,7 @@ export async function uploadProfileToCloud(
   // 1. Zip profile via main process
   console.log(`[ProfileSync] Starting upload for ${profileId}`);
   const result = await (window as any).electronAPI.profileSync.zipForSync(profileId);
-  const binaryStr = atob(result.buffer);
-  const zipData = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i++) {
-    zipData[i] = binaryStr.charCodeAt(i);
-  }
+  const zipData = new Uint8Array(result.buffer);
   console.log(`[ProfileSync] Zip ready: ${(result.size / 1024 / 1024).toFixed(2)} MB`);
 
   // 2. Upload to Firebase Storage with progress
@@ -72,13 +68,7 @@ export async function downloadProfileFromCloud(
   const storageRef = ref(storage, `profiles/${profileId}/profile.zip`);
   const blob = await getBlob(storageRef);
   const arrayBuffer = await blob.arrayBuffer();
-  const uint8 = new Uint8Array(arrayBuffer);
-  let binaryStr = '';
-  const chunkSize = 8192;
-  for (let i = 0; i < uint8.length; i += chunkSize) {
-    binaryStr += String.fromCharCode(...uint8.subarray(i, i + chunkSize));
-  }
-  const zipData = btoa(binaryStr);
+  const zipData = new Uint8Array(arrayBuffer);
   console.log(`[ProfileSync] Downloaded: ${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
   onProgress?.(60);
 

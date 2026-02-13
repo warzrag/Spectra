@@ -40,7 +40,7 @@ export interface UserProfile {
 
 export type Platform = 'twitter' | 'instagram' | 'tiktok' | 'reddit' | 'onlyfans' | 'telegram' | 'other';
 
-export type ProfileStatus = 'ready' | 'active' | 'warming' | 'limited' | 'shadowBanned' | 'banned' | 'suspended' | 'none';
+export type ProfileStatus = 'active' | 'shadowBanned' | 'banned' | 'none';
 
 export interface Profile {
   id: string;
