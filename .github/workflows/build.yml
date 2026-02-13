@@ -35,6 +35,8 @@ jobs:
       - name: Install dependencies
         working-directory: desktop-app
         run: npm ci
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: true
 
       - name: Build app
         working-directory: desktop-app

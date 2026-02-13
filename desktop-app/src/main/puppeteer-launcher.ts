@@ -134,38 +134,39 @@ export class PuppeteerLauncher {
       // Get BotBrowser paths
       const { chromePath, profileEncPath, isBotBrowser } = await this.getPortableChrome();
 
-      // Build Chrome args — BotBrowser handles fingerprinting natively
+      // Build Chrome args
       const args = [
         `--user-data-dir=${profilePath}`,
         `--disk-cache-dir=${cacheDir}`,
         '--no-first-run',
         '--no-default-browser-check',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--disable-popup-blocking',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-breakpad',
-        '--disable-client-side-phishing-detection',
         '--disable-default-apps',
-        '--disable-hang-monitor',
-        '--disable-ipc-flooding-protection',
-        '--disable-renderer-backgrounding',
         '--disable-sync',
-        '--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints',
         '--window-size=1280,800',
       ];
 
-      // Only force --lang when NOT using BotBrowser (BotBrowser auto-detects from proxy)
-      if (!isBotBrowser) {
-        args.push(`--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`);
-      }
-
-      // BotBrowser-specific: add --bot-profile flag
       if (isBotBrowser && profileEncPath) {
+        // BotBrowser: minimal flags + bot-profile (everything else handled natively)
         args.push(`--bot-profile=${profileEncPath}`);
+        args.push('--bot-config-timezone=auto');
+        args.push('--bot-config-languages=auto');
+        args.push('--bot-config-webrtc=disabled');
         console.log(`[BotBrowser] Using profile: ${profileEncPath}`);
+      } else {
+        // Fallback Chrome for Testing: need extra flags
+        args.push('--disable-blink-features=AutomationControlled');
+        args.push('--disable-dev-shm-usage');
+        args.push('--disable-background-timer-throttling');
+        args.push('--disable-backgrounding-occluded-windows');
+        args.push('--disable-breakpad');
+        args.push('--disable-client-side-phishing-detection');
+        args.push('--disable-hang-monitor');
+        args.push('--disable-ipc-flooding-protection');
+        args.push('--disable-renderer-backgrounding');
+        args.push('--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints');
+        args.push(`--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`);
       }
 
       // Proxy + DNS leak prevention
@@ -604,10 +605,14 @@ export class PuppeteerLauncher {
 
             if (err) return reject(new Error(`Failed to copy app: ${err.message}`));
 
+            // Remove macOS quarantine attribute (prevents "Chromium is damaged" error)
+            execFile('xattr', ['-rd', 'com.apple.quarantine', destApp], () => {
+              console.log('[BotBrowser] Removed quarantine attribute from .app bundle');
+            });
+
             // Find the executable inside the .app bundle
             const execPath = path.join(destApp, 'Contents', 'MacOS', 'Chromium');
             if (fs.existsSync(execPath)) {
-              // Make executable
               fs.chmodSync(execPath, 0o755);
               resolve(execPath);
             } else {

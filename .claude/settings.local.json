@@ -60,7 +60,9 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:multilogin.com)",
       "Bash(gh api:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:localapi-doc-en.adspower.com)",
+      "WebFetch(domain:pypi.org)"
     ]
   }
 }
