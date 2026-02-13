@@ -50,7 +50,17 @@
       "Bash(git commit:*)",
       "Bash(git push:*)",
       "Bash(gh release view:*)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:rebrowser.net)",
+      "WebFetch(domain:datadome.co)",
+      "WebFetch(domain:blog.castle.io)",
+      "WebFetch(domain:kameleo.io)",
+      "Bash(GIT_TERMINAL_PROMPT=0 git push:*)",
+      "WebFetch(domain:support.gologin.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:multilogin.com)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

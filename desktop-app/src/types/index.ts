@@ -94,6 +94,9 @@ export interface Profile {
   lockedByEmail?: string | null;
   lockedByDevice?: string | null;
   lockedAt?: string | null;
+
+  // Custom sort order
+  sortIndex?: number;
 }
 
 export interface Folder {

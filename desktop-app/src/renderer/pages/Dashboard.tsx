@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket } from 'lucide-react';
+import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket, GripVertical } from 'lucide-react';
 import MoveFolderModal from '../components/MoveFolderModal';
 import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -52,13 +52,16 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [showMoveModal, setShowMoveModal] = useState(false);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
-  const [sortBy, setSortBy] = useState<'name' | 'created' | 'lastUsed'>(settings.sortBy || 'created');
-  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(settings.sortOrder || 'desc');
+  const [sortBy, setSortBy] = useState<'name' | 'created' | 'lastUsed' | 'custom'>(settings.sortBy as any || 'custom');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(settings.sortOrder || 'asc');
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [assignProfileId, setAssignProfileId] = useState<string | null>(null);
   const [bulkAssignMode, setBulkAssignMode] = useState(false);
   const [statusMenuId, setStatusMenuId] = useState<string | null>(null);
   const [showBulkStatusMenu, setShowBulkStatusMenu] = useState(false);
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [localOrder, setLocalOrder] = useState<string[] | null>(null);
 
   const statusOptions: { id: ProfileStatus; label: string; color: string; bg: string }[] = [
     { id: 'active', label: 'Active', color: '#22c55e', bg: 'rgba(34,197,94,0.1)' },
@@ -92,6 +95,36 @@ const Dashboard: React.FC<DashboardProps> = ({
     setFilterTag(null);
   }, [selectedFolderId]);
 
+  // Drag & drop reorder handler
+  const handleDrop = (targetId: string) => {
+    if (!dragId || dragId === targetId || sortBy !== 'custom') return;
+
+    // Build current visual order
+    const currentList = localOrder
+      ? localOrder.map(id => filteredProfiles.find(p => p.id === id)).filter(Boolean) as Profile[]
+      : [...filteredProfiles];
+
+    const fromIdx = currentList.findIndex(p => p.id === dragId);
+    const toIdx = currentList.findIndex(p => p.id === targetId);
+    if (fromIdx === -1 || toIdx === -1) return;
+
+    // Move item in the list
+    const [moved] = currentList.splice(fromIdx, 1);
+    currentList.splice(toIdx, 0, moved);
+
+    // Set local order immediately (visual feedback)
+    const newOrder = currentList.map(p => p.id);
+    setLocalOrder(newOrder);
+
+    // Save to Firestore in background
+    newOrder.forEach((id, i) => {
+      onUpdateProfile(id, { sortIndex: i });
+    });
+
+    setDragId(null);
+    setDragOverId(null);
+  };
+
   // Get all unique tags
   const allTags = Array.from(new Set(profiles.flatMap(p => p.tags || [])));
 
@@ -114,7 +147,19 @@ const Dashboard: React.FC<DashboardProps> = ({
     })
     .sort((a, b) => {
       let cmp = 0;
-      if (sortBy === 'name') cmp = a.name.localeCompare(b.name);
+      if (sortBy === 'custom') {
+        if (localOrder) {
+          const ai = localOrder.indexOf(a.id);
+          const bi = localOrder.indexOf(b.id);
+          cmp = (ai === -1 ? 999999 : ai) - (bi === -1 ? 999999 : bi);
+        } else {
+          // Use sortIndex, fallback to creation date order
+          const ai = a.sortIndex ?? new Date(a.createdAt).getTime();
+          const bi = b.sortIndex ?? new Date(b.createdAt).getTime();
+          cmp = ai - bi;
+        }
+      }
+      else if (sortBy === 'name') cmp = a.name.localeCompare(b.name);
       else if (sortBy === 'created') cmp = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
       else if (sortBy === 'lastUsed') cmp = new Date(a.lastUsed || 0).getTime() - new Date(b.lastUsed || 0).getTime();
       return sortOrder === 'desc' ? -cmp : cmp;
@@ -734,18 +779,40 @@ const Dashboard: React.FC<DashboardProps> = ({
                 const conn = getConnectionInfo(profile);
                 const locked = !isActive && isLockedByOther(profile, user?.uid || '');
 
+                const isDragTarget = dragOverId === profile.id && dragId !== profile.id;
+                const isDragging = dragId === profile.id;
+
                 return (
+                  <React.Fragment key={profile.id}>
+                    {isDragTarget && (
+                      <tr style={{ height: 3, padding: 0 }}>
+                        <td colSpan={99} style={{ padding: 0, border: 'none', background: 'linear-gradient(90deg, transparent, #818cf8, transparent)', height: 3, borderRadius: 2 }} />
+                      </tr>
+                    )}
                   <tr
-                    key={profile.id}
-                    className="group transition-colors"
+                    className="group"
                     style={{
                       borderBottom: '1px solid var(--border-subtle)',
                       background: isSelected ? 'var(--accent-subtle, rgba(99,102,241,0.06))' : 'transparent',
+                      opacity: isDragging ? 0.25 : 1,
+                      transform: isDragging ? 'scale(0.98)' : 'scale(1)',
+                      transition: 'opacity 0.2s ease, transform 0.2s ease, background 0.15s ease',
+                      position: 'relative',
+                      zIndex: (statusMenuId === `table-${profile.id}` || openMenuId === profile.id) ? 50 : 'auto',
                     }}
-                    onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                    onMouseEnter={e => { if (!isSelected && !dragId) e.currentTarget.style.background = 'var(--bg-elevated)'; }}
                     onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = 'transparent'; }}
                     draggable
-                    onDragStart={(e) => e.dataTransfer.setData('profileId', profile.id)}
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('profileId', profile.id);
+                      e.dataTransfer.effectAllowed = 'move';
+                      setDragId(profile.id);
+                      setSortBy('custom');
+                    }}
+                    onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverId(profile.id); }}
+                    onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverId(null); }}
+                    onDrop={(e) => { e.preventDefault(); handleDrop(profile.id); }}
+                    onDragEnd={() => { setDragId(null); setDragOverId(null); }}
                   >
                     <td className="px-3 py-2.5">
                       <input
@@ -758,6 +825,9 @@ const Dashboard: React.FC<DashboardProps> = ({
 
                     <td className="px-3 py-2.5">
                       <div className="flex items-center gap-2.5 min-w-0">
+                        <div className="cursor-grab active:cursor-grabbing shrink-0 opacity-0 group-hover:opacity-40 hover:!opacity-70 transition-opacity" style={{ color: 'var(--text-muted)', marginRight: -4 }}>
+                          <GripVertical size={14} />
+                        </div>
                         <div
                           className="w-8 h-8 rounded-lg flex items-center justify-center text-[13px] font-bold shrink-0"
                           style={{ background: isActive ? 'var(--success-subtle)' : 'var(--bg-overlay)', color: isActive ? 'var(--success)' : 'var(--text-muted)' }}
@@ -813,8 +883,8 @@ const Dashboard: React.FC<DashboardProps> = ({
                             </button>
                             {statusMenuId === `table-${profile.id}` && (
                               <div
-                                className="absolute top-full left-0 mt-1 rounded-lg shadow-xl z-30 py-1 min-w-[150px]"
-                                style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+                                className="absolute top-full left-0 mt-1 rounded-lg shadow-xl py-1 min-w-[150px]"
+                                style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)', zIndex: 9999 }}
                                 onClick={e => e.stopPropagation()}
                               >
                                 {statusOptions.map(opt => (
@@ -1066,6 +1136,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                       </div>
                     </td>
                   </tr>
+                  </React.Fragment>
                 );
               })}
             </tbody>
