@@ -87,6 +87,7 @@ export class PuppeteerLauncher {
       let proxy: any = null;
       if (options.proxy?.host) {
         proxy = options.proxy;
+        console.log(`[ProxyDebug] host=${proxy.host} port=${proxy.port} user=${proxy.username || 'NONE'} pass=${proxy.password ? '***' : 'NONE'}`);
       }
 
       const cacheDir = path.join(profilePath, 'Cache');
@@ -131,7 +132,32 @@ export class PuppeteerLauncher {
         args.push('--disable-dns-prefetch');
       }
 
+      // Create proxy auth extension if proxy has credentials
+      // This handles auth for ALL requests (pages + extensions) unlike page.authenticate()
+      let proxyAuthExtPath: string | null = null;
+      if (proxy && proxy.username && proxy.password) {
+        proxyAuthExtPath = path.join(profilePath, '__proxy_auth_ext');
+        if (!fs.existsSync(proxyAuthExtPath)) {
+          fs.mkdirSync(proxyAuthExtPath, { recursive: true });
+        }
+        fs.writeFileSync(path.join(proxyAuthExtPath, 'manifest.json'), JSON.stringify({
+          manifest_version: 3,
+          name: 'Proxy Auth',
+          version: '1.0',
+          permissions: ['webRequest', 'webRequestAuthProvider'],
+          background: { service_worker: 'background.js' },
+        }));
+        fs.writeFileSync(path.join(proxyAuthExtPath, 'background.js'),
+          `chrome.webRequest.onAuthRequired.addListener((details, callback) => {
+            callback({ authCredentials: { username: ${JSON.stringify(proxy.username)}, password: ${JSON.stringify(proxy.password)} } });
+          }, { urls: ['<all_urls>'] }, ['asyncBlocking']);`
+        );
+        console.log('[ProxyAuth] Created proxy auth extension');
+      }
+
       // Load extensions via --load-extension flag (like AdsPower/GoLogin)
+      const extPaths: string[] = [];
+      if (proxyAuthExtPath) extPaths.push(proxyAuthExtPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
         const validPaths = options.extensionPaths.filter(p => {
           const manifestPath = path.join(p, 'manifest.json');
@@ -139,11 +165,12 @@ export class PuppeteerLauncher {
           console.log(`[Extensions] ${p} — manifest exists: ${exists}`);
           return exists;
         });
-        if (validPaths.length > 0) {
-          args.push(`--load-extension=${validPaths.join(',')}`);
-          args.push(`--disable-extensions-except=${validPaths.join(',')}`);
-          console.log(`[Extensions] Loading ${validPaths.length} extension(s) via --load-extension`);
-        }
+        extPaths.push(...validPaths);
+      }
+      if (extPaths.length > 0) {
+        args.push(`--load-extension=${extPaths.join(',')}`);
+        args.push(`--disable-extensions-except=${extPaths.join(',')}`);
+        console.log(`[Extensions] Loading ${extPaths.length} extension(s) via --load-extension`);
       }
 
       // User agent will be set after fingerprint OS correction (see below)
