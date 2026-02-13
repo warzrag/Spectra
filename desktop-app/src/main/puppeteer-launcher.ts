@@ -119,7 +119,7 @@ export class PuppeteerLauncher {
         '--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints',
         '--force-color-profile=srgb',
         '--password-store=basic',
-        `--window-size=${options.fingerprint?.screenWidth || 1200},${options.fingerprint?.screenHeight || 800}`,
+        '--window-size=1280,800',
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
       ];
 
