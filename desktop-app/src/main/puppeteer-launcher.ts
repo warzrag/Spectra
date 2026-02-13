@@ -141,16 +141,17 @@ export class PuppeteerLauncher {
           fs.mkdirSync(proxyAuthExtPath, { recursive: true });
         }
         fs.writeFileSync(path.join(proxyAuthExtPath, 'manifest.json'), JSON.stringify({
-          manifest_version: 2,
+          manifest_version: 3,
           name: 'Proxy Auth',
           version: '1.0',
-          permissions: ['webRequest', 'webRequestBlocking', '<all_urls>'],
-          background: { scripts: ['background.js'], persistent: true },
+          permissions: ['webRequest', 'webRequestAuthProvider'],
+          host_permissions: ['<all_urls>'],
+          background: { service_worker: 'background.js' },
         }));
         fs.writeFileSync(path.join(proxyAuthExtPath, 'background.js'),
-          `chrome.webRequest.onAuthRequired.addListener(() => {
+          `chrome.webRequest.onAuthRequired.addListener((details) => {
             return { authCredentials: { username: ${JSON.stringify(proxy.username)}, password: ${JSON.stringify(proxy.password)} } };
-          }, { urls: ['<all_urls>'] }, ['blocking']);`
+          }, { urls: ['<all_urls>'] }, ['asyncBlocking']);`
         );
         console.log('[ProxyAuth] Created proxy auth extension');
       }
