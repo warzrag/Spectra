@@ -38,11 +38,14 @@ const ESSENTIAL_DIRS = new Set([
   'Sync Extension Settings',
 ]);
 
-// Root-level files to sync (Chrome profile config)
+// Root-level files to sync (Chrome profile config + CDP cookie/tab data)
 const ROOT_FILES = new Set([
   'Local State',
   'First Run',
   '.sync_version',
+  'synced_cookies.json',
+  'open_tabs.json',
+  'last_url.txt',
 ]);
 
 function getProfilesBaseDir(): string {

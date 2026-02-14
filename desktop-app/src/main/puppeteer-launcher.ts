@@ -2,47 +2,9 @@ import puppeteer from 'puppeteer';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import * as https from 'https';
-import { execFile } from 'child_process';
 import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
 
-// BotBrowser release info
-const BOTBROWSER_VERSION = '145.0.7632.46';
-const BOTBROWSER_DATE = '20260210';
-const BOTBROWSER_BASE_URL = `https://github.com/botswin/BotBrowser/releases/download/${BOTBROWSER_VERSION}`;
-
-function getBotBrowserDownloadInfo(): { url: string; filename: string; profileUrl: string; profileName: string } {
-  const platform = os.platform();
-  const arch = os.arch();
-
-  if (platform === 'win32') {
-    return {
-      url: `${BOTBROWSER_BASE_URL}/botbrowser_${BOTBROWSER_DATE}_${BOTBROWSER_VERSION}_win_x86_64.7z`,
-      filename: `botbrowser_${BOTBROWSER_DATE}_${BOTBROWSER_VERSION}_win_x86_64.7z`,
-      profileUrl: 'https://raw.githubusercontent.com/botswin/BotBrowser/main/profiles/stable/chrome145_win10_x64.enc',
-      profileName: 'chrome145_win10_x64.enc',
-    };
-  } else if (platform === 'darwin') {
-    const isArm = arch === 'arm64';
-    const archStr = isArm ? 'arm64' : 'x86_64';
-    return {
-      url: `${BOTBROWSER_BASE_URL}/botbrowser_${BOTBROWSER_DATE}_${BOTBROWSER_VERSION}_mac_${archStr}.dmg`,
-      filename: `botbrowser_${BOTBROWSER_DATE}_${BOTBROWSER_VERSION}_mac_${archStr}.dmg`,
-      profileUrl: `https://raw.githubusercontent.com/botswin/BotBrowser/main/profiles/stable/chrome145_mac_${archStr}.enc`,
-      profileName: `chrome145_mac_${archStr}.enc`,
-    };
-  } else {
-    const archStr = arch === 'arm64' ? 'arm64' : 'x86_64';
-    return {
-      url: `${BOTBROWSER_BASE_URL}/botbrowser_${BOTBROWSER_DATE}_${BOTBROWSER_VERSION}_${archStr}.deb`,
-      filename: `botbrowser_${BOTBROWSER_DATE}_${BOTBROWSER_VERSION}_${archStr}.deb`,
-      profileUrl: `https://raw.githubusercontent.com/AntBrowserTeam/BotBrowser/main/profiles/stable/chrome145_win10_x64.enc`,
-      profileName: 'chrome145_win10_x64.enc',
-    };
-  }
-}
-
-// Get the Chrome version this Puppeteer version supports (fallback only)
+// Get the Chrome version this Puppeteer version supports
 const COMPATIBLE_CHROME_VERSION = (() => {
   try {
     const { PUPPETEER_REVISIONS } = require('puppeteer');
@@ -79,6 +41,36 @@ export class PuppeteerLauncher {
 
   static isProfileActive(profileId: string): boolean {
     return this.activeProfiles.has(profileId);
+  }
+
+  /**
+   * Clean Chrome-internal state from a profile directory to fix version incompatibility.
+   * Keeps our custom files (cookies, tabs, last_url, proxy auth extension).
+   */
+  private static cleanProfileState(profilePath: string) {
+    const keepFiles = new Set([
+      'pending_cookies.json', 'synced_cookies.json', 'open_tabs.json',
+      'last_url.txt', '__proxy_auth_ext',
+    ]);
+
+    try {
+      const entries = fs.readdirSync(profilePath);
+      for (const entry of entries) {
+        if (keepFiles.has(entry)) continue;
+        const fullPath = path.join(profilePath, entry);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            fs.rmSync(fullPath, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(fullPath);
+          }
+        } catch {}
+      }
+      console.log(`[Profile] Cleaned incompatible Chrome state from ${profilePath}`);
+    } catch (e: any) {
+      console.error(`[Profile] Error cleaning profile state:`, e.message);
+    }
   }
 
   static async launch(options: PuppeteerLaunchOptions) {
@@ -131,8 +123,8 @@ export class PuppeteerLauncher {
         fs.mkdirSync(cacheDir, { recursive: true });
       }
 
-      // Get BotBrowser paths
-      const { chromePath, profileEncPath, isBotBrowser } = await this.getPortableChrome();
+      // Get Chrome for Testing
+      const chromePath = await this.downloadChromeForTesting();
 
       // Build Chrome args
       const args = [
@@ -145,29 +137,18 @@ export class PuppeteerLauncher {
         '--disable-default-apps',
         '--disable-sync',
         '--window-size=1280,800',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
+        '--disable-client-side-phishing-detection',
+        '--disable-hang-monitor',
+        '--disable-ipc-flooding-protection',
+        '--disable-renderer-backgrounding',
+        '--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints',
+        `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
       ];
-
-      if (isBotBrowser && profileEncPath) {
-        // BotBrowser: minimal flags + bot-profile (everything else handled natively)
-        args.push(`--bot-profile=${profileEncPath}`);
-        args.push('--bot-config-timezone=auto');
-        args.push('--bot-config-languages=auto');
-        args.push('--bot-config-webrtc=disabled');
-        console.log(`[BotBrowser] Using profile: ${profileEncPath}`);
-      } else {
-        // Fallback Chrome for Testing: need extra flags
-        args.push('--disable-blink-features=AutomationControlled');
-        args.push('--disable-dev-shm-usage');
-        args.push('--disable-background-timer-throttling');
-        args.push('--disable-backgrounding-occluded-windows');
-        args.push('--disable-breakpad');
-        args.push('--disable-client-side-phishing-detection');
-        args.push('--disable-hang-monitor');
-        args.push('--disable-ipc-flooding-protection');
-        args.push('--disable-renderer-backgrounding');
-        args.push('--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints');
-        args.push(`--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`);
-      }
 
       // Proxy + DNS leak prevention
       if (proxy && proxy.host) {
@@ -201,8 +182,21 @@ export class PuppeteerLauncher {
         console.log('[ProxyAuth] Created proxy auth extension');
       }
 
+      // Load stealth extension (replaces CDP injection — undetectable by Twitter)
+      const stealthExtPath = path.join(__dirname, '..', '..', '..', 'assets', 'stealth-extension');
+      // Also check packaged app path
+      const stealthExtPathAlt = path.join(process.resourcesPath || '', 'assets', 'stealth-extension');
+      const stealthExt = fs.existsSync(path.join(stealthExtPath, 'manifest.json')) ? stealthExtPath
+        : fs.existsSync(path.join(stealthExtPathAlt, 'manifest.json')) ? stealthExtPathAlt : null;
+
       // Load extensions via --load-extension flag
       const extPaths: string[] = [];
+      if (stealthExt) {
+        extPaths.push(stealthExt);
+        console.log(`[Stealth] Loading stealth extension from: ${stealthExt}`);
+      } else {
+        console.warn('[Stealth] Stealth extension not found!');
+      }
       if (proxyAuthExtPath) extPaths.push(proxyAuthExtPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
         const validPaths = options.extensionPaths.filter(p => {
@@ -219,13 +213,14 @@ export class PuppeteerLauncher {
         console.log(`[Extensions] Loading ${extPaths.length} extension(s) via --load-extension`);
       }
 
-      // Determine start URL
-      let startUrl = options.lastUrl || 'https://www.google.com';
+      // Determine start URL — only allow http/https
+      const isValidUrl = (url: string) => url && (url.startsWith('https://') || url.startsWith('http://'));
+      let startUrl = isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com';
       const lastUrlPath = path.join(profilePath, 'last_url.txt');
       if (fs.existsSync(lastUrlPath)) {
         try {
           const savedUrl = fs.readFileSync(lastUrlPath, 'utf8').trim();
-          if (savedUrl && savedUrl.startsWith('http')) {
+          if (isValidUrl(savedUrl)) {
             startUrl = savedUrl;
             console.log(`Restored saved URL: ${savedUrl}`);
           }
@@ -236,7 +231,7 @@ export class PuppeteerLauncher {
 
       // Don't pass startUrl as Chrome arg — we navigate AFTER proxy auth is configured
       console.log(`Start URL (will navigate after auth setup): ${startUrl}`);
-      console.log(`Launching ${isBotBrowser ? 'BotBrowser' : 'Chrome'}: ${chromePath}`);
+      console.log(`Launching Chrome: ${chromePath}`);
 
       // Clean environment: remove Electron-specific env vars that crash Chrome
       const cleanEnv: Record<string, string | undefined> = {};
@@ -246,13 +241,9 @@ export class PuppeteerLauncher {
         }
       }
 
-      // BotBrowser needs extra ignoreDefaultArgs to avoid interfering with fingerprint protection
       const ignoreArgs = ['--enable-automation', '--disable-extensions'];
-      if (isBotBrowser) {
-        ignoreArgs.push('--disable-crash-reporter', '--disable-crashpad-for-testing', '--disable-gpu-watchdog');
-      }
 
-      const browser = await puppeteer.launch({
+      const launchOptions = {
         headless: false,
         defaultViewport: null,
         args: args,
@@ -264,17 +255,39 @@ export class PuppeteerLauncher {
         handleSIGINT: false,
         handleSIGTERM: false,
         handleSIGHUP: false,
-      });
-      console.log(`[${isBotBrowser ? 'BotBrowser' : 'Chrome'}] Browser launched successfully!`);
+      };
 
-      // Get the page that Chrome opened
-      const pages = await browser.pages();
-      const page = pages.length > 1 ? pages[1] : pages[0];
+      let browser;
+      try {
+        browser = await puppeteer.launch(launchOptions);
+      } catch (launchErr: any) {
+        // If profile is incompatible (e.g. created by BotBrowser Chrome 145), clean and retry
+        if (launchErr.message?.includes('Target closed') || launchErr.message?.includes('Protocol error')) {
+          console.warn('[Chrome] Launch failed — cleaning incompatible profile state and retrying...');
+          this.cleanProfileState(profilePath);
+          // Recreate Default directory and Preferences
+          const retryDefaultDir = path.join(profilePath, 'Default');
+          if (!fs.existsSync(retryDefaultDir)) fs.mkdirSync(retryDefaultDir, { recursive: true });
+          fs.writeFileSync(path.join(retryDefaultDir, 'Preferences'), '{}');
+          if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+          browser = await puppeteer.launch(launchOptions);
+        } else {
+          throw launchErr;
+        }
+      }
+      console.log('[Chrome] Browser launched!');
+
+      let page: any;
+      let pages = await browser.pages();
+      if (pages.length === 0) {
+        pages = [await browser.newPage()];
+      }
+      page = pages[pages.length - 1];
 
       // Handle proxy authentication BEFORE navigation (prevents auth popup)
-      // With BotBrowser, only use the extension (no CDP page.authenticate which is detectable)
-      if (proxy && proxy.username && proxy.password && !isBotBrowser) {
-        for (const p of pages) {
+      if (proxy && proxy.username && proxy.password) {
+        const allPages = await browser.pages();
+        for (const p of allPages) {
           await p.authenticate({ username: proxy.username, password: proxy.password });
         }
 
@@ -289,8 +302,6 @@ export class PuppeteerLauncher {
           }
         });
         console.log('[ProxyAuth] Proxy authentication configured via CDP');
-      } else if (proxy && proxy.username && proxy.password) {
-        console.log('[ProxyAuth] Using extension-only auth (BotBrowser mode)');
       }
 
       // Load pending cookies via CDP
@@ -351,40 +362,39 @@ export class PuppeteerLauncher {
         }
       }
 
-      // Restore all saved tabs or navigate to start URL
+      // Navigate to saved tabs or start URL
       const tabsFilePath = path.join(profilePath, 'open_tabs.json');
       let savedTabs: string[] = [];
       if (fs.existsSync(tabsFilePath)) {
-        try { savedTabs = JSON.parse(fs.readFileSync(tabsFilePath, 'utf8')); } catch {}
+        try {
+          savedTabs = JSON.parse(fs.readFileSync(tabsFilePath, 'utf8'));
+          savedTabs = savedTabs.filter(url => url.startsWith('http://') || url.startsWith('https://'));
+        } catch {}
       }
 
       if (savedTabs.length > 0) {
-        // Restore first tab in existing page
         try {
           await page.goto(savedTabs[0], { waitUntil: 'domcontentloaded', timeout: 30000 });
           console.log(`[Navigation] Restored tab 1/${savedTabs.length}: ${savedTabs[0]}`);
-        } catch (e) {
-          console.error('[Navigation] Failed to restore first tab:', e);
+        } catch (e: any) {
+          console.error(`[Navigation] Failed to restore first tab:`, e.message);
         }
-        // Open remaining tabs
-        await Promise.all(savedTabs.slice(1).map(async (url, idx) => {
+        for (const [idx, url] of savedTabs.slice(1).entries()) {
           try {
             const newPage = await browser.newPage();
-            if (proxy && proxy.username && proxy.password && !isBotBrowser) {
+            if (proxy && proxy.username && proxy.password) {
               await newPage.authenticate({ username: proxy.username, password: proxy.password });
             }
             newPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
             console.log(`[Navigation] Restored tab ${idx + 2}/${savedTabs.length}: ${url}`);
-          } catch (e) {
-            console.error(`[Navigation] Failed to restore tab ${idx + 2}:`, e);
-          }
-        }));
+          } catch {}
+        }
       } else {
         try {
           await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           console.log(`[Navigation] Navigated to: ${startUrl}`);
-        } catch (e) {
-          console.error('[Navigation] Failed to navigate to start URL:', e);
+        } catch (e: any) {
+          console.error(`[Navigation] Failed to navigate:`, e.message);
         }
       }
 
@@ -424,7 +434,7 @@ export class PuppeteerLauncher {
             console.log(`[Tabs] Saved ${urls.length} tab(s)`);
           }
           const mainUrl = page.url();
-          if (mainUrl && !mainUrl.startsWith('about:') && !mainUrl.startsWith('chrome://')) {
+          if (mainUrl && (mainUrl.startsWith('https://') || mainUrl.startsWith('http://'))) {
             fs.writeFileSync(path.join(profilePath, 'last_url.txt'), mainUrl);
             const stateDir = path.join(os.homedir(), '.antidetect-browser', 'state');
             if (!fs.existsSync(stateDir)) fs.mkdirSync(stateDir, { recursive: true });
@@ -482,7 +492,7 @@ export class PuppeteerLauncher {
       setTimeout(saveCookiesViaCDP, 5000);
       cookieSaveInterval = setInterval(saveCookiesViaCDP, 30000);
 
-      console.log(`${isBotBrowser ? 'BotBrowser' : 'Chrome'} launched successfully for profile: ${options.profileId}`);
+      console.log(`Chrome launched successfully for profile: ${options.profileId}`);
       return { success: true };
 
     } catch (error: any) {
@@ -491,292 +501,8 @@ export class PuppeteerLauncher {
     }
   }
 
-  private static browserPath: string | null = null;
-  private static profileEncPath: string | null = null;
-  private static usingBotBrowser: boolean = false;
-
   /**
-   * Download a file from URL to disk with progress reporting.
-   */
-  private static downloadFile(url: string, destPath: string, label: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const follow = (url: string, redirects: number) => {
-        if (redirects > 5) return reject(new Error('Too many redirects'));
-
-        const makeRequest = (requestUrl: string) => {
-          https.get(requestUrl, { headers: { 'User-Agent': 'Spectra/1.0' } }, (res) => {
-            if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-              return follow(res.headers.location, redirects + 1);
-            }
-            if (res.statusCode !== 200) {
-              return reject(new Error(`HTTP ${res.statusCode} downloading ${url}`));
-            }
-
-            const totalBytes = parseInt(res.headers['content-length'] || '0', 10);
-            let downloadedBytes = 0;
-            let lastPercent = 0;
-            const file = fs.createWriteStream(destPath);
-
-            res.on('data', (chunk: Buffer) => {
-              downloadedBytes += chunk.length;
-              if (totalBytes > 0) {
-                const percent = Math.round((downloadedBytes / totalBytes) * 100);
-                if (percent !== lastPercent) {
-                  lastPercent = percent;
-                  const dlMB = (downloadedBytes / 1024 / 1024).toFixed(1);
-                  const totalMB = (totalBytes / 1024 / 1024).toFixed(1);
-                  this.sendProgress(percent, `${label}... ${dlMB} / ${totalMB} Mo`);
-                  if (percent % 10 === 0) {
-                    console.log(`[BotBrowser] ${label}: ${percent}% (${dlMB}/${totalMB} MB)`);
-                  }
-                }
-              }
-            });
-
-            res.pipe(file);
-            file.on('finish', () => { file.close(); resolve(); });
-            file.on('error', (err) => { fs.unlinkSync(destPath); reject(err); });
-          }).on('error', reject);
-        };
-
-        makeRequest(url);
-      };
-
-      follow(url, 0);
-    });
-  }
-
-  /**
-   * Extract a .7z archive using 7zip-bin (Windows)
-   */
-  private static extract7z(archivePath: string, destDir: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      let sevenZipBin: string;
-      try {
-        sevenZipBin = require('7zip-bin').path7za;
-      } catch {
-        return reject(new Error('7zip-bin not installed'));
-      }
-
-      console.log(`[BotBrowser] Extracting ${archivePath} to ${destDir}`);
-      this.sendProgress(50, 'Extraction en cours...');
-
-      execFile(sevenZipBin, ['x', archivePath, `-o${destDir}`, '-y'], { maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          console.error('[BotBrowser] 7z extraction error:', stderr || err.message);
-          return reject(err);
-        }
-        console.log('[BotBrowser] Extraction complete');
-        this.sendProgress(80, 'Extraction terminée');
-        resolve();
-      });
-    });
-  }
-
-  /**
-   * Extract a .dmg on macOS using hdiutil
-   */
-  private static extractDmg(dmgPath: string, destDir: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const mountPoint = path.join(os.tmpdir(), 'botbrowser_mount');
-
-      // Mount the DMG
-      execFile('hdiutil', ['attach', dmgPath, '-mountpoint', mountPoint, '-nobrowse', '-quiet'], (err) => {
-        if (err) return reject(new Error(`Failed to mount DMG: ${err.message}`));
-
-        this.sendProgress(60, 'Copie des fichiers...');
-
-        // Find .app inside mounted volume
-        try {
-          const entries = fs.readdirSync(mountPoint);
-          const appEntry = entries.find(e => e.endsWith('.app'));
-          if (!appEntry) {
-            execFile('hdiutil', ['detach', mountPoint, '-quiet'], () => {});
-            return reject(new Error('No .app found in DMG'));
-          }
-
-          const srcApp = path.join(mountPoint, appEntry);
-          const destApp = path.join(destDir, appEntry);
-
-          // Copy .app to destination
-          execFile('cp', ['-R', srcApp, destApp], (err) => {
-            // Unmount regardless
-            execFile('hdiutil', ['detach', mountPoint, '-quiet'], () => {});
-
-            if (err) return reject(new Error(`Failed to copy app: ${err.message}`));
-
-            // Remove macOS quarantine attribute (prevents "Chromium is damaged" error)
-            execFile('xattr', ['-rd', 'com.apple.quarantine', destApp], () => {
-              console.log('[BotBrowser] Removed quarantine attribute from .app bundle');
-            });
-
-            // Find the executable inside the .app bundle
-            const execPath = path.join(destApp, 'Contents', 'MacOS', 'Chromium');
-            if (fs.existsSync(execPath)) {
-              fs.chmodSync(execPath, 0o755);
-              resolve(execPath);
-            } else {
-              // Try to find any executable
-              const macosDir = path.join(destApp, 'Contents', 'MacOS');
-              if (fs.existsSync(macosDir)) {
-                const execs = fs.readdirSync(macosDir);
-                if (execs.length > 0) {
-                  const executablePath = path.join(macosDir, execs[0]);
-                  fs.chmodSync(executablePath, 0o755);
-                  resolve(executablePath);
-                } else {
-                  reject(new Error('No executable found in .app bundle'));
-                }
-              } else {
-                reject(new Error('No MacOS directory in .app bundle'));
-              }
-            }
-          });
-        } catch (e) {
-          execFile('hdiutil', ['detach', mountPoint, '-quiet'], () => {});
-          reject(e);
-        }
-      });
-    });
-  }
-
-  /**
-   * Download BotBrowser and profile, with fallback to Chrome for Testing
-   */
-  private static async getPortableChrome(): Promise<{ chromePath: string; profileEncPath: string | null; isBotBrowser: boolean }> {
-    // Return cached paths
-    if (this.browserPath && fs.existsSync(this.browserPath)) {
-      return {
-        chromePath: this.browserPath,
-        profileEncPath: this.profileEncPath,
-        isBotBrowser: this.usingBotBrowser,
-      };
-    }
-
-    const botBrowserDir = path.join(os.homedir(), '.antidetect-browser', 'botbrowser');
-    const markerPath = path.join(botBrowserDir, '.installed');
-
-    // Check if BotBrowser is already installed
-    if (fs.existsSync(markerPath)) {
-      try {
-        const saved = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
-        if (saved.chromePath && fs.existsSync(saved.chromePath)) {
-          console.log(`[BotBrowser] Using cached installation: ${saved.chromePath}`);
-          this.browserPath = saved.chromePath;
-          this.profileEncPath = saved.profileEncPath || null;
-          this.usingBotBrowser = true;
-          return { chromePath: saved.chromePath, profileEncPath: saved.profileEncPath, isBotBrowser: true };
-        }
-      } catch {}
-    }
-
-    // Try to download and install BotBrowser
-    try {
-      const info = getBotBrowserDownloadInfo();
-      console.log(`[BotBrowser] Downloading ${info.filename}...`);
-      this.sendProgress(0, 'Téléchargement de BotBrowser...');
-
-      if (!fs.existsSync(botBrowserDir)) {
-        fs.mkdirSync(botBrowserDir, { recursive: true });
-      }
-
-      // Download the browser archive
-      const archivePath = path.join(botBrowserDir, info.filename);
-      if (!fs.existsSync(archivePath)) {
-        await this.downloadFile(info.url, archivePath, 'Téléchargement de BotBrowser');
-      }
-
-      // Extract based on platform
-      let executablePath: string;
-      const extractDir = path.join(botBrowserDir, 'browser');
-
-      if (process.platform === 'win32') {
-        // Extract .7z on Windows
-        if (!fs.existsSync(extractDir)) {
-          fs.mkdirSync(extractDir, { recursive: true });
-        }
-        await this.extract7z(archivePath, extractDir);
-
-        // Find chrome.exe in extracted directory
-        executablePath = this.findExecutableInDir(extractDir, 'chrome.exe');
-        if (!executablePath) {
-          throw new Error('chrome.exe not found in extracted BotBrowser archive');
-        }
-      } else if (process.platform === 'darwin') {
-        // Extract .dmg on macOS
-        if (!fs.existsSync(extractDir)) {
-          fs.mkdirSync(extractDir, { recursive: true });
-        }
-        executablePath = await this.extractDmg(archivePath, extractDir);
-      } else {
-        throw new Error('Linux BotBrowser installation not yet supported');
-      }
-
-      // Download profile .enc file
-      this.sendProgress(85, 'Téléchargement du profil...');
-      const profileEncPath = path.join(botBrowserDir, info.profileName);
-      if (!fs.existsSync(profileEncPath)) {
-        await this.downloadFile(info.profileUrl, profileEncPath, 'Téléchargement du profil');
-      }
-
-      this.sendProgress(95, 'Installation terminée');
-
-      // Save marker
-      const markerData = { chromePath: executablePath, profileEncPath, version: BOTBROWSER_VERSION };
-      fs.writeFileSync(markerPath, JSON.stringify(markerData));
-
-      // Clean up archive to save disk space
-      try { fs.unlinkSync(archivePath); } catch {}
-
-      this.browserPath = executablePath;
-      this.profileEncPath = profileEncPath;
-      this.usingBotBrowser = true;
-
-      this.sendProgress(100, 'BotBrowser prêt !');
-      console.log(`[BotBrowser] Installed: ${executablePath}`);
-
-      return { chromePath: executablePath, profileEncPath, isBotBrowser: true };
-
-    } catch (err: any) {
-      console.error(`[BotBrowser] Installation failed, falling back to Chrome for Testing:`, err.message);
-      this.sendProgress(0, 'Fallback: Chrome for Testing...');
-
-      // Fallback to Chrome for Testing
-      const chromePath = await this.downloadChromeForTesting();
-      this.browserPath = chromePath;
-      this.profileEncPath = null;
-      this.usingBotBrowser = false;
-
-      return { chromePath, profileEncPath: null, isBotBrowser: false };
-    }
-  }
-
-  /**
-   * Recursively find an executable in a directory
-   */
-  private static findExecutableInDir(dir: string, name: string): string {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-
-    // Check current directory first
-    for (const entry of entries) {
-      if (entry.isFile() && entry.name.toLowerCase() === name.toLowerCase()) {
-        return path.join(dir, entry.name);
-      }
-    }
-
-    // Recurse into subdirectories
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const found = this.findExecutableInDir(path.join(dir, entry.name), name);
-        if (found) return found;
-      }
-    }
-
-    return '';
-  }
-
-  /**
-   * Fallback: Download Chrome for Testing (original method)
+   * Download Chrome for Testing
    */
   private static async downloadChromeForTesting(): Promise<string> {
     const cacheDir = path.join(os.homedir(), '.antidetect-browser', 'browser');
@@ -795,7 +521,7 @@ export class PuppeteerLauncher {
       }
     }
 
-    console.log('[Browser] Downloading Chrome for Testing (fallback)...');
+    console.log('[Browser] Downloading Chrome for Testing...');
     this.sendProgress(0, 'Téléchargement Chrome for Testing...');
     if (!fs.existsSync(cacheDir)) {
       fs.mkdirSync(cacheDir, { recursive: true });

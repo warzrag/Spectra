@@ -24,7 +24,7 @@
     {
       "from": "assets",
       "to": "assets",
-      "filter": ["icon.png", "icon-256.png"]
+      "filter": ["icon.png", "icon-256.png", "stealth-extension/**/*"]
     }
   ],
   "win": {
