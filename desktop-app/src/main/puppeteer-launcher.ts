@@ -52,6 +52,7 @@ export class PuppeteerLauncher {
     const keepFiles = new Set([
       'pending_cookies.json', 'synced_cookies.json', 'open_tabs.json',
       'last_url.txt', '__proxy_auth_ext', '__brand_fix_ext',
+      '__cookie_sync_ext', '__platform_fix_ext',
     ]);
     try {
       const entries = fs.readdirSync(profilePath);
@@ -199,8 +200,95 @@ export class PuppeteerLauncher {
         console.log(`[Platform] Override: ${platform}`);
       }
 
+      // Create cookie-sync extension (export/import cookies for cloud sync)
+      const cookieSyncPath = path.join(profilePath, '__cookie_sync_ext');
+      if (fs.existsSync(cookieSyncPath)) {
+        fs.rmSync(cookieSyncPath, { recursive: true, force: true });
+      }
+      fs.mkdirSync(cookieSyncPath, { recursive: true });
+
+      fs.writeFileSync(path.join(cookieSyncPath, 'manifest.json'), JSON.stringify({
+        manifest_version: 3,
+        name: 'Cookie Sync',
+        version: '1.0',
+        permissions: ['cookies'],
+        host_permissions: ['<all_urls>'],
+        background: { service_worker: 'background.js' },
+      }));
+
+      // Write synced cookies as cookies.json for import
+      const syncedCookiesPath = path.join(profilePath, 'synced_cookies.json');
+      if (fs.existsSync(syncedCookiesPath)) {
+        try {
+          const cookies = fs.readFileSync(syncedCookiesPath, 'utf8');
+          fs.writeFileSync(path.join(cookieSyncPath, 'cookies.json'), cookies);
+          console.log(`[CookieSync] Loaded cookies for import`);
+        } catch {}
+      } else {
+        fs.writeFileSync(path.join(cookieSyncPath, 'cookies.json'), '[]');
+      }
+
+      fs.writeFileSync(path.join(cookieSyncPath, 'background.js'),
+`const PROFILE_ID = ${JSON.stringify(options.profileId)};
+const SERVER = 'http://127.0.0.1:45678';
+
+// Import cookies from cookies.json at startup
+async function importCookies() {
+  try {
+    const response = await fetch(chrome.runtime.getURL('cookies.json'));
+    if (!response.ok) return;
+    const cookies = await response.json();
+    if (!Array.isArray(cookies) || cookies.length === 0) return;
+    let imported = 0;
+    for (const c of cookies) {
+      try {
+        const details = {
+          url: 'http' + (c.secure ? 's' : '') + '://' + (c.domain || '').replace(/^\\./, '') + (c.path || '/'),
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || '/',
+          secure: c.secure || false,
+          httpOnly: c.httpOnly || false,
+          sameSite: c.sameSite === 'None' ? 'no_restriction' : (c.sameSite || 'lax').toLowerCase(),
+        };
+        if (c.expires && c.expires > 0) details.expirationDate = c.expires;
+        else if (c.expirationDate && c.expirationDate > 0) details.expirationDate = c.expirationDate;
+        await chrome.cookies.set(details);
+        imported++;
+      } catch (e) {}
+    }
+    console.log('[CookieSync] Imported ' + imported + '/' + cookies.length + ' cookies');
+  } catch (e) {}
+}
+
+// Export all cookies to local server
+async function exportCookies() {
+  try {
+    const cookies = await chrome.cookies.getAll({});
+    await fetch(SERVER + '/api/save-cookies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profileId: PROFILE_ID, cookies }),
+    });
+    console.log('[CookieSync] Exported ' + cookies.length + ' cookies');
+  } catch (e) {}
+}
+
+// Import on startup
+importCookies();
+
+// Export every 30 seconds
+setInterval(exportCookies, 30000);
+
+// Also export after 5 seconds (initial page load)
+setTimeout(exportCookies, 5000);
+`
+      );
+      console.log(`[CookieSync] Created cookie sync extension`);
+
       // Collect extensions
-      const extPaths: string[] = [];
+      const extPaths: string[] = [cookieSyncPath];
       if (platformFixPath) extPaths.push(platformFixPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
         const validPaths = options.extensionPaths.filter(p => {

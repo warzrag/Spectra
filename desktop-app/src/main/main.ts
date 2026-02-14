@@ -252,6 +252,19 @@ ipcMain.on('internal:save-url', (_, profileId, url) => {
   }
 });
 
+// Handle internal cookie save event — save to synced_cookies.json for cloud sync
+ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
+  try {
+    const userDataDir = process.platform === 'win32'
+      ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+      : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+    const syncedPath = path.join(userDataDir, profileId, 'synced_cookies.json');
+    fs.writeFileSync(syncedPath, JSON.stringify(cookies));
+    console.log(`[CookieSync] Saved ${cookies.length} cookies for profile ${profileId}`);
+  } catch (e: any) {
+    console.error('[CookieSync] Error saving cookies:', e.message);
+  }
+});
 
 ipcMain.handle('app:getVersion', () => {
   return app.getVersion();

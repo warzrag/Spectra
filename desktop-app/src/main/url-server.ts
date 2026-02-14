@@ -20,27 +20,37 @@ export class UrlTrackingServer {
         return;
       }
 
-      if (req.method === 'POST' && req.url === '/api/save-url') {
+      if (req.method === 'POST' && (req.url === '/api/save-url' || req.url === '/api/save-cookies')) {
         let body = '';
-        
+
         req.on('data', chunk => {
           body += chunk.toString();
         });
-        
+
         req.on('end', () => {
           try {
             const data = JSON.parse(body);
-            const { profileId, url } = data;
-            
-            if (profileId && url) {
-              // Emit event to main process to save URL
-              ipcMain.emit('internal:save-url', null, profileId, url);
-              
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true }));
-            } else {
-              res.writeHead(400);
-              res.end(JSON.stringify({ error: 'Missing profileId or url' }));
+
+            if (req.url === '/api/save-url') {
+              const { profileId, url } = data;
+              if (profileId && url) {
+                ipcMain.emit('internal:save-url', null, profileId, url);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+              } else {
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Missing profileId or url' }));
+              }
+            } else if (req.url === '/api/save-cookies') {
+              const { profileId, cookies } = data;
+              if (profileId && Array.isArray(cookies)) {
+                ipcMain.emit('internal:save-cookies', null, profileId, cookies);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, count: cookies.length }));
+              } else {
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Missing profileId or cookies' }));
+              }
             }
           } catch (error) {
             res.writeHead(400);
