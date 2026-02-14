@@ -51,7 +51,7 @@ export class PuppeteerLauncher {
   private static cleanProfileState(profilePath: string) {
     const keepFiles = new Set([
       'pending_cookies.json', 'synced_cookies.json', 'open_tabs.json',
-      'last_url.txt', '__proxy_auth_ext',
+      'last_url.txt', '__proxy_auth_ext', '__brand_fix_ext',
     ]);
     try {
       const entries = fs.readdirSync(profilePath);
@@ -103,6 +103,12 @@ export class PuppeteerLauncher {
       if (fs.existsSync(prefsPath)) {
         try { prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf8')); } catch {}
       }
+      // Enable developer mode for extensions loading
+      if (!prefs.extensions) prefs.extensions = {};
+      prefs.extensions.developer_mode = true;
+      // Suppress "disable developer mode extensions" dialog
+      if (!prefs.extensions.alerts) prefs.extensions.alerts = {};
+      prefs.extensions.alerts.initialized = true;
       fs.writeFileSync(prefsPath, JSON.stringify(prefs));
 
       // Proxy config
@@ -116,10 +122,11 @@ export class PuppeteerLauncher {
         fs.mkdirSync(cacheDir, { recursive: true });
       }
 
-      // Get Chrome
+      // Get Chrome for Testing (supports --load-extension for unpacked extensions)
       const chromePath = await this.downloadChromeForTesting();
 
       // Build Chrome args — MINIMAL flags only
+      const userAgent = options.userAgent || options.fingerprint?.userAgent || '';
       const args = [
         `--user-data-dir=${profilePath}`,
         '--no-first-run',
@@ -127,7 +134,14 @@ export class PuppeteerLauncher {
         '--disable-infobars',
         '--window-size=1280,800',
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
+        '--disable-features=UserAgentClientHint',
       ];
+
+      // Force User-Agent to match fingerprint (consistent across Mac/Windows)
+      if (userAgent) {
+        args.push(`--user-agent=${userAgent}`);
+        console.log(`[UA] Forced: ${userAgent.substring(0, 80)}...`);
+      }
 
       // WebRTC leak protection when using proxy
       if (proxy && proxy.host) {
@@ -153,8 +167,41 @@ export class PuppeteerLauncher {
         }
       }
 
-      // Collect extensions (user extensions only)
+      // Create platform-fix extension (overrides navigator.platform to match UA)
+      let platformFixPath: string | null = null;
+      if (userAgent) {
+        const isWindows = userAgent.includes('Windows');
+        const isMac = userAgent.includes('Macintosh');
+        const platform = isWindows ? 'Win32' : isMac ? 'MacIntel' : 'Linux x86_64';
+
+        platformFixPath = path.join(profilePath, '__platform_fix_ext');
+        if (fs.existsSync(platformFixPath)) {
+          fs.rmSync(platformFixPath, { recursive: true, force: true });
+        }
+        fs.mkdirSync(platformFixPath, { recursive: true });
+
+        fs.writeFileSync(path.join(platformFixPath, 'manifest.json'), JSON.stringify({
+          manifest_version: 3,
+          name: 'Platform',
+          version: '1.0',
+          content_scripts: [{
+            matches: ['<all_urls>'],
+            js: ['platform.js'],
+            run_at: 'document_start',
+            all_frames: true,
+            world: 'MAIN',
+          }],
+        }));
+
+        fs.writeFileSync(path.join(platformFixPath, 'platform.js'),
+          `Object.defineProperty(navigator, 'platform', { get: () => ${JSON.stringify(platform)} });`
+        );
+        console.log(`[Platform] Override: ${platform}`);
+      }
+
+      // Collect extensions
       const extPaths: string[] = [];
+      if (platformFixPath) extPaths.push(platformFixPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
         const validPaths = options.extensionPaths.filter(p => {
           const manifestPath = path.join(p, 'manifest.json');
@@ -248,7 +295,36 @@ export class PuppeteerLauncher {
   }
 
   /**
-   * Download Chrome for Testing
+   * Find system-installed Chrome (sends proper "Google Chrome" in Sec-Ch-Ua)
+   */
+  private static findSystemChrome(): string | null {
+    const candidates: string[] = [];
+    if (process.platform === 'win32') {
+      const programFiles = process.env['PROGRAMFILES'] || 'C:\\Program Files';
+      const programFilesX86 = process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
+      const localAppData = process.env['LOCALAPPDATA'] || path.join(os.homedir(), 'AppData', 'Local');
+      candidates.push(
+        path.join(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      );
+    } else if (process.platform === 'darwin') {
+      candidates.push('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome');
+    } else {
+      candidates.push('/usr/bin/google-chrome', '/usr/bin/google-chrome-stable');
+    }
+    for (const c of candidates) {
+      if (fs.existsSync(c)) {
+        console.log(`[Browser] Found system Chrome: ${c}`);
+        return c;
+      }
+    }
+    console.log('[Browser] System Chrome not found, will use Chrome for Testing');
+    return null;
+  }
+
+  /**
+   * Download Chrome for Testing (fallback)
    */
   private static async downloadChromeForTesting(): Promise<string> {
     const cacheDir = path.join(os.homedir(), '.antidetect-browser', 'browser');
