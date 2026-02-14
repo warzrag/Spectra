@@ -74,8 +74,11 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
   useEffect(() => {
     const timer = setTimeout(() => {
       const input = document.querySelector('input[name="profileName"]') as HTMLInputElement;
-      if (input) input.focus();
-    }, 50);
+      if (input) {
+        input.focus();
+        input.click();
+      }
+    }, 150);
     return () => clearTimeout(timer);
   }, []);
 

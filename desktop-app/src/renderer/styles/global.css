@@ -75,8 +75,14 @@ body {
   -webkit-app-region: drag;
 }
 
-.non-draggable {
-  -webkit-app-region: no-drag;
+.non-draggable,
+.non-draggable * {
+  -webkit-app-region: no-drag !important;
+}
+
+/* Ensure all interactive elements are never draggable */
+input, textarea, select, button, a, [contenteditable] {
+  -webkit-app-region: no-drag !important;
 }
 
 /* Custom scrollbar */
@@ -142,10 +148,13 @@ select {
   color: var(--text-muted);
 }
 
-/* Modal backdrop blur */
+/* Modal backdrop blur — z-index must override Electron drag regions */
 .modal-backdrop {
   backdrop-filter: blur(4px);
   background: rgba(0, 0, 0, 0.6);
+  -webkit-app-region: no-drag !important;
+  position: fixed;
+  z-index: 9999;
 }
 
 /* Subtle glass effect */

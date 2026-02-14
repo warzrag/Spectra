@@ -3,6 +3,11 @@
   "name": "Stealth",
   "version": "1.0",
   "description": "Browser stealth",
+  "permissions": ["cookies"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
