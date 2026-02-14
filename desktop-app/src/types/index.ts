@@ -122,6 +122,7 @@ export interface Extension {
   localPath?: string;
   storageUrl?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface AppSettings {

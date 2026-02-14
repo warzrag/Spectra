@@ -11,6 +11,7 @@ export interface InstalledExtension {
   version: string;
   description: string;
   localPath: string;
+  updatedAt?: string;
 }
 
 function ensureExtensionsDir(): void {
@@ -207,12 +208,17 @@ export function updateExtension(extensionId: string, filePath: string): Installe
       fs.rmSync(backupDir, { recursive: true, force: true });
     }
 
+    // Save updatedAt for sync
+    const updatedAt = new Date().toISOString();
+    fs.writeFileSync(path.join(extDir, '.sync_meta'), updatedAt);
+
     return {
       id: extensionId,
       name: manifest.name,
       version: manifest.version,
       description: manifest.description,
       localPath: extDir,
+      updatedAt,
     };
   } catch (error: any) {
     // Restore backup on failure
@@ -243,12 +249,18 @@ export function getInstalledExtensions(): InstalledExtension[] {
 
     const manifest = readManifest(extDir);
     if (manifest) {
+      let updatedAt: string | undefined;
+      const metaPath = path.join(extDir, '.sync_meta');
+      if (fs.existsSync(metaPath)) {
+        try { updatedAt = fs.readFileSync(metaPath, 'utf8').trim(); } catch {}
+      }
       extensions.push({
         id: entry,
         name: manifest.name,
         version: manifest.version,
         description: manifest.description,
         localPath: extDir,
+        updatedAt,
       });
     }
   }
@@ -286,12 +298,16 @@ export function readZipFile(zipPath: string): Buffer {
   return fs.readFileSync(zipPath);
 }
 
-export function downloadAndInstallExtension(extensionId: string, url: string): Promise<void> {
+export function downloadAndInstallExtension(extensionId: string, url: string, updatedAt?: string): Promise<void> {
   ensureExtensionsDir();
   const extDir = path.join(EXTENSIONS_DIR, extensionId);
 
   // Already installed
   if (fs.existsSync(extDir) && fs.existsSync(path.join(extDir, 'manifest.json'))) {
+    // Save sync metadata if provided
+    if (updatedAt) {
+      fs.writeFileSync(path.join(extDir, '.sync_meta'), updatedAt);
+    }
     return Promise.resolve();
   }
 
@@ -340,6 +356,11 @@ export function downloadAndInstallExtension(extensionId: string, url: string): P
               fs.rmSync(extDir, { recursive: true, force: true });
               reject(new Error('Downloaded extension has no manifest.json'));
               return;
+            }
+
+            // Save sync metadata
+            if (updatedAt) {
+              fs.writeFileSync(path.join(extDir, '.sync_meta'), updatedAt);
             }
 
             resolve();

@@ -123,7 +123,7 @@ declare global {
         getPaths: (extensionIds: string[]) => Promise<string[]>;
         zip: (extensionId: string) => Promise<string>;
         readZip: (zipPath: string) => Promise<Buffer>;
-        downloadAndInstall: (extensionId: string, url: string) => Promise<boolean>;
+        downloadAndInstall: (extensionId: string, url: string, updatedAt?: string) => Promise<boolean>;
       };
       profileSync?: {
         zipForSync: (profileId: string) => Promise<{ buffer: Uint8Array; size: number }>;
@@ -646,7 +646,7 @@ function App() {
         const missing = enabledExts.filter(e => !localIds.has(e.id) && e.storageUrl);
         for (const ext of missing) {
           try {
-            await window.electronAPI.extensions.downloadAndInstall(ext.id, ext.storageUrl!);
+            await window.electronAPI.extensions.downloadAndInstall(ext.id, ext.storageUrl!, (ext as any).updatedAt);
           } catch (e) {
             console.error(`Failed to download extension ${ext.name}:`, e);
           }

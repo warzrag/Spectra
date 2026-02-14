@@ -51,14 +51,17 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         if (!local) {
           // Missing locally → download
           try {
-            await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl);
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl, ext.updatedAt);
             localIds.add(ext.id);
             console.log(`[ExtSync] Downloaded missing extension: ${ext.name}`);
           } catch (e) {
             console.error(`Failed to download extension ${ext.name}:`, e);
           }
-        } else if (ext.version && local.version && ext.version !== local.version) {
-          // Version mismatch → remove old and re-download (with rollback on failure)
+        } else if (ext.storageUrl && (
+          (ext.version && local.version && ext.version !== local.version) ||
+          (ext.updatedAt && ext.updatedAt !== local.updatedAt)
+        )) {
+          // Version or timestamp mismatch → remove old and re-download
           try {
             console.log(`[ExtSync] Updating ${ext.name}: ${local.version} → ${ext.version}`);
             // Rename old version instead of deleting (so we can rollback)
@@ -70,7 +73,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
             } catch {}
             await window.electronAPI.extensions!.remove(ext.id);
             try {
-              await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl);
+              await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl, ext.updatedAt);
               console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
             } catch (dlError) {
               console.error(`[ExtSync] Download failed for ${ext.name}, keeping old version:`, dlError);
@@ -235,7 +238,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         console.error('Failed to upload updated extension to cloud:', e);
       }
 
-      // Update Firestore with new version info
+      // Update Firestore with new version info + updatedAt timestamp
       await registerExtension({
         id: ext.id,
         name: updated.name,
@@ -245,6 +248,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         localPath: updated.localPath,
         storageUrl,
         createdAt: ext.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       }, teamId);
 
       showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
@@ -292,6 +296,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         localPath: updated.localPath,
         storageUrl,
         createdAt: ext.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       }, teamId);
 
       showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
