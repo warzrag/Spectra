@@ -138,7 +138,7 @@ export class PuppeteerLauncher {
         '--disable-background-timer-throttling',
         '--window-size=1280,800',
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
-        '--disable-features=UserAgentClientHint',
+        '--disable-features=UserAgentClientHint,CalculateNativeWinOcclusion',
       ];
 
       // Force User-Agent to match fingerprint (consistent across Mac/Windows)
