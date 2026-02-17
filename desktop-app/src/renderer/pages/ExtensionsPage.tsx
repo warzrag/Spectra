@@ -48,10 +48,22 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
 
         const local = localById.get(ext.id);
 
+        // Helper: get a fresh download URL (stored URLs may have expired tokens)
+        const getFreshUrl = async (): Promise<string> => {
+          try {
+            const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+            return await getDownloadURL(storageRef);
+          } catch {
+            // Fallback to stored URL
+            return ext.storageUrl!;
+          }
+        };
+
         if (!local) {
           // Missing locally → download
           try {
-            await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl, ext.updatedAt);
+            const url = await getFreshUrl();
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt);
             localIds.add(ext.id);
             console.log(`[ExtSync] Downloaded missing extension: ${ext.name}`);
           } catch (e) {
@@ -73,7 +85,8 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
             } catch {}
             await window.electronAPI.extensions!.remove(ext.id);
             try {
-              await window.electronAPI.extensions!.downloadAndInstall(ext.id, ext.storageUrl, ext.updatedAt);
+              const url = await getFreshUrl();
+              await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt);
               console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
             } catch (dlError) {
               console.error(`[ExtSync] Download failed for ${ext.name}, keeping old version:`, dlError);
