@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import AdmZip from 'adm-zip';
 
 const EXTENSIONS_DIR = path.join(os.homedir(), '.antidetect-browser', 'extensions');
@@ -17,6 +18,32 @@ export interface InstalledExtension {
 function ensureExtensionsDir(): void {
   if (!fs.existsSync(EXTENSIONS_DIR)) {
     fs.mkdirSync(EXTENSIONS_DIR, { recursive: true });
+  }
+}
+
+/**
+ * Inject a deterministic `key` into manifest.json so Chrome generates the same
+ * extension ID regardless of the absolute path on disk.
+ * Without this, PC and VPS get different IDs → chrome.storage data doesn't match.
+ */
+function injectDeterministicKey(extDir: string, extensionId: string): void {
+  const manifestPath = path.join(extDir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) return;
+
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (manifest.key) return; // Already has a key (e.g. from Chrome Web Store)
+
+    // Generate a deterministic 128-byte "public key" from the Firestore extension ID
+    // Chrome hashes this to compute the extension ID (first 32 chars of hex SHA-256, a-p encoded)
+    const hash = crypto.createHash('sha256').update(`spectra-ext-${extensionId}`).digest();
+    const keyBytes = Buffer.concat([hash, hash, hash, hash]); // 128 bytes
+    manifest.key = keyBytes.toString('base64');
+
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    console.log(`[Extensions] Injected deterministic key for ${extensionId}`);
+  } catch (e) {
+    console.warn(`[Extensions] Failed to inject key for ${extensionId}:`, e);
   }
 }
 
@@ -66,6 +93,8 @@ export function installExtension(filePath: string): InstalledExtension {
         fs.rmSync(extDir, { recursive: true, force: true });
         throw new Error('Invalid extension: no manifest.json found in folder');
       }
+
+      injectDeterministicKey(extDir, extId);
 
       return {
         id: extId,
@@ -120,6 +149,8 @@ export function installExtension(filePath: string): InstalledExtension {
       fs.rmSync(extDir, { recursive: true, force: true });
       throw new Error('Invalid extension: no manifest.json found');
     }
+
+    injectDeterministicKey(extDir, extId);
 
     return {
       id: extId,
@@ -203,6 +234,8 @@ export function updateExtension(extensionId: string, filePath: string): Installe
       throw new Error('Invalid extension: no manifest.json found');
     }
 
+    injectDeterministicKey(extDir, extensionId);
+
     // Remove backup on success
     if (fs.existsSync(backupDir)) {
       fs.rmSync(backupDir, { recursive: true, force: true });
@@ -249,6 +282,9 @@ export function getInstalledExtensions(): InstalledExtension[] {
 
     const manifest = readManifest(extDir);
     if (manifest) {
+      // Patch existing extensions that don't have a deterministic key yet
+      injectDeterministicKey(extDir, entry);
+
       let updatedAt: string | undefined;
       const metaPath = path.join(extDir, '.sync_meta');
       if (fs.existsSync(metaPath)) {
@@ -357,6 +393,8 @@ export function downloadAndInstallExtension(extensionId: string, url: string, up
               reject(new Error('Downloaded extension has no manifest.json'));
               return;
             }
+
+            injectDeterministicKey(extDir, extensionId);
 
             // Save sync metadata
             if (updatedAt) {
