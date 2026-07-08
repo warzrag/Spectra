@@ -95,12 +95,10 @@ export async function getAllUsers(teamId?: string): Promise<UserProfile[]> {
 
 // ── Profiles (Cloud Sync) ──────────────────────────────────────
 
-export function subscribeToProfiles(teamId: string, callback: (profiles: Profile[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, PROFILES_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToProfiles(teamId: string | null | undefined, callback: (profiles: Profile[]) => void): Unsubscribe {
+  const q = teamId
+    ? query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+    : query(collection(db, PROFILES_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const profiles: Profile[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -112,12 +110,10 @@ export function subscribeToProfiles(teamId: string, callback: (profiles: Profile
   });
 }
 
-export function subscribeToFolders(teamId: string, callback: (folders: Folder[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, FOLDERS_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToFolders(teamId: string | null | undefined, callback: (folders: Folder[]) => void): Unsubscribe {
+  const q = teamId
+    ? query(collection(db, FOLDERS_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+    : query(collection(db, FOLDERS_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const folders: Folder[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -284,12 +280,10 @@ export async function migrateLocalProfiles(localProfiles: Profile[], localFolder
 
 // ── Extensions (Cloud Sync) ────────────────────────────────────
 
-export function subscribeToExtensions(teamId: string, callback: (extensions: Extension[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, EXTENSIONS_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToExtensions(teamId: string | null | undefined, callback: (extensions: Extension[]) => void): Unsubscribe {
+  const q = teamId
+    ? query(collection(db, EXTENSIONS_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+    : query(collection(db, EXTENSIONS_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const extensions: Extension[] = snapshot.docs.map(d => ({
       id: d.id,

@@ -15,7 +15,7 @@ async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string
   if (userDoc.exists()) {
     const data = userDoc.data();
     const role: UserRole = ADMIN_UIDS.includes(user.uid)
-      ? 'owner'
+      ? 'super_admin'
       : (data.role as UserRole) || 'va';
     const teamId = data.teamId;
 
@@ -35,7 +35,7 @@ async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string
 
   // First login ever → create team + user document
   const isAdmin = ADMIN_UIDS.includes(user.uid);
-  const role: UserRole = isAdmin ? 'owner' : 'owner'; // New users are always owner of their own team
+  const role: UserRole = isAdmin ? 'super_admin' : 'owner'; // New users are owners; platform admins are global.
 
   const teamRef = await addDoc(collection(db, 'teams'), {
     name: user.email || 'My Team',

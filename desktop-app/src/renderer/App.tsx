@@ -312,17 +312,19 @@ function App() {
     };
     migrateTeam();
 
-    // Subscribe to Firestore collections (real-time, scoped by teamId)
-    const unsubProfiles = subscribeToProfiles(user.teamId, (allProfiles) => {
+    const scopeTeamId = user.role === 'super_admin' ? null : user.teamId;
+
+    // Subscribe to Firestore collections (super admin = global, others = scoped by teamId)
+    const unsubProfiles = subscribeToProfiles(scopeTeamId, (allProfiles) => {
       setProfiles(allProfiles);
       setLoading(false);
     });
 
-    const unsubFolders = subscribeToFolders(user.teamId, (allFolders) => {
+    const unsubFolders = subscribeToFolders(scopeTeamId, (allFolders) => {
       setFolders(allFolders);
     });
 
-    const unsubExtensions = subscribeToExtensions(user.teamId, (allExtensions) => {
+    const unsubExtensions = subscribeToExtensions(scopeTeamId, (allExtensions) => {
       setExtensions(allExtensions);
     });
 
@@ -831,6 +833,8 @@ function App() {
   }, {} as { [folderId: string]: number });
 
   const renderPage = () => {
+    const hasAdminAccess = user?.role === 'super_admin' || user?.role === 'admin' || user?.role === 'owner';
+
     switch (activePage) {
       case 'profiles':
         return (
@@ -857,17 +861,17 @@ function App() {
       case 'proxies':
         return <ProxyManagerPage profiles={visibleProfiles} folders={visibleFolders} onUpdateProfile={handleUpdateProfile} userId={user?.uid} teamId={user?.teamId} />;
       case 'extensions':
-        return (user?.role === 'admin' || user?.role === 'owner') ? <ExtensionsPage teamId={user?.teamId || ''} /> : null;
+        return hasAdminAccess ? <ExtensionsPage teamId={user?.role === 'super_admin' ? '' : user?.teamId || ''} /> : null;
       case 'diagnostics':
-        return (user?.role === 'admin' || user?.role === 'owner') ? (
+        return hasAdminAccess ? (
           <DiagnosticsPage user={user} profiles={visibleProfiles} activeProfiles={activeProfiles} />
         ) : null;
       case 'settings':
         return <SettingsPage settings={settings} onSettingsChange={handleSettingsChange} user={user} onLogout={handleLogout} />;
       case 'activity':
-        return (user?.role === 'admin' || user?.role === 'owner') ? <ActivityLogPage teamId={user?.teamId || ''} /> : null;
+        return hasAdminAccess ? <ActivityLogPage teamId={user?.role === 'super_admin' ? '' : user?.teamId || ''} /> : null;
       case 'recycle-bin':
-        return (user?.role === 'admin' || user?.role === 'owner') ? (
+        return hasAdminAccess ? (
           <RecycleBinPage
             deletedProfiles={deletedProfiles}
             onRestore={handleRestoreProfile}
@@ -876,11 +880,11 @@ function App() {
           />
         ) : null;
       case 'billing':
-        return (user?.role === 'admin' || user?.role === 'owner') ? <BillingPage /> : null;
+        return hasAdminAccess ? <BillingPage /> : null;
       case 'members':
-        return (user?.role === 'admin' || user?.role === 'owner') ? <MembersPage teamId={user?.teamId || ''} folders={folders} /> : null;
+        return hasAdminAccess ? <MembersPage teamId={user?.teamId || ''} folders={folders} /> : null;
       case 'admin-panel':
-        return user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53' ? <AdminPage /> : null;
+        return user?.role === 'super_admin' || user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53' ? <AdminPage /> : null;
       default:
         return null;
     }

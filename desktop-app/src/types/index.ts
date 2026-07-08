@@ -1,6 +1,6 @@
 export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'diagnostics' | 'activity' | 'recycle-bin' | 'billing' | 'members' | 'admin-panel';
 
-export type UserRole = 'owner' | 'admin' | 'va';
+export type UserRole = 'super_admin' | 'owner' | 'admin' | 'va';
 
 export interface Team {
   id: string;
