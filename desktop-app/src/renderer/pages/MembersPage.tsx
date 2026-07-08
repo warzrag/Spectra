@@ -1,16 +1,17 @@
 import React, { useState, useEffect } from 'react';
-import { UsersRound, UserPlus, Shield, Eye, MoreVertical, Mail, Calendar, Trash2, Crown, Ticket, Copy, Check, Plus, Loader2 } from 'lucide-react';
+import { UsersRound, UserPlus, Shield, Eye, MoreVertical, Mail, Calendar, Trash2, Crown, Ticket, Copy, Check, Plus, Loader2, FolderOpen } from 'lucide-react';
 import { collection, getDocs, query, where, doc, updateDoc, deleteDoc, setDoc, onSnapshot } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import InviteMemberModal from '../components/InviteMemberModal';
-import { UserRole } from '../../types';
+import { Folder, UserRole } from '../../types';
 
 interface Member {
   uid: string;
   email: string;
   role: UserRole;
+  assignedFolderId?: string | null;
   displayName?: string;
   createdAt?: string;
 }
@@ -28,9 +29,10 @@ interface InviteCode {
 
 interface MembersPageProps {
   teamId: string;
+  folders: Folder[];
 }
 
-const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
+const MembersPage: React.FC<MembersPageProps> = ({ teamId, folders }) => {
   const { user } = useAuth();
   const { showToast } = useToast();
   const [members, setMembers] = useState<Member[]>([]);
@@ -77,6 +79,10 @@ const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
   };
 
   const currentUserRole = members.find(m => m.uid === user?.uid)?.role;
+  const getFolderName = (folderId?: string | null) => {
+    if (!folderId) return 'No folder';
+    return folders.find(f => f.id === folderId)?.name || 'Unknown folder';
+  };
 
   const handleRoleChange = async (memberId: string, newRole: UserRole) => {
     const target = members.find(m => m.uid === memberId);
@@ -89,13 +95,34 @@ const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
       return;
     }
     try {
-      await updateDoc(doc(db, 'users', memberId), { role: newRole });
-      setMembers(prev => prev.map(m => m.uid === memberId ? { ...m, role: newRole } : m));
+      const updateData = {
+        role: newRole,
+        assignedFolderId: newRole === 'va' ? (target?.assignedFolderId || null) : null,
+      };
+      await updateDoc(doc(db, 'users', memberId), updateData);
+      setMembers(prev => prev.map(m => m.uid === memberId ? { ...m, ...updateData } : m));
       setMenuOpenId(null);
       showToast(`${target?.email || 'Member'} is now ${newRole === 'admin' ? 'Admin' : 'VA'}`, 'success');
     } catch (e) {
       console.error('Error updating role:', e);
       showToast('Failed to update role', 'error');
+    }
+  };
+
+  const handleFolderChange = async (memberId: string, folderId: string) => {
+    const target = members.find(m => m.uid === memberId);
+    if (target?.role !== 'va') return;
+    if (currentUserRole !== 'owner' && currentUserRole !== 'admin') {
+      showToast('Only Owner and Admins can change folder access', 'error');
+      return;
+    }
+    try {
+      await updateDoc(doc(db, 'users', memberId), { assignedFolderId: folderId || null });
+      setMembers(prev => prev.map(m => m.uid === memberId ? { ...m, assignedFolderId: folderId || null } : m));
+      showToast(`${target.email} folder access updated`, 'success');
+    } catch (e) {
+      console.error('Error updating folder access:', e);
+      showToast('Failed to update folder access', 'error');
     }
   };
 
@@ -224,9 +251,10 @@ const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
         <section>
           <div className="rounded-xl" style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)', overflow: 'visible' }}>
             {/* Table Header */}
-            <div className="grid grid-cols-[1fr_120px_120px_60px] min-w-[480px] px-5 py-3 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
+            <div className="grid grid-cols-[1fr_120px_170px_120px_60px] min-w-[650px] px-5 py-3 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
               <span>Member</span>
               <span>Role</span>
+              <span>Folder Access</span>
               <span>Joined</span>
               <span></span>
             </div>
@@ -240,7 +268,7 @@ const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
             {!loading && members.map((member) => (
               <div
                 key={member.uid}
-                className="grid grid-cols-[1fr_120px_120px_60px] min-w-[480px] px-5 py-3 items-center transition-colors"
+                className="grid grid-cols-[1fr_120px_170px_120px_60px] min-w-[650px] px-5 py-3 items-center transition-colors"
                 style={{ borderBottom: '1px solid var(--border-subtle)' }}
                 onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
                 onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
@@ -275,6 +303,28 @@ const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
                     }}>
                     {member.role === 'owner' ? 'Owner' : member.role === 'admin' ? 'Admin' : 'VA'}
                   </span>
+                </div>
+
+                {/* Folder access */}
+                <div>
+                  {member.role === 'va' ? (
+                    <select
+                      value={member.assignedFolderId || ''}
+                      onChange={e => handleFolderChange(member.uid, e.target.value)}
+                      className="w-full px-2 py-1.5 rounded-lg text-[12px]"
+                      style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
+                    >
+                      <option value="">No folder</option>
+                      {folders.map(folder => (
+                        <option key={folder.id} value={folder.id}>{folder.name}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <div className="text-[12px] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
+                      <FolderOpen size={12} />
+                      Full access
+                    </div>
+                  )}
                 </div>
 
                 {/* Date */}
@@ -462,6 +512,7 @@ const MembersPage: React.FC<MembersPageProps> = ({ teamId }) => {
           onClose={() => setShowInviteModal(false)}
           onMemberAdded={loadMembers}
           teamId={teamId}
+          folders={folders}
         />
       )}
     </div>

@@ -50,10 +50,15 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedProfiles, setSelectedProfiles] = useState<string[]>([]);
   const [showMoveModal, setShowMoveModal] = useState(false);
+  const [moveProfileIds, setMoveProfileIds] = useState<string[]>([]);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
-  const [sortBy, setSortBy] = useState<'name' | 'created' | 'lastUsed' | 'custom'>(settings.sortBy as any || 'custom');
-  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(settings.sortOrder || 'asc');
+  const [sortBy, setSortBy] = useState<'name' | 'created' | 'lastUsed' | 'custom'>(() => {
+    return (localStorage.getItem('spectra-dashboard-sort-by') as any) || settings.sortBy || 'custom';
+  });
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>(() => {
+    return (localStorage.getItem('spectra-dashboard-sort-order') as any) || settings.sortOrder || 'asc';
+  });
   const [filterTag, setFilterTag] = useState<string | null>(null);
   const [assignProfileId, setAssignProfileId] = useState<string | null>(null);
   const [bulkAssignMode, setBulkAssignMode] = useState(false);
@@ -88,6 +93,11 @@ const Dashboard: React.FC<DashboardProps> = ({
     }
   }, [openMenuId, statusMenuId]);
 
+  useEffect(() => {
+    localStorage.setItem('spectra-dashboard-sort-by', sortBy);
+    localStorage.setItem('spectra-dashboard-sort-order', sortOrder);
+  }, [sortBy, sortOrder]);
+
   // Reset selection when navigating between folders
   useEffect(() => {
     setSelectedProfiles([]);
@@ -97,7 +107,9 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   // Drag & drop reorder handler
   const handleDrop = (targetId: string) => {
-    if (!dragId || dragId === targetId || sortBy !== 'custom') return;
+    if (!isAdmin || !dragId || dragId === targetId) return;
+    setSortBy('custom');
+    setSortOrder('asc');
 
     // Build current visual order
     const currentList = localOrder
@@ -166,12 +178,14 @@ const Dashboard: React.FC<DashboardProps> = ({
     });
 
   const handleSelectProfile = (profileId: string) => {
+    if (!isAdmin) return;
     setSelectedProfiles(prev =>
       prev.includes(profileId) ? prev.filter(id => id !== profileId) : [...prev, profileId]
     );
   };
 
   const handleSelectAll = () => {
+    if (!isAdmin) return;
     if (selectedProfiles.length === filteredProfiles.length) {
       setSelectedProfiles([]);
     } else {
@@ -180,10 +194,26 @@ const Dashboard: React.FC<DashboardProps> = ({
   };
 
   const handleBulkDelete = () => {
+    if (!isAdmin) return;
     if (window.confirm(`Delete ${selectedProfiles.length} instances?`)) {
       selectedProfiles.forEach(id => onDeleteProfile(id));
       setSelectedProfiles([]);
     }
+  };
+
+  const openMoveModal = (profileIds: string[]) => {
+    if (!isAdmin) return;
+    setMoveProfileIds(profileIds);
+    setShowMoveModal(true);
+  };
+
+  const handleMoveProfiles = (folderId: string | null) => {
+    if (!isAdmin) return;
+    moveProfileIds.forEach(id => onMoveProfile(id, folderId));
+    showToast(`${moveProfileIds.length} instance${moveProfileIds.length > 1 ? 's' : ''} moved`, 'success');
+    setSelectedProfiles([]);
+    setMoveProfileIds([]);
+    setShowMoveModal(false);
   };
 
   const toggleSort = (col: 'name' | 'created' | 'lastUsed') => {
@@ -192,6 +222,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   };
 
   const handleImportCookies = async (profile: Profile) => {
+    if (!isAdmin) return;
     setOpenMenuId(null);
     if (!window.electronAPI?.cookies) return;
 
@@ -221,6 +252,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   };
 
   const handleExportCookies = async (profile: Profile) => {
+    if (!isAdmin) return;
     setOpenMenuId(null);
     if (!window.electronAPI?.cookies) return;
 
@@ -247,11 +279,13 @@ const Dashboard: React.FC<DashboardProps> = ({
   };
 
   const handleAssign = (profileId: string, userId: string | null, userEmail: string | null) => {
+    if (!isAdmin) return;
     onUpdateProfile(profileId, { assignedTo: userId, assignedToEmail: userEmail });
     setAssignProfileId(null);
   };
 
   const handleBulkAssign = (userId: string | null, userEmail: string | null) => {
+    if (!isAdmin) return;
     selectedProfiles.forEach(id => {
       onUpdateProfile(id, { assignedTo: userId, assignedToEmail: userEmail });
     });
@@ -261,6 +295,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   };
 
   const handleBulkStatusChange = (newStatus: ProfileStatus | undefined) => {
+    if (!isAdmin) return;
     selectedProfiles.forEach(id => {
       onUpdateProfile(id, { status: newStatus });
     });
@@ -556,7 +591,7 @@ const Dashboard: React.FC<DashboardProps> = ({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
-          {selectedProfiles.length > 0 && (
+          {isAdmin && selectedProfiles.length > 0 && (
             <>
               <button
                 onClick={() => onBulkLaunch(selectedProfiles)}
@@ -577,7 +612,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                 )}
               </button>
               <button
-                onClick={() => setShowMoveModal(true)}
+                onClick={() => openMoveModal(selectedProfiles)}
                 className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
                 style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)' }}
               >
@@ -746,14 +781,16 @@ const Dashboard: React.FC<DashboardProps> = ({
           <table className="profile-table w-full">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                <th className="w-10 px-3 py-2.5 text-left">
-                  <input
-                    type="checkbox"
-                    checked={selectedProfiles.length === filteredProfiles.length && filteredProfiles.length > 0}
-                    onChange={handleSelectAll}
-                    className="rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 w-3.5 h-3.5"
-                  />
-                </th>
+                {isAdmin && (
+                  <th className="w-10 px-3 py-2.5 text-left">
+                    <input
+                      type="checkbox"
+                      checked={selectedProfiles.length === filteredProfiles.length && filteredProfiles.length > 0}
+                      onChange={handleSelectAll}
+                      className="rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 w-3.5 h-3.5"
+                    />
+                  </th>
+                )}
                 <th className="px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-wider cursor-pointer select-none" style={{ color: 'var(--text-muted)' }} onClick={() => toggleSort('name')}>
                   <span className="flex items-center">Instance <SortIcon col="name" /></span>
                 </th>
@@ -802,32 +839,38 @@ const Dashboard: React.FC<DashboardProps> = ({
                     }}
                     onMouseEnter={e => { if (!isSelected && !dragId) e.currentTarget.style.background = 'var(--bg-elevated)'; }}
                     onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = 'transparent'; }}
-                    draggable
+                    draggable={isAdmin}
                     onDragStart={(e) => {
+                      if (!isAdmin) return;
                       e.dataTransfer.setData('profileId', profile.id);
                       e.dataTransfer.effectAllowed = 'move';
                       setDragId(profile.id);
                       setSortBy('custom');
+                      setSortOrder('asc');
                     }}
-                    onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverId(profile.id); }}
-                    onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverId(null); }}
-                    onDrop={(e) => { e.preventDefault(); handleDrop(profile.id); }}
+                    onDragOver={(e) => { if (!isAdmin) return; e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDragOverId(profile.id); }}
+                    onDragLeave={(e) => { if (!isAdmin) return; if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOverId(null); }}
+                    onDrop={(e) => { if (!isAdmin) return; e.preventDefault(); handleDrop(profile.id); }}
                     onDragEnd={() => { setDragId(null); setDragOverId(null); }}
                   >
-                    <td className="px-3 py-2.5">
-                      <input
-                        type="checkbox"
-                        checked={isSelected}
-                        onChange={() => handleSelectProfile(profile.id)}
-                        className="rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 w-3.5 h-3.5"
-                      />
-                    </td>
+                    {isAdmin && (
+                      <td className="px-3 py-2.5">
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => handleSelectProfile(profile.id)}
+                          className="rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 focus:ring-offset-0 w-3.5 h-3.5"
+                        />
+                      </td>
+                    )}
 
                     <td className="px-3 py-2.5">
                       <div className="flex items-center gap-2.5 min-w-0">
-                        <div className="cursor-grab active:cursor-grabbing shrink-0 opacity-0 group-hover:opacity-40 hover:!opacity-70 transition-opacity" style={{ color: 'var(--text-muted)', marginRight: -4 }}>
-                          <GripVertical size={14} />
-                        </div>
+                        {isAdmin && (
+                          <div className="cursor-grab active:cursor-grabbing shrink-0 opacity-0 group-hover:opacity-40 hover:!opacity-70 transition-opacity" style={{ color: 'var(--text-muted)', marginRight: -4 }}>
+                            <GripVertical size={14} />
+                          </div>
+                        )}
                         <div
                           className="w-8 h-8 rounded-lg flex items-center justify-center text-[13px] font-bold shrink-0"
                           style={{ background: isActive ? 'var(--success-subtle)' : 'var(--bg-overlay)', color: isActive ? 'var(--success)' : 'var(--text-muted)' }}
@@ -873,15 +916,18 @@ const Dashboard: React.FC<DashboardProps> = ({
                         return (
                           <div className="relative">
                             <button
-                              onClick={(e) => { e.stopPropagation(); setStatusMenuId(statusMenuId === `table-${profile.id}` ? null : `table-${profile.id}`); }}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium cursor-pointer transition-all hover:opacity-80"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (isAdmin) setStatusMenuId(statusMenuId === `table-${profile.id}` ? null : `table-${profile.id}`);
+                              }}
+                              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium transition-all ${isAdmin ? 'cursor-pointer hover:opacity-80' : 'cursor-default'}`}
                               style={{ background: s ? s.bg : 'var(--bg-elevated)', color: s ? s.color : 'var(--text-muted)', border: `1px solid ${s ? s.color + '33' : 'var(--border-default)'}` }}
                             >
                               <span className="w-1.5 h-1.5 rounded-full" style={{ background: s ? s.color : 'var(--text-muted)' }} />
                               {s ? s.label : 'No Status'}
-                              <ChevronDown size={10} style={{ opacity: 0.6 }} />
+                              {isAdmin && <ChevronDown size={10} style={{ opacity: 0.6 }} />}
                             </button>
-                            {statusMenuId === `table-${profile.id}` && (
+                            {isAdmin && statusMenuId === `table-${profile.id}` && (
                               <div
                                 className="absolute top-full left-0 mt-1 rounded-lg shadow-xl py-1 min-w-[150px]"
                                 style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)', zIndex: 9999 }}
@@ -988,6 +1034,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                           )}
                         </button>
 
+                        {isAdmin && (
                         <div className="relative">
                           <button
                             onClick={(e) => { e.stopPropagation(); setOpenMenuId(openMenuId === profile.id ? null : profile.id); }}
@@ -1038,6 +1085,21 @@ const Dashboard: React.FC<DashboardProps> = ({
                                   onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
                                 >
                                   <UserPlus size={13} /> Assign
+                                </button>
+                              )}
+
+                              {isAdmin && (
+                                <button
+                                  onClick={() => {
+                                    openMoveModal([profile.id]);
+                                    setOpenMenuId(null);
+                                  }}
+                                  className="w-full px-3 py-1.5 text-[13px] text-left flex items-center gap-2 transition-colors"
+                                  style={{ color: 'var(--text-secondary)' }}
+                                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-elevated)'; }}
+                                  onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
+                                >
+                                  <MoveRight size={13} /> Move
                                 </button>
                               )}
 
@@ -1133,6 +1195,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                             </div>
                           )}
                         </div>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -1149,8 +1212,8 @@ const Dashboard: React.FC<DashboardProps> = ({
           isOpen={showMoveModal}
           onClose={() => setShowMoveModal(false)}
           folders={folders}
-          selectedCount={selectedProfiles.length}
-          onMove={(folderId) => { selectedProfiles.forEach(id => onMoveProfile(id, folderId)); setSelectedProfiles([]); setShowMoveModal(false); }}
+          selectedCount={moveProfileIds.length}
+          onMove={handleMoveProfiles}
         />
       )}
 

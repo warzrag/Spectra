@@ -8,7 +8,7 @@ const ADMIN_UIDS = [
   'EsZbVc0qtNYwTsUmXm9drmF5hu53',
 ];
 
-async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string }> {
+async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string; assignedFolderId: string | null }> {
   const userRef = doc(db, 'users', user.uid);
   const userDoc = await getDoc(userRef);
 
@@ -27,10 +27,10 @@ async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string
         createdAt: new Date().toISOString(),
       });
       await setDoc(userRef, { ...data, teamId: teamRef.id, role }, { merge: true });
-      return { role, teamId: teamRef.id };
+      return { role, teamId: teamRef.id, assignedFolderId: data.assignedFolderId || null };
     }
 
-    return { role, teamId };
+    return { role, teamId, assignedFolderId: data.assignedFolderId || null };
   }
 
   // First login ever → create team + user document
@@ -51,18 +51,19 @@ async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string
     createdAt: new Date().toISOString(),
   });
 
-  return { role, teamId: teamRef.id };
+  return { role, teamId: teamRef.id, assignedFolderId: null };
 }
 
 export async function loginWithEmail(email: string, password: string): Promise<AppUser> {
   const credential = await signInWithEmailAndPassword(auth, email, password);
-  const { role, teamId } = await resolveUser(credential.user);
+  const { role, teamId, assignedFolderId } = await resolveUser(credential.user);
   return {
     uid: credential.user.uid,
     email: credential.user.email || email,
     displayName: credential.user.displayName,
     role,
     teamId,
+    assignedFolderId,
   };
 }
 
@@ -125,6 +126,7 @@ export async function registerWithInviteCode(email: string, password: string, in
       displayName: user.displayName,
       role,
       teamId,
+      assignedFolderId: null,
     };
   } catch (error) {
     await signOut(auth).catch(() => {});
@@ -139,13 +141,14 @@ export async function logout(): Promise<void> {
 export function onAuthStateChanged(callback: (user: AppUser | null) => void): () => void {
   return firebaseOnAuthStateChanged(auth, async (firebaseUser) => {
     if (firebaseUser) {
-      const { role, teamId } = await resolveUser(firebaseUser);
+      const { role, teamId, assignedFolderId } = await resolveUser(firebaseUser);
       callback({
         uid: firebaseUser.uid,
         email: firebaseUser.email || '',
         displayName: firebaseUser.displayName,
         role,
         teamId,
+        assignedFolderId,
       });
     } else {
       callback(null);

@@ -63,6 +63,17 @@ export class UrlTrackingServer {
       }
     });
 
+    this.server.on('error', (error: NodeJS.ErrnoException) => {
+      if (error.code === 'EADDRINUSE') {
+        console.warn(`URL tracking server already running on port ${this.port}`);
+        this.server = null;
+        return;
+      }
+
+      console.error('URL tracking server failed:', error);
+      this.server = null;
+    });
+
     this.server.listen(this.port, () => {
       console.log(`URL tracking server listening on port ${this.port}`);
     });

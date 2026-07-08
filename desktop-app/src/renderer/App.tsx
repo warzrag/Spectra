@@ -3,6 +3,7 @@ import Dashboard from './pages/Dashboard';
 import ProxyManagerPage from './pages/ProxyManager';
 import SettingsPage from './pages/SettingsPage';
 import ExtensionsPage from './pages/ExtensionsPage';
+import DiagnosticsPage from './pages/DiagnosticsPage';
 import ActivityLogPage from './pages/ActivityLogPage';
 import RecycleBinPage from './pages/RecycleBinPage';
 import BillingPage from './pages/BillingPage';
@@ -155,8 +156,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   language: 'en-US',
   defaultOS: 'windows',
   defaultBrowser: 'chrome',
-  sortBy: 'created',
-  sortOrder: 'desc',
+  sortBy: 'custom',
+  sortOrder: 'asc',
 };
 
 function App() {
@@ -169,6 +170,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [activePage, setActivePage] = useState<AppPage>('profiles');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
 
   // Lifted states from Dashboard
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
@@ -227,6 +229,14 @@ function App() {
     if (c3) cleanups.push(c3);
 
     return () => { cleanups.forEach(c => c()); };
+  }, []);
+
+  useEffect(() => {
+    window.electronAPI.profiles.getActive().then(setActiveProfiles).catch(() => {});
+    const cleanup = window.electronAPI.profiles.onActiveUpdate((nextActiveProfiles) => {
+      setActiveProfiles(nextActiveProfiles);
+    });
+    return () => cleanup();
   }, []);
 
   // Auth state listener
@@ -758,11 +768,36 @@ function App() {
   };
 
   // Filter profiles: exclude deleted, and for VA only show assigned
+  const vaAssignedFolderIds = (() => {
+    if (user?.role !== 'va' || !user.assignedFolderId) return new Set<string>();
+    const allowed = new Set<string>([user.assignedFolderId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const folder of folders) {
+        if (folder.parentId && allowed.has(folder.parentId) && !allowed.has(folder.id)) {
+          allowed.add(folder.id);
+          changed = true;
+        }
+      }
+    }
+    return allowed;
+  })();
+
   const visibleProfiles = profiles.filter(p => {
     if (p.deleted) return false;
-    if (user?.role === 'va' && p.assignedTo !== user.uid) return false;
+    if (user?.role === 'va') {
+      if (user.assignedFolderId) {
+        return Boolean(p.folderId && vaAssignedFolderIds.has(p.folderId));
+      }
+      if (p.assignedTo !== user.uid) return false;
+    }
     return true;
   });
+
+  const visibleFolders = user?.role === 'va' && user.assignedFolderId
+    ? folders.filter(folder => vaAssignedFolderIds.has(folder.id))
+    : folders;
 
   const deletedProfiles = profiles.filter(p => p.deleted);
 
@@ -770,7 +805,7 @@ function App() {
     if (profile.folderId) {
       acc[profile.folderId] = (acc[profile.folderId] || 0) + 1;
       // Also count towards parent folder
-      const folder = folders.find(f => f.id === profile.folderId);
+      const folder = visibleFolders.find(f => f.id === profile.folderId);
       if (folder?.parentId) {
         acc[folder.parentId] = (acc[folder.parentId] || 0) + 1;
       }
@@ -784,7 +819,7 @@ function App() {
         return (
           <Dashboard
             profiles={visibleProfiles}
-            folders={folders}
+            folders={visibleFolders}
             loading={loading}
             selectedFolderId={selectedFolderId}
             onSelectFolder={setSelectedFolderId}
@@ -802,9 +837,13 @@ function App() {
           />
         );
       case 'proxies':
-        return <ProxyManagerPage profiles={visibleProfiles} folders={folders} onUpdateProfile={handleUpdateProfile} userId={user?.uid} teamId={user?.teamId} />;
+        return <ProxyManagerPage profiles={visibleProfiles} folders={visibleFolders} onUpdateProfile={handleUpdateProfile} userId={user?.uid} teamId={user?.teamId} />;
       case 'extensions':
-        return <ExtensionsPage teamId={user?.teamId || ''} />;
+        return (user?.role === 'admin' || user?.role === 'owner') ? <ExtensionsPage teamId={user?.teamId || ''} /> : null;
+      case 'diagnostics':
+        return (user?.role === 'admin' || user?.role === 'owner') ? (
+          <DiagnosticsPage user={user} profiles={visibleProfiles} activeProfiles={activeProfiles} />
+        ) : null;
       case 'settings':
         return <SettingsPage settings={settings} onSettingsChange={handleSettingsChange} user={user} onLogout={handleLogout} />;
       case 'activity':
@@ -821,7 +860,7 @@ function App() {
       case 'billing':
         return (user?.role === 'admin' || user?.role === 'owner') ? <BillingPage /> : null;
       case 'members':
-        return (user?.role === 'admin' || user?.role === 'owner') ? <MembersPage teamId={user?.teamId || ''} /> : null;
+        return (user?.role === 'admin' || user?.role === 'owner') ? <MembersPage teamId={user?.teamId || ''} folders={folders} /> : null;
       case 'admin-panel':
         return user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53' ? <AdminPage /> : null;
       default:
@@ -865,7 +904,7 @@ function App() {
           <Sidebar
             activePage={activePage}
             onNavigate={setActivePage}
-            folders={folders}
+            folders={visibleFolders}
             selectedFolderId={selectedFolderId}
             profileCounts={profileCounts}
             totalProfiles={visibleProfiles.length}

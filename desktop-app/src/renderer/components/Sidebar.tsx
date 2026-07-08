@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, ArrowLeftRight, UserPlus, X, Crown } from 'lucide-react';
+import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, ArrowLeftRight, UserPlus, X, Crown, Activity } from 'lucide-react';
 import { Folder as FolderType, AppPage } from '../../types';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -102,7 +102,8 @@ const Sidebar: React.FC<SidebarProps> = ({
   const mainNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean }[] = [
     { page: 'profiles', label: 'Instances', icon: <Users size={18} /> },
     { page: 'proxies', label: 'Proxies', icon: <Globe size={18} />, adminOnly: true },
-    { page: 'extensions', label: 'Extensions', icon: <Puzzle size={18} /> },
+    { page: 'extensions', label: 'Extensions', icon: <Puzzle size={18} />, adminOnly: true },
+    { page: 'diagnostics', label: 'Diagnostics', icon: <Activity size={18} />, adminOnly: true },
     { page: 'recycle-bin', label: 'Recycle Bin', icon: <Trash2 size={18} />, adminOnly: true },
   ];
 
@@ -209,6 +210,12 @@ const Sidebar: React.FC<SidebarProps> = ({
             </span>
             <span className="text-[10px] font-medium" style={{ color: 'var(--text-muted)' }}>
               Antidetect Browser
+            </span>
+            <span
+              className="inline-flex mt-1 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+              style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}
+            >
+              Internal Build
             </span>
           </div>
         )}

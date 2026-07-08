@@ -1,4 +1,4 @@
-export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'activity' | 'recycle-bin' | 'billing' | 'members' | 'admin-panel';
+export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'diagnostics' | 'activity' | 'recycle-bin' | 'billing' | 'members' | 'admin-panel';
 
 export type UserRole = 'owner' | 'admin' | 'va';
 
@@ -15,6 +15,7 @@ export interface AppUser {
   displayName: string | null;
   role: UserRole;
   teamId: string;
+  assignedFolderId?: string | null;
 }
 
 export interface ActivityLogEntry {
@@ -34,6 +35,7 @@ export interface UserProfile {
   email: string;
   role: UserRole;
   teamId?: string;
+  assignedFolderId?: string | null;
   displayName?: string;
   createdAt: string;
 }
@@ -130,7 +132,7 @@ export interface AppSettings {
   language: string;
   defaultOS: 'windows' | 'macos' | 'linux';
   defaultBrowser: 'chrome' | 'firefox' | 'edge';
-  sortBy: 'name' | 'created' | 'lastUsed';
+  sortBy: 'name' | 'created' | 'lastUsed' | 'custom';
   sortOrder: 'asc' | 'desc';
 }
 
