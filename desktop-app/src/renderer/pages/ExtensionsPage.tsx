@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
-import { Extension } from '../../types';
+import { Extension, Team } from '../../types';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { storage } from '../services/firebase';
 import {
@@ -13,9 +13,10 @@ import {
 
 interface ExtensionsPageProps {
   teamId: string | null;
+  teams?: Team[];
 }
 
-const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
+const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) => {
   const { showToast } = useToast();
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [localInstalled, setLocalInstalled] = useState<Set<string>>(new Set());
@@ -349,6 +350,93 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
     );
   }
 
+  const isGlobalView = teamId === null;
+  const teamNameById = new Map(teams.map(team => [team.id, team.name]));
+  const teamSections = Array.from(new Set(extensions.map(ext => ext.teamId || 'unknown')))
+    .map(sectionTeamId => ({
+      teamId: sectionTeamId,
+      teamName: teamNameById.get(sectionTeamId) || (sectionTeamId === 'unknown' ? 'No team' : `Team ${sectionTeamId.slice(0, 6)}`),
+      extensions: extensions.filter(ext => (ext.teamId || 'unknown') === sectionTeamId),
+    }))
+    .filter(section => section.extensions.length > 0)
+    .sort((a, b) => a.teamName.localeCompare(b.teamName));
+
+  const renderExtensionRow = (ext: Extension) => {
+    const isLocal = localInstalled.has(ext.id);
+    return (
+      <div
+        key={ext.id}
+        className="flex items-center gap-4 p-4 rounded-xl border transition-colors"
+        style={{
+          background: 'var(--bg-elevated)',
+          borderColor: 'var(--border)',
+        }}
+      >
+        <div
+          className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
+          style={{ background: ext.enabled ? 'var(--accent-subtle)' : 'var(--bg-base)' }}
+        >
+          <Puzzle size={18} style={{ color: ext.enabled ? 'var(--accent)' : 'var(--text-muted)' }} />
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+              {ext.name}
+            </span>
+            {ext.version && (
+              <span className="text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-base)', color: 'var(--text-muted)' }}>
+                v{ext.version}
+              </span>
+            )}
+            {!isLocal && (
+              <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}>
+                <AlertCircle size={10} />
+                Not installed locally
+              </span>
+            )}
+          </div>
+          {ext.description && (
+            <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
+              {ext.description}
+            </p>
+          )}
+        </div>
+
+        <button
+          onClick={() => handleToggle(ext)}
+          className="relative w-10 h-5 rounded-full flex-shrink-0 transition-colors"
+          style={{ background: ext.enabled ? 'var(--accent)' : 'var(--bg-base)' }}
+        >
+          <div
+            className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
+            style={{ left: ext.enabled ? '22px' : '2px' }}
+          />
+        </button>
+
+        <button
+          onClick={() => handleUpdateFolder(ext)}
+          disabled={updating === ext.id}
+          className="p-2 rounded-lg transition-colors"
+          style={{ color: 'var(--text-muted)' }}
+          title="Update (folder)"
+          onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
+          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
+        >
+          {updating === ext.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+        </button>
+
+        <button
+          onClick={() => handleRemove(ext)}
+          className="p-2 rounded-lg transition-colors hover:bg-red-500/10"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+    );
+  };
+
   return (
     <div className="h-full flex flex-col p-6">
       {/* Header */}
@@ -434,82 +522,33 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
           </div>
         </div>
       ) : (
-        <div className="space-y-2 overflow-auto">
-          {extensions.map((ext) => {
-            const isLocal = localInstalled.has(ext.id);
-            return (
-              <div
-                key={ext.id}
-                className="flex items-center gap-4 p-4 rounded-xl border transition-colors"
-                style={{
-                  background: 'var(--bg-elevated)',
-                  borderColor: 'var(--border)',
-                }}
-              >
-                <div
-                  className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
-                  style={{ background: ext.enabled ? 'var(--accent-subtle)' : 'var(--bg-base)' }}
-                >
-                  <Puzzle size={18} style={{ color: ext.enabled ? 'var(--accent)' : 'var(--text-muted)' }} />
-                </div>
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[13px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
-                      {ext.name}
-                    </span>
-                    {ext.version && (
-                      <span className="text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-base)', color: 'var(--text-muted)' }}>
-                        v{ext.version}
-                      </span>
-                    )}
-                    {!isLocal && (
-                      <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}>
-                        <AlertCircle size={10} />
-                        Not installed locally
-                      </span>
-                    )}
-                  </div>
-                  {ext.description && (
-                    <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
-                      {ext.description}
+        <div className="space-y-6 overflow-auto">
+          {isGlobalView ? (
+            teamSections.map(section => (
+              <section key={section.teamId}>
+                <div className="flex items-center justify-between mb-2">
+                  <div>
+                    <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+                      {section.teamName}
+                    </h2>
+                    <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                      {section.extensions.length} extension{section.extensions.length !== 1 ? 's' : ''}
                     </p>
-                  )}
+                  </div>
+                  <span className="text-[10px] px-2 py-1 rounded-md" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
+                    {section.teamId}
+                  </span>
                 </div>
-
-                <button
-                  onClick={() => handleToggle(ext)}
-                  className="relative w-10 h-5 rounded-full flex-shrink-0 transition-colors"
-                  style={{ background: ext.enabled ? 'var(--accent)' : 'var(--bg-base)' }}
-                >
-                  <div
-                    className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
-                    style={{ left: ext.enabled ? '22px' : '2px' }}
-                  />
-                </button>
-
-                <button
-                  onClick={() => handleUpdateFolder(ext)}
-                  disabled={updating === ext.id}
-                  className="p-2 rounded-lg transition-colors"
-                  style={{ color: 'var(--text-muted)' }}
-                  title="Update (folder)"
-                  onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
-                  onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
-                >
-                  {updating === ext.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                </button>
-
-                <button
-                  onClick={() => handleRemove(ext)}
-                  className="p-2 rounded-lg transition-colors hover:bg-red-500/10"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            );
-          })}
+                <div className="space-y-2">
+                  {section.extensions.map(renderExtensionRow)}
+                </div>
+              </section>
+            ))
+          ) : (
+            <div className="space-y-2">
+              {extensions.map(renderExtensionRow)}
+            </div>
+          )}
         </div>
       )}
     </div>

@@ -869,7 +869,7 @@ function App() {
       case 'proxies':
         return <ProxyManagerPage profiles={visibleProfiles} folders={visibleFolders} onUpdateProfile={handleUpdateProfile} userId={user?.uid} teamId={user?.teamId} />;
       case 'extensions':
-        return hasAdminAccess ? <ExtensionsPage teamId={user?.role === 'super_admin' ? null : user?.teamId || null} /> : null;
+        return hasAdminAccess ? <ExtensionsPage teamId={user?.role === 'super_admin' ? null : user?.teamId || null} teams={teams} /> : null;
       case 'diagnostics':
         return hasAdminAccess ? (
           <DiagnosticsPage user={user} profiles={visibleProfiles} activeProfiles={activeProfiles} />
