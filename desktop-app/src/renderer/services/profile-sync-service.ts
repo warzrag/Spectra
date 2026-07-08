@@ -1,5 +1,7 @@
 import { ref, uploadBytesResumable, getDownloadURL, getBlob } from 'firebase/storage';
+import { doc, getDoc } from 'firebase/firestore';
 import { storage } from './firebase';
+import { db } from './firebase';
 import { updateProfile } from './firestore-service';
 import { Profile } from '../../types';
 
@@ -122,7 +124,7 @@ export function isLockedByOther(profile: Profile, currentUserId: string, current
 export async function acquireProfileLock(
   profileId: string,
   user: { uid: string; email: string }
-): Promise<void> {
+): Promise<string> {
   let deviceName = 'PC';
   try {
     deviceName = await (window as any).electronAPI.profileSync.getHostname();
@@ -134,12 +136,43 @@ export async function acquireProfileLock(
     lockedByDevice: deviceName,
     lockedAt: new Date().toISOString(),
   } as any);
+
+  return deviceName;
 }
 
 /**
- * Release the lock on a profile after closing.
+ * Refresh the lock while a profile is still running locally.
  */
-export async function releaseProfileLock(profileId: string): Promise<void> {
+export async function refreshProfileLock(
+  profileId: string,
+  owner?: { uid: string; deviceName?: string | null }
+): Promise<void> {
+  if (owner) {
+    const profileDoc = await getDoc(doc(db, 'profiles', profileId));
+    const data = profileDoc.data() as Profile | undefined;
+    if (!data || data.lockedBy !== owner.uid) return;
+    if (owner.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
+  }
+
+  await updateProfile(profileId, {
+    lockedAt: new Date().toISOString(),
+  } as any);
+}
+
+/**
+ * Release the lock on a profile after closing, but only if it still belongs to this device/user.
+ */
+export async function releaseProfileLock(
+  profileId: string,
+  owner?: { uid: string; deviceName?: string | null }
+): Promise<void> {
+  if (owner) {
+    const profileDoc = await getDoc(doc(db, 'profiles', profileId));
+    const data = profileDoc.data() as Profile | undefined;
+    if (!data || data.lockedBy !== owner.uid) return;
+    if (owner.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
+  }
+
   await updateProfile(profileId, {
     lockedBy: null,
     lockedByEmail: null,

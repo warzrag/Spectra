@@ -43,6 +43,7 @@ import {
   needsCloudDownload,
   isLockedByOther,
   acquireProfileLock,
+  refreshProfileLock,
   releaseProfileLock,
 } from './services/profile-sync-service';
 
@@ -360,7 +361,7 @@ function App() {
         const lockedByThisDevice = p.lockedBy === user.uid && p.lockedByDevice === currentDeviceName;
         if (lockedByThisDevice && !activeIds.includes(p.id)) {
           try {
-            await releaseProfileLock(p.id);
+            await releaseProfileLock(p.id, { uid: user.uid, deviceName: currentDeviceName });
             console.log(`[LockCleanup] Released lock on "${p.name}" (was ${p.lockedByEmail || p.lockedBy})`);
           } catch (e) {
             console.error(`[LockCleanup] Failed to release lock on "${p.name}":`, e);
@@ -371,6 +372,22 @@ function App() {
 
     cleanupLocks();
   }, [user, currentDeviceName, profiles.length > 0]);
+
+  useEffect(() => {
+    if (!user || !currentDeviceName || activeProfiles.length === 0) return;
+
+    const refreshOwnActiveLocks = () => {
+      activeProfiles.forEach(profileId => {
+        refreshProfileLock(profileId, { uid: user.uid, deviceName: currentDeviceName }).catch((error) => {
+          console.error('[LockHeartbeat] Failed to refresh lock:', error);
+        });
+      });
+    };
+
+    refreshOwnActiveLocks();
+    const interval = window.setInterval(refreshOwnActiveLocks, 30000);
+    return () => window.clearInterval(interval);
+  }, [user, currentDeviceName, activeProfiles]);
 
   // Keep a ref of profile IDs so the URL listener always has the latest
   const profileIdsRef = useRef<Set<string>>(new Set());
@@ -429,7 +446,7 @@ function App() {
 
         // Release lock AFTER upload is done (or failed)
         try {
-          await releaseProfileLock(profileId);
+          await releaseProfileLock(profileId, { uid: user.uid, deviceName: currentDeviceName });
         } catch (error) {
           console.error('[ProfileSync] Failed to release lock:', error);
         }
@@ -657,14 +674,14 @@ function App() {
         const hasLocal = await window.electronAPI?.profileSync?.hasLocalData(profile.id);
         if (!hasLocal) {
           showToast('Échec du téléchargement du profil', 'error');
-          await releaseProfileLock(profile.id).catch(() => {});
+          await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
           return;
         }
       }
 
       // Get enabled extensions and auto-download missing ones from cloud
       let extensionPaths: string[] = [];
-      const enabledExts = extensions.filter(e => e.enabled);
+      const enabledExts = extensions.filter(e => e.enabled && (!e.teamId || !profile.teamId || e.teamId === profile.teamId));
       const enabledExtIds = enabledExts.map(e => e.id);
 
       if (enabledExtIds.length > 0 && window.electronAPI?.extensions) {
@@ -699,13 +716,13 @@ function App() {
         } else {
           console.error('Launch failed:', result.error);
           showToast(`Launch failed: ${result.error}`, 'error');
-          await releaseProfileLock(profile.id).catch(() => {});
+          await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
         }
       }
     } catch (error) {
       console.error('Failed to launch profile:', error);
       showToast('Failed to launch browser', 'error');
-      await releaseProfileLock(profile.id).catch(() => {});
+      await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
     }
   };
 
