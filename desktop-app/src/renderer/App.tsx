@@ -695,10 +695,14 @@ function App() {
   const [bulkLaunching, setBulkLaunching] = useState<{ total: number; current: number; name: string } | null>(null);
 
   const handleBulkLaunch = async (profileIds: string[]) => {
-    const profilesToLaunch = visibleProfiles.filter(p => profileIds.includes(p.id));
+    const profilesToLaunch = visibleProfiles.filter(p =>
+      profileIds.includes(p.id) &&
+      !activeProfiles.includes(p.id) &&
+      !(user && isLockedByOther(p, user.uid))
+    );
 
     if (profilesToLaunch.length === 0) {
-      showToast('Toutes les instances sont déjà lancées', 'info');
+      showToast('Aucune instance disponible à lancer', 'info');
       return;
     }
 
@@ -708,7 +712,12 @@ function App() {
       const profile = profilesToLaunch[i];
       setBulkLaunching({ total: profilesToLaunch.length, current: i + 1, name: profile.name });
 
-      await handleLaunchProfile(profile);
+      await handleLaunchProfile({
+        ...profile,
+        lastUrl: 'https://x.com/messages/requests',
+        autoStartTwitterBot: true,
+        windowLayout: { index: i, total: profilesToLaunch.length },
+      });
 
       // Small delay between launches to avoid overwhelming the system
       if (i < profilesToLaunch.length - 1) {

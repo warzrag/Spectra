@@ -177,6 +177,11 @@ const Dashboard: React.FC<DashboardProps> = ({
       return sortOrder === 'desc' ? -cmp : cmp;
     });
 
+  const launchableVisibleProfiles = filteredProfiles.filter(profile =>
+    !activeProfiles.includes(profile.id) &&
+    !(user && isLockedByOther(profile, user.uid))
+  );
+
   const handleSelectProfile = (profileId: string) => {
     if (!isAdmin) return;
     setSelectedProfiles(prev =>
@@ -591,6 +596,28 @@ const Dashboard: React.FC<DashboardProps> = ({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          {launchableVisibleProfiles.length > 0 && (
+            <button
+              onClick={() => onBulkLaunch(launchableVisibleProfiles.map(profile => profile.id))}
+              disabled={!!bulkLaunching}
+              className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
+              style={{ background: 'var(--success-subtle, rgba(34,197,94,0.1))', border: '1px solid var(--success, #22c55e)', color: 'var(--success, #22c55e)' }}
+              title="Open every available instance currently shown"
+            >
+              {bulkLaunching ? (
+                <>
+                  <Loader2 size={14} className="animate-spin" />
+                  {bulkLaunching.current}/{bulkLaunching.total}
+                </>
+              ) : (
+                <>
+                  <Rocket size={14} />
+                  Open visible ({launchableVisibleProfiles.length})
+                </>
+              )}
+            </button>
+          )}
+
           {isAdmin && selectedProfiles.length > 0 && (
             <>
               <button
@@ -607,7 +634,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                 ) : (
                   <>
                     <Rocket size={14} />
-                    Launch ({selectedProfiles.length})
+                    Open selected ({selectedProfiles.length})
                   </>
                 )}
               </button>
@@ -1030,7 +1057,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                           ) : locked ? (
                             <><Lock size={12} /> Locked</>
                           ) : (
-                            <><Play size={12} /> Launch</>
+                            <><Play size={12} /> Open</>
                           )}
                         </button>
 

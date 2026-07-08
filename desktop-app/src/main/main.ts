@@ -91,6 +91,8 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
       lastUrl: profileData.lastUrl,
       connectionType: profileData.connectionType,
       extensionPaths: extensionPaths,
+      windowLayout: profileData.windowLayout,
+      autoStartTwitterBot: profileData.autoStartTwitterBot === true,
     });
 
     // Check if Chrome returned an error because profile is already running

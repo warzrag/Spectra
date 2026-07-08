@@ -25,11 +25,14 @@ export interface PuppeteerLaunchOptions {
   lastUrl?: string;
   connectionType?: string;
   extensionPaths?: string[];
+  windowLayout?: { index: number; total: number };
+  autoStartTwitterBot?: boolean;
 }
 
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
   private static mainWindow: any = null;
+  private static readonly compactWindow = { width: 480, height: 500, margin: 0, gap: 0 };
 
   static setMainWindow(win: any) {
     this.mainWindow = win;
@@ -45,6 +48,301 @@ export class PuppeteerLauncher {
     return this.activeProfiles.has(profileId);
   }
 
+  private static getWindowPlacement(layout?: { index: number; total: number }) {
+    let workArea = { x: 0, y: 0, width: 1920, height: 1080 };
+
+    try {
+      const { screen } = require('electron');
+      const display = this.mainWindow && !this.mainWindow.isDestroyed()
+        ? screen.getDisplayMatching(this.mainWindow.getBounds())
+        : screen.getPrimaryDisplay();
+      workArea = display.workArea;
+    } catch {}
+
+    const win = this.compactWindow;
+    const maxColumns = Math.max(1, Math.floor((workArea.width - win.margin * 2 + win.gap) / (win.width + win.gap)));
+    const columns = Math.max(1, maxColumns);
+    const slot = Math.max(0, layout?.index ?? this.activeProfiles.size);
+    const col = slot % columns;
+    const row = Math.floor(slot / columns);
+    const left = workArea.x + win.margin + col * (win.width + win.gap);
+    const top = workArea.y + win.margin + row * (win.height + win.gap);
+
+    return {
+      left,
+      top,
+      right: left + win.width,
+      bottom: top + win.height,
+      width: win.width,
+      height: win.height,
+      workArea,
+    };
+  }
+
+  private static applyCleanLaunchState(profilePath: string, prefs: any) {
+    prefs.profile = {
+      ...(prefs.profile || {}),
+      exit_type: 'Normal',
+      exited_cleanly: true,
+    };
+    prefs.session = {
+      ...(prefs.session || {}),
+      restore_on_startup: 0,
+      startup_urls: [],
+    };
+
+    const localStatePath = path.join(profilePath, 'Local State');
+    try {
+      const localState = fs.existsSync(localStatePath) ? JSON.parse(fs.readFileSync(localStatePath, 'utf8')) : {};
+      localState.profile = {
+        ...(localState.profile || {}),
+        exit_type: 'Normal',
+        exited_cleanly: true,
+      };
+      fs.writeFileSync(localStatePath, JSON.stringify(localState));
+    } catch {}
+  }
+
+  private static clearChromeSessionRestore(profilePath: string) {
+    const defaultDir = path.join(profilePath, 'Default');
+    const sessionTargets = [
+      path.join(defaultDir, 'Current Session'),
+      path.join(defaultDir, 'Current Tabs'),
+      path.join(defaultDir, 'Last Session'),
+      path.join(defaultDir, 'Last Tabs'),
+      path.join(defaultDir, 'Sessions'),
+    ];
+
+    for (const target of sessionTargets) {
+      try {
+        if (!fs.existsSync(target)) continue;
+        const stat = fs.statSync(target);
+        if (stat.isDirectory()) fs.rmSync(target, { recursive: true, force: true });
+        else fs.unlinkSync(target);
+      } catch {}
+    }
+  }
+
+  private static configureTwitterAutoReplyAutostart(extensionPath: string, enabled: boolean): boolean {
+    const manifestPath = path.join(extensionPath, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) return false;
+
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (manifest.name !== 'Twitter Auto Reply DM Client Secure') return false;
+
+      const autostartFile = 'spectra-autostart.js';
+      const autostartPath = path.join(extensionPath, autostartFile);
+      const autostartScript = `
+(function () {
+  const start = () => {
+    try {
+      chrome.storage.local.set({
+        isEnabled: true,
+        pendingAutoStart: true,
+        pendingMode: 'autonomous',
+        mode: 'autonomous',
+        manualPause: false,
+        autonomousPhaseStartTime: Date.now()
+      });
+    } catch (error) {
+      console.warn('[Spectra] Auto Reply DM autostart failed:', error);
+    }
+  };
+
+  start();
+  setTimeout(start, 1500);
+})();
+`;
+      if (enabled && (!fs.existsSync(autostartPath) || fs.readFileSync(autostartPath, 'utf8') !== autostartScript)) {
+        fs.writeFileSync(autostartPath, autostartScript);
+      }
+
+      const matches = ['https://twitter.com/*', 'https://x.com/*', 'https://x.com/i/*'];
+      const contentScripts = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
+      const alreadyRegistered = contentScripts.some((script: any) =>
+        Array.isArray(script.js) && script.js.includes(autostartFile)
+      );
+
+      if (enabled && !alreadyRegistered) {
+        manifest.content_scripts = [
+          { matches, js: [autostartFile], run_at: 'document_start' },
+          ...contentScripts,
+        ];
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+      } else if (!enabled && alreadyRegistered) {
+        manifest.content_scripts = contentScripts.filter((script: any) =>
+          !(Array.isArray(script.js) && script.js.includes(autostartFile))
+        );
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+      }
+
+      return true;
+    } catch (error) {
+      console.error('[Extensions] Failed to prepare Twitter Auto Reply autostart:', error);
+      return false;
+    }
+  }
+
+  private static getExtensionName(extensionPath: string): string | null {
+    const manifestPath = path.join(extensionPath, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) return null;
+
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      return typeof manifest.name === 'string' ? manifest.name : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private static findTwitterAutoReplyExtensionPath(): string | null {
+    const extensionRoots = [
+      path.join(os.homedir(), '.antidetect-browser', 'extensions'),
+      path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Extensions'),
+    ];
+
+    for (const root of extensionRoots) {
+      if (!fs.existsSync(root)) continue;
+      try {
+        const matches = fs.readdirSync(root)
+          .map(name => path.join(root, name))
+          .filter(extPath => {
+            const manifestPath = path.join(extPath, 'manifest.json');
+            if (!fs.existsSync(manifestPath)) return false;
+            try {
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+              return manifest.name === 'Twitter Auto Reply DM Client Secure';
+            } catch {
+              return false;
+            }
+          })
+          .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+        if (matches[0]) return matches[0];
+      } catch {}
+    }
+
+    return null;
+  }
+
+  private static createStartupTabCleanerExtension(profilePath: string, startUrl: string): string {
+    const cleanerPath = path.join(profilePath, '__startup_tab_cleaner_ext');
+    if (fs.existsSync(cleanerPath)) {
+      fs.rmSync(cleanerPath, { recursive: true, force: true });
+    }
+    fs.mkdirSync(cleanerPath, { recursive: true });
+
+    fs.writeFileSync(path.join(cleanerPath, 'manifest.json'), JSON.stringify({
+      manifest_version: 3,
+      name: 'Spectra Startup Tab Cleaner',
+      version: '1.0',
+      permissions: ['tabs'],
+      background: { service_worker: 'background.js' },
+    }, null, 2));
+
+    fs.writeFileSync(path.join(cleanerPath, 'background.js'), `
+const START_URL = ${JSON.stringify(startUrl)};
+const isTargetTab = (url) => /^https?:\\/\\/(www\\.)?(x\\.com|twitter\\.com)\\//i.test(url || '');
+const isExtensionSetupTab = (url) => /^chrome-extension:\\/\\/.*\\/html\\/initialSetup\\.html/i.test(url || '');
+let cleanupUntil = Date.now() + 20000;
+let cleanupTimer = null;
+
+async function cleanTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const targetTabs = tabs.filter((tab) => isTargetTab(tab.url));
+
+    if (targetTabs.length === 0) {
+      const activeTab = tabs.find((tab) => tab.active) || tabs[0];
+      if (activeTab && activeTab.id) {
+        await chrome.tabs.update(activeTab.id, { url: START_URL, active: true });
+      } else {
+        await chrome.tabs.create({ url: START_URL, active: true });
+      }
+    } else {
+      await chrome.tabs.update(targetTabs[0].id, { active: true });
+      for (const tab of targetTabs.slice(1)) {
+        if (tab.id) await chrome.tabs.remove(tab.id).catch(() => {});
+      }
+    }
+
+    const latestTabs = await chrome.tabs.query({});
+    for (const tab of latestTabs) {
+      if (tab.id && (isExtensionSetupTab(tab.url) || !isTargetTab(tab.url))) {
+        await chrome.tabs.remove(tab.id).catch(() => {});
+      }
+    }
+  } catch (error) {
+    console.warn('[Spectra] Startup tab cleanup failed:', error);
+  }
+}
+
+function scheduleCleanTabs(delay = 250) {
+  if (Date.now() > cleanupUntil) return;
+  clearTimeout(cleanupTimer);
+  cleanupTimer = setTimeout(cleanTabs, delay);
+}
+
+chrome.tabs.onCreated.addListener(() => scheduleCleanTabs(150));
+chrome.tabs.onUpdated.addListener(() => scheduleCleanTabs(150));
+chrome.tabs.onActivated.addListener(() => scheduleCleanTabs(150));
+
+setInterval(() => {
+  if (Date.now() <= cleanupUntil) cleanTabs();
+}, 1000);
+
+chrome.runtime.onStartup.addListener(() => {
+  setTimeout(cleanTabs, 800);
+  setTimeout(cleanTabs, 2200);
+  setTimeout(cleanTabs, 4500);
+  setTimeout(cleanTabs, 8000);
+  setTimeout(cleanTabs, 14000);
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  setTimeout(cleanTabs, 800);
+  setTimeout(cleanTabs, 2200);
+  setTimeout(cleanTabs, 4500);
+  setTimeout(cleanTabs, 8000);
+  setTimeout(cleanTabs, 14000);
+});
+`);
+
+    return cleanerPath;
+  }
+
+  private static enforceWindowPlacement(pid: number | undefined, placement: ReturnType<typeof PuppeteerLauncher.getWindowPlacement>) {
+    if (!pid || process.platform !== 'win32') return;
+
+    const ps = `
+      Start-Sleep -Milliseconds 900
+      Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+  [DllImport("user32.dll")]
+  public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}
+"@
+      $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue
+      if ($p) {
+        $deadline = (Get-Date).AddSeconds(5)
+        while ($p.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline) {
+          Start-Sleep -Milliseconds 150
+          $p.Refresh()
+        }
+        if ($p.MainWindowHandle -ne 0) {
+          [Win32]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, ${placement.left}, ${placement.top}, ${placement.width}, ${placement.height}, 0x0040) | Out-Null
+        }
+      }
+    `;
+
+    spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
+  }
+
   /**
    * Clean Chrome-internal state from a profile directory to fix version incompatibility.
    */
@@ -52,7 +350,7 @@ export class PuppeteerLauncher {
     const keepFiles = new Set([
       'pending_cookies.json', 'synced_cookies.json', 'open_tabs.json',
       'last_url.txt', '__proxy_auth_ext', '__brand_fix_ext',
-      '__cookie_sync_ext', '__platform_fix_ext',
+      '__cookie_sync_ext', '__platform_fix_ext', '__startup_tab_cleaner_ext',
     ]);
     try {
       const entries = fs.readdirSync(profilePath);
@@ -104,6 +402,25 @@ export class PuppeteerLauncher {
       if (fs.existsSync(prefsPath)) {
         try { prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf8')); } catch {}
       }
+      const placement = this.getWindowPlacement(options.windowLayout);
+      this.applyCleanLaunchState(profilePath, prefs);
+      if (options.autoStartTwitterBot) {
+        this.clearChromeSessionRestore(profilePath);
+      }
+      prefs.browser = {
+        ...(prefs.browser || {}),
+        window_placement: {
+          left: placement.left,
+          top: placement.top,
+          right: placement.right,
+          bottom: placement.bottom,
+          maximized: false,
+          work_area_left: placement.workArea.x,
+          work_area_top: placement.workArea.y,
+          work_area_right: placement.workArea.x + placement.workArea.width,
+          work_area_bottom: placement.workArea.y + placement.workArea.height,
+        },
+      };
       // Enable developer mode for extensions loading
       if (!prefs.extensions) prefs.extensions = {};
       prefs.extensions.developer_mode = true;
@@ -127,6 +444,8 @@ export class PuppeteerLauncher {
       const chromePath = await this.downloadChromeForTesting();
 
       // Build Chrome args — MINIMAL flags only
+      const compactWindowSize = `${placement.width},${placement.height}`;
+      const compactWindowPosition = `${placement.left},${placement.top}`;
       const userAgent = options.userAgent || options.fingerprint?.userAgent || '';
       const args = [
         `--user-data-dir=${profilePath}`,
@@ -136,7 +455,8 @@ export class PuppeteerLauncher {
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
         '--disable-background-timer-throttling',
-        '--window-size=1280,800',
+        `--window-size=${compactWindowSize}`,
+        `--window-position=${compactWindowPosition}`,
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
         '--disable-features=UserAgentClientHint,CalculateNativeWinOcclusion',
       ];
@@ -292,27 +612,35 @@ setTimeout(exportCookies, 5000);
 
       // Collect extensions
       const extPaths: string[] = [cookieSyncPath];
+      let shouldAutoStartTwitterBot = false;
       if (platformFixPath) extPaths.push(platformFixPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
         const validPaths = options.extensionPaths.filter(p => {
           const manifestPath = path.join(p, 'manifest.json');
           const exists = fs.existsSync(manifestPath);
+          const extensionName = exists ? this.getExtensionName(p) : null;
           console.log(`[Extensions] ${p} — manifest exists: ${exists}`);
+          if (exists && this.configureTwitterAutoReplyAutostart(p, options.autoStartTwitterBot === true)) {
+            shouldAutoStartTwitterBot = options.autoStartTwitterBot === true;
+          }
           return exists;
         });
         extPaths.push(...validPaths);
       }
-      if (extPaths.length > 0) {
-        args.push(`--load-extension=${extPaths.join(',')}`);
-        args.push(`--disable-extensions-except=${extPaths.join(',')}`);
-        console.log(`[Extensions] Loading ${extPaths.length} extension(s)`);
+      if (options.autoStartTwitterBot) {
+        const twitterAutoReplyPath = this.findTwitterAutoReplyExtensionPath();
+        if (twitterAutoReplyPath && !extPaths.includes(twitterAutoReplyPath)) {
+          this.configureTwitterAutoReplyAutostart(twitterAutoReplyPath, true);
+          shouldAutoStartTwitterBot = true;
+          extPaths.push(twitterAutoReplyPath);
+          console.log(`[Extensions] Auto-start extension added: ${twitterAutoReplyPath}`);
+        }
       }
-
       // Determine start URL
       const isValidUrl = (url: string) => url && (url.startsWith('https://') || url.startsWith('http://'));
       let startUrl = isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com';
       const lastUrlPath = path.join(profilePath, 'last_url.txt');
-      if (fs.existsSync(lastUrlPath)) {
+      if (!options.autoStartTwitterBot && fs.existsSync(lastUrlPath)) {
         try {
           const savedUrl = fs.readFileSync(lastUrlPath, 'utf8').trim();
           if (isValidUrl(savedUrl)) {
@@ -320,6 +648,21 @@ setTimeout(exportCookies, 5000);
           }
         } catch {}
       }
+      if (shouldAutoStartTwitterBot && !startUrl.includes('twitter.com') && !startUrl.includes('x.com')) {
+        startUrl = 'https://x.com/messages/requests';
+      }
+
+      if (options.autoStartTwitterBot) {
+        extPaths.push(this.createStartupTabCleanerExtension(profilePath, startUrl));
+      }
+
+      if (extPaths.length > 0) {
+        const uniqueExtPaths = Array.from(new Set(extPaths));
+        args.push(`--load-extension=${uniqueExtPaths.join(',')}`);
+        args.push(`--disable-extensions-except=${uniqueExtPaths.join(',')}`);
+        console.log(`[Extensions] Loading ${uniqueExtPaths.length} extension(s)`);
+      }
+
       args.push(startUrl);
 
       console.log(`Launching Chrome: ${chromePath}`);
@@ -345,6 +688,7 @@ setTimeout(exportCookies, 5000);
         stdio: 'ignore',
         env: cleanEnv as any,
       });
+      this.enforceWindowPlacement(chromeProcess.pid, placement);
 
       console.log(`[Chrome] Process spawned (PID: ${chromeProcess.pid}) — CDP-free`);
 
