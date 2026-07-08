@@ -12,7 +12,7 @@ import {
 } from '../services/firestore-service';
 
 interface ExtensionsPageProps {
-  teamId: string;
+  teamId: string | null;
 }
 
 const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
@@ -24,9 +24,8 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   const [storeUrl, setStoreUrl] = useState('');
   const [installingFromStore, setInstallingFromStore] = useState(false);
 
-  // Subscribe to Firestore extensions (scoped by teamId)
+  // Subscribe to Firestore extensions (super admin = global, others = scoped by teamId)
   useEffect(() => {
-    if (!teamId) return;
     const unsub = subscribeToExtensions(teamId, (exts) => {
       setExtensions(exts);
       setLoading(false);
@@ -106,6 +105,11 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   }, [extensions]);
 
   const doInstall = async (pathToInstall: string) => {
+    if (!teamId) {
+      showToast('Choose a team before installing a new extension', 'warning');
+      return;
+    }
+
     const result = await window.electronAPI.extensions!.install(pathToInstall);
     if (!result.success) {
       showToast(`Failed to install extension: ${result.error}`, 'error');
@@ -139,6 +143,11 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   };
 
   const handleInstallFromStore = async () => {
+    if (!teamId) {
+      showToast('Choose a team before installing a new extension', 'warning');
+      return;
+    }
+
     if (!storeUrl.trim() || !window.electronAPI?.extensions) return;
     setInstallingFromStore(true);
     try {
