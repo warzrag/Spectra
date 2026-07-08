@@ -259,6 +259,8 @@ async function cleanTabs() {
       } else {
         await chrome.tabs.create({ url: START_URL, active: true });
       }
+      scheduleCleanTabs(900);
+      return;
     } else {
       await chrome.tabs.update(targetTabs[0].id, { active: true });
       for (const tab of targetTabs.slice(1)) {
@@ -267,6 +269,12 @@ async function cleanTabs() {
     }
 
     const latestTabs = await chrome.tabs.query({});
+    const latestTargetTabs = latestTabs.filter((tab) => isTargetTab(tab.url));
+    if (latestTargetTabs.length === 0) {
+      scheduleCleanTabs(900);
+      return;
+    }
+
     for (const tab of latestTabs) {
       if (tab.id && (isExtensionSetupTab(tab.url) || !isTargetTab(tab.url))) {
         await chrome.tabs.remove(tab.id).catch(() => {});
