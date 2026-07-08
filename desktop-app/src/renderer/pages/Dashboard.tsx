@@ -932,6 +932,15 @@ const Dashboard: React.FC<DashboardProps> = ({
                           <Circle size={6} className="fill-current status-dot-active" />
                           Running
                         </span>
+                      ) : locked ? (
+                        <span
+                          className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium"
+                          style={{ background: 'rgba(245,158,11,0.12)', color: '#f59e0b' }}
+                          title={`Utilise par ${profile.lockedByEmail || '?'} sur ${profile.lockedByDevice || '?'}`}
+                        >
+                          <Lock size={10} />
+                          In use
+                        </span>
                       ) : (
                         <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>Idle</span>
                       )}

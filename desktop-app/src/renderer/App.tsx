@@ -326,7 +326,7 @@ function App() {
     };
   }, [user]);
 
-  // Release all locks on profiles not currently running on this machine
+  // Release only this device/user's own stale local locks. Never clear another user's lock.
   const lockCleanupDone = useRef(false);
   useEffect(() => {
     if (!user || profiles.length === 0 || lockCleanupDone.current) return;
@@ -341,7 +341,8 @@ function App() {
       } catch {}
 
       for (const p of profiles) {
-        if (p.lockedBy && !activeIds.includes(p.id)) {
+        const lockedByCurrentUser = p.lockedBy === user.uid;
+        if (lockedByCurrentUser && !activeIds.includes(p.id)) {
           try {
             await releaseProfileLock(p.id);
             console.log(`[LockCleanup] Released lock on "${p.name}" (was ${p.lockedByEmail || p.lockedBy})`);
