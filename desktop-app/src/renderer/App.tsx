@@ -171,6 +171,7 @@ function App() {
   const [activePage, setActivePage] = useState<AppPage>('profiles');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
+  const [currentDeviceName, setCurrentDeviceName] = useState<string | null>(null);
 
   // Lifted states from Dashboard
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
@@ -237,6 +238,12 @@ function App() {
       setActiveProfiles(nextActiveProfiles);
     });
     return () => cleanup();
+  }, []);
+
+  useEffect(() => {
+    window.electronAPI.profileSync?.getHostname?.()
+      .then(setCurrentDeviceName)
+      .catch(() => setCurrentDeviceName(null));
   }, []);
 
   // Auth state listener
@@ -329,7 +336,7 @@ function App() {
   // Release only this device/user's own stale local locks. Never clear another user's lock.
   const lockCleanupDone = useRef(false);
   useEffect(() => {
-    if (!user || profiles.length === 0 || lockCleanupDone.current) return;
+    if (!user || !currentDeviceName || profiles.length === 0 || lockCleanupDone.current) return;
     lockCleanupDone.current = true;
 
     const cleanupLocks = async () => {
@@ -341,8 +348,8 @@ function App() {
       } catch {}
 
       for (const p of profiles) {
-        const lockedByCurrentUser = p.lockedBy === user.uid;
-        if (lockedByCurrentUser && !activeIds.includes(p.id)) {
+        const lockedByThisDevice = p.lockedBy === user.uid && p.lockedByDevice === currentDeviceName;
+        if (lockedByThisDevice && !activeIds.includes(p.id)) {
           try {
             await releaseProfileLock(p.id);
             console.log(`[LockCleanup] Released lock on "${p.name}" (was ${p.lockedByEmail || p.lockedBy})`);
@@ -354,7 +361,7 @@ function App() {
     };
 
     cleanupLocks();
-  }, [user, profiles.length > 0]);
+  }, [user, currentDeviceName, profiles.length > 0]);
 
   // Keep a ref of profile IDs so the URL listener always has the latest
   const profileIdsRef = useRef<Set<string>>(new Set());
@@ -610,7 +617,7 @@ function App() {
   const handleLaunchProfile = async (profile: any) => {
     try {
       // Check if profile is locked by another user
-      if (user && isLockedByOther(profile, user.uid)) {
+      if (user && isLockedByOther(profile, user.uid, currentDeviceName)) {
         showToast(`Profil utilisé par ${profile.lockedByEmail || 'un autre utilisateur'} sur ${profile.lockedByDevice || 'un autre PC'}`, 'warning');
         return;
       }
@@ -699,7 +706,7 @@ function App() {
     const profilesToLaunch = visibleProfiles.filter(p =>
       profileIds.includes(p.id) &&
       !activeProfiles.includes(p.id) &&
-      !(user && isLockedByOther(p, user.uid))
+      !(user && isLockedByOther(p, user.uid, currentDeviceName))
     );
 
     if (profilesToLaunch.length === 0) {
@@ -844,6 +851,7 @@ function App() {
             onShowCreateModal={() => setShowCreateModal(true)}
             onEditProfile={(profile) => { setEditingProfile(profile); setShowCreateModal(true); }}
             onCloneProfile={handleCloneProfile}
+            currentDeviceName={currentDeviceName}
           />
         );
       case 'proxies':

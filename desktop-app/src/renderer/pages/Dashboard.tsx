@@ -25,6 +25,7 @@ interface DashboardProps {
   onShowCreateModal: () => void;
   onEditProfile: (profile: Profile) => void;
   onCloneProfile: (profile: Profile) => void;
+  currentDeviceName?: string | null;
 }
 
 const Dashboard: React.FC<DashboardProps> = ({
@@ -44,6 +45,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   onShowCreateModal,
   onEditProfile,
   onCloneProfile,
+  currentDeviceName,
 }) => {
   const { user, isAdmin, isVA } = useAuth();
   const { showToast } = useToast();
@@ -179,7 +181,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   const launchableVisibleProfiles = filteredProfiles.filter(profile =>
     !activeProfiles.includes(profile.id) &&
-    !(user && isLockedByOther(profile, user.uid))
+    !(user && isLockedByOther(profile, user.uid, currentDeviceName))
   );
 
   const handleSelectProfile = (profileId: string) => {
@@ -841,7 +843,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                 const isActive = activeProfiles.includes(profile.id);
                 const isSelected = selectedProfiles.includes(profile.id);
                 const conn = getConnectionInfo(profile);
-                const locked = !isActive && isLockedByOther(profile, user?.uid || '');
+                const locked = !isActive && isLockedByOther(profile, user?.uid || '', currentDeviceName);
 
                 const isDragTarget = dragOverId === profile.id && dragId !== profile.id;
                 const isDragging = dragId === profile.id;

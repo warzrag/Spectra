@@ -98,8 +98,8 @@ export async function needsCloudDownload(profile: Profile): Promise<boolean> {
 /**
  * Check if a profile is locked by another user.
  */
-export function isLockedByOther(profile: Profile, currentUserId: string): boolean {
-  if (!profile.lockedBy || profile.lockedBy === currentUserId) return false;
+export function isLockedByOther(profile: Profile, currentUserId: string, currentDeviceName?: string | null): boolean {
+  if (!profile.lockedBy) return false;
 
   // Check if lock is stale
   if (profile.lockedAt) {
@@ -107,7 +107,13 @@ export function isLockedByOther(profile: Profile, currentUserId: string): boolea
     if (lockAge > STALE_LOCK_MS) return false; // Stale lock, can override
   }
 
-  return true;
+  if (profile.lockedBy !== currentUserId) return true;
+
+  return !!(
+    currentDeviceName &&
+    profile.lockedByDevice &&
+    profile.lockedByDevice !== currentDeviceName
+  );
 }
 
 /**
