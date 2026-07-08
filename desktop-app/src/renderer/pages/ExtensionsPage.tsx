@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link } from 'lucide-react';
+import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link, ChevronDown, ChevronRight } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Extension, Team } from '../../types';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
@@ -24,6 +24,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
   const [installing, setInstalling] = useState(false);
   const [storeUrl, setStoreUrl] = useState('');
   const [installingFromStore, setInstallingFromStore] = useState(false);
+  const [expandedTeamIds, setExpandedTeamIds] = useState<Set<string>>(new Set());
 
   // Subscribe to Firestore extensions (super admin = global, others = scoped by teamId)
   useEffect(() => {
@@ -437,6 +438,15 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
     );
   };
 
+  const toggleTeamSection = (sectionTeamId: string) => {
+    setExpandedTeamIds(prev => {
+      const next = new Set(prev);
+      if (next.has(sectionTeamId)) next.delete(sectionTeamId);
+      else next.add(sectionTeamId);
+      return next;
+    });
+  };
+
   return (
     <div className="h-full flex flex-col p-6">
       {/* Header */}
@@ -525,23 +535,42 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
         <div className="space-y-6 overflow-auto">
           {isGlobalView ? (
             teamSections.map(section => (
-              <section key={section.teamId}>
-                <div className="flex items-center justify-between mb-2">
-                  <div>
-                    <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>
-                      {section.teamName}
-                    </h2>
-                    <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-                      {section.extensions.length} extension{section.extensions.length !== 1 ? 's' : ''}
+              <section key={section.teamId} className="rounded-xl border overflow-hidden" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-surface)' }}>
+                <button
+                  onClick={() => toggleTeamSection(section.teamId)}
+                  className="w-full px-4 py-3 flex items-center gap-3 text-left transition-colors"
+                  style={{ color: 'var(--text-primary)' }}
+                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                >
+                  <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: 'var(--bg-elevated)', color: 'var(--accent-light)' }}>
+                    <FolderOpen size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <h2 className="text-[14px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                        {section.teamName}
+                      </h2>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-md shrink-0" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
+                        {section.extensions.length} extension{section.extensions.length !== 1 ? 's' : ''}
+                      </span>
+                    </div>
+                    <p className="text-[10px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
+                      {section.teamId}
                     </p>
                   </div>
-                  <span className="text-[10px] px-2 py-1 rounded-md" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
-                    {section.teamId}
-                  </span>
-                </div>
-                <div className="space-y-2">
-                  {section.extensions.map(renderExtensionRow)}
-                </div>
+                  {expandedTeamIds.has(section.teamId) ? (
+                    <ChevronDown size={16} style={{ color: 'var(--text-muted)' }} />
+                  ) : (
+                    <ChevronRight size={16} style={{ color: 'var(--text-muted)' }} />
+                  )}
+                </button>
+
+                {expandedTeamIds.has(section.teamId) && (
+                  <div className="space-y-2 p-3 pt-0">
+                    {section.extensions.map(renderExtensionRow)}
+                  </div>
+                )}
               </section>
             ))
           ) : (
