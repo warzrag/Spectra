@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, ArrowLeftRight, UserPlus, X, Crown, Activity } from 'lucide-react';
-import { Folder as FolderType, AppPage } from '../../types';
+import { Folder as FolderType, Team, AppPage } from '../../types';
 import { useAuth } from '../contexts/AuthContext';
 
 const SWITCH_UIDS = [
@@ -12,6 +12,7 @@ interface SidebarProps {
   activePage: AppPage;
   onNavigate: (page: AppPage) => void;
   folders: FolderType[];
+  teams?: Team[];
   selectedFolderId: string | null;
   profileCounts: { [folderId: string]: number };
   totalProfiles: number;
@@ -32,6 +33,7 @@ const Sidebar: React.FC<SidebarProps> = ({
   activePage,
   onNavigate,
   folders,
+  teams = [],
   selectedFolderId,
   profileCounts,
   totalProfiles,
@@ -107,7 +109,7 @@ const Sidebar: React.FC<SidebarProps> = ({
     { page: 'recycle-bin', label: 'Recycle Bin', icon: <Trash2 size={18} />, adminOnly: true },
   ];
 
-  const isSuperAdmin = user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53';
+  const isSuperAdmin = user?.role === 'super_admin' || user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53';
 
   // Team section items
   const teamNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean; superAdminOnly?: boolean }[] = [
@@ -333,6 +335,15 @@ const Sidebar: React.FC<SidebarProps> = ({
             {foldersExpanded && (() => {
               const rootFolders = folders.filter(f => !f.parentId);
               const getChildren = (parentId: string) => folders.filter(f => f.parentId === parentId);
+              const teamNameById = new Map(teams.map(team => [team.id, team.name]));
+              const teamSections = Array.from(new Set(rootFolders.map(folder => folder.teamId || 'unknown')))
+                .map(teamId => ({
+                  teamId,
+                  teamName: teamNameById.get(teamId) || (teamId === 'unknown' ? 'No team' : `Team ${teamId.slice(0, 6)}`),
+                  folders: rootFolders.filter(folder => (folder.teamId || 'unknown') === teamId),
+                }))
+                .filter(section => section.folders.length > 0)
+                .sort((a, b) => a.teamName.localeCompare(b.teamName));
               const toggleParent = (folderId: string, e: React.MouseEvent) => {
                 e.stopPropagation();
                 setExpandedParents(prev => {
@@ -426,7 +437,16 @@ const Sidebar: React.FC<SidebarProps> = ({
 
               return (
                 <div className="space-y-0.5">
-                  {rootFolders.map(folder => renderFolder(folder))}
+                  {isSuperAdmin && teamSections.length > 1
+                    ? teamSections.map(section => (
+                        <div key={section.teamId} className="pt-1">
+                          <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider truncate" style={{ color: 'var(--text-muted)' }}>
+                            {section.teamName}
+                          </div>
+                          {section.folders.map(folder => renderFolder(folder))}
+                        </div>
+                      ))
+                    : rootFolders.map(folder => renderFolder(folder))}
                   {folders.length === 0 && (
                     <p className="text-[12px] px-3 py-2" style={{ color: 'var(--text-muted)' }}>
                       No folders yet

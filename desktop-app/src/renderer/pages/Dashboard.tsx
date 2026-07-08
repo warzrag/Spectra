@@ -5,12 +5,13 @@ import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { logActivity } from '../services/firestore-service';
-import { Profile, Folder, AppSettings, Platform, ProfileStatus } from '../../types';
+import { Profile, Folder, Team, AppSettings, Platform, ProfileStatus } from '../../types';
 import { isLockedByOther } from '../services/profile-sync-service';
 
 interface DashboardProps {
   profiles: Profile[];
   folders: Folder[];
+  teams?: Team[];
   loading: boolean;
   selectedFolderId: string | null;
   onSelectFolder: (folderId: string | null) => void;
@@ -31,6 +32,7 @@ interface DashboardProps {
 const Dashboard: React.FC<DashboardProps> = ({
   profiles,
   folders,
+  teams = [],
   loading,
   selectedFolderId,
   onSelectFolder,
@@ -394,6 +396,132 @@ const Dashboard: React.FC<DashboardProps> = ({
     const filteredUnassigned = gridSearchTerm
       ? unassignedProfiles.filter(p => p.name.toLowerCase().includes(gridSearchTerm))
       : unassignedProfiles;
+    const isSuperAdmin = user?.role === 'super_admin';
+    const teamNameById = new Map(teams.map(team => [team.id, team.name]));
+    const teamIds = Array.from(new Set([
+      ...filteredFolders.map(folder => folder.teamId || 'unknown'),
+      ...filteredUnassigned.map(profile => profile.teamId || 'unknown'),
+    ]));
+    const teamSections = teamIds
+      .map(teamId => {
+        const teamFolders = filteredFolders.filter(folder => (folder.teamId || 'unknown') === teamId);
+        const teamUnassigned = filteredUnassigned.filter(profile => (profile.teamId || 'unknown') === teamId);
+        const teamProfiles = profiles.filter(profile => (profile.teamId || 'unknown') === teamId);
+        return {
+          teamId,
+          teamName: teamNameById.get(teamId) || (teamId === 'unknown' ? 'No team' : `Team ${teamId.slice(0, 6)}`),
+          folders: teamFolders,
+          unassigned: teamUnassigned,
+          profileCount: teamProfiles.length,
+        };
+      })
+      .filter(section => section.folders.length > 0 || section.unassigned.length > 0)
+      .sort((a, b) => a.teamName.localeCompare(b.teamName));
+
+    const renderFolderCard = (folder: Folder) => {
+      const childIds = getChildFolderIds(folder.id);
+      const folderProfiles = profiles.filter(p => p.folderId === folder.id || childIds.includes(p.folderId || ''));
+      const activeCount = folderProfiles.filter(p => activeProfiles.includes(p.id)).length;
+      const lastActivity = folderProfiles.reduce((max, p) => {
+        const t = p.lastUsed || p.createdAt || '';
+        return t > max ? t : max;
+      }, '');
+
+      return (
+        <button
+          key={folder.id}
+          onClick={() => onSelectFolder(folder.id)}
+          className="text-left p-5 rounded-xl transition-all group"
+          style={{
+            background: 'var(--bg-surface)',
+            border: '1px solid var(--border-default)',
+          }}
+          onMouseEnter={e => {
+            e.currentTarget.style.borderColor = 'var(--accent)';
+            e.currentTarget.style.boxShadow = '0 4px 20px rgba(99, 102, 241, 0.1)';
+          }}
+          onMouseLeave={e => {
+            e.currentTarget.style.borderColor = 'var(--border-default)';
+            e.currentTarget.style.boxShadow = 'none';
+          }}
+        >
+          <div className="flex items-start justify-between mb-3">
+            <div
+              className="w-12 h-12 rounded-xl flex items-center justify-center text-xl"
+              style={{ background: folder.color ? `${folder.color}20` : 'var(--bg-elevated)' }}
+            >
+              <span style={{ color: folder.color }}>{folder.icon || '\uD83D\uDCC1'}</span>
+            </div>
+            {activeCount > 0 && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: 'var(--success-subtle)', color: 'var(--success)' }}>
+                <Circle size={6} className="fill-current status-dot-active" />
+                {activeCount} active
+              </span>
+            )}
+          </div>
+
+          <h3 className="text-[14px] font-semibold truncate mb-1" style={{ color: 'var(--text-primary)' }}>
+            {folder.name}
+            {childIds.length > 0 && (
+              <span className="ml-1.5 text-[10px] font-normal" style={{ color: 'var(--text-muted)' }}>
+                ({childIds.length} sub)
+              </span>
+            )}
+          </h3>
+
+          <div className="flex items-center gap-3 text-[12px] mb-2" style={{ color: 'var(--text-muted)' }}>
+            <span className="flex items-center gap-1">
+              <Users size={12} />
+              {folderProfiles.length} instance{folderProfiles.length !== 1 ? 's' : ''}
+            </span>
+            {lastActivity && (
+              <span>{formatDate(lastActivity)}</span>
+            )}
+          </div>
+
+          {folderProfiles.length > 0 && (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {getPlatformSummary(folderProfiles).slice(0, 4).map(p => (
+                <span key={p.label} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px]" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
+                  {p.icon} {p.count}
+                </span>
+              ))}
+            </div>
+          )}
+        </button>
+      );
+    };
+
+    const renderUnassignedCard = (items: Profile[], key = 'unassigned') => (
+      <button
+        key={key}
+        onClick={() => onSelectFolder('__none__')}
+        className="text-left p-5 rounded-xl transition-all"
+        style={{
+          background: 'var(--bg-surface)',
+          border: '1px dashed var(--border-default)',
+        }}
+        onMouseEnter={e => {
+          e.currentTarget.style.borderColor = 'var(--text-muted)';
+        }}
+        onMouseLeave={e => {
+          e.currentTarget.style.borderColor = 'var(--border-default)';
+        }}
+      >
+        <div className="flex items-start justify-between mb-3">
+          <div className="w-12 h-12 rounded-xl flex items-center justify-center text-xl" style={{ background: 'var(--bg-elevated)' }}>
+            <FolderOpen size={20} style={{ color: 'var(--text-muted)' }} />
+          </div>
+        </div>
+        <h3 className="text-[14px] font-semibold truncate mb-1" style={{ color: 'var(--text-secondary)' }}>
+          Unassigned
+        </h3>
+        <div className="flex items-center gap-1 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+          <Users size={12} />
+          {items.length} instance{items.length !== 1 ? 's' : ''}
+        </div>
+      </button>
+    );
 
     if (loading) {
       return (
@@ -441,116 +569,36 @@ const Dashboard: React.FC<DashboardProps> = ({
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-              {filteredFolders.map(folder => {
-                const childIds = getChildFolderIds(folder.id);
-                const folderProfiles = profiles.filter(p => p.folderId === folder.id || childIds.includes(p.folderId || ''));
-                const activeCount = folderProfiles.filter(p => activeProfiles.includes(p.id)).length;
-                const lastActivity = folderProfiles.reduce((max, p) => {
-                  const t = p.lastUsed || p.createdAt || '';
-                  return t > max ? t : max;
-                }, '');
-
-                return (
-                  <button
-                    key={folder.id}
-                    onClick={() => onSelectFolder(folder.id)}
-                    className="text-left p-5 rounded-xl transition-all group"
-                    style={{
-                      background: 'var(--bg-surface)',
-                      border: '1px solid var(--border-default)',
-                    }}
-                    onMouseEnter={e => {
-                      e.currentTarget.style.borderColor = 'var(--accent)';
-                      e.currentTarget.style.boxShadow = '0 4px 20px rgba(99, 102, 241, 0.1)';
-                    }}
-                    onMouseLeave={e => {
-                      e.currentTarget.style.borderColor = 'var(--border-default)';
-                      e.currentTarget.style.boxShadow = 'none';
-                    }}
-                  >
-                    {/* Icon + Active badge */}
-                    <div className="flex items-start justify-between mb-3">
-                      <div
-                        className="w-12 h-12 rounded-xl flex items-center justify-center text-xl"
-                        style={{ background: folder.color ? `${folder.color}20` : 'var(--bg-elevated)' }}
-                      >
-                        <span style={{ color: folder.color }}>{folder.icon || '\uD83D\uDCC1'}</span>
+            isSuperAdmin ? (
+              <div className="space-y-8">
+                {teamSections.map(section => (
+                  <section key={section.teamId}>
+                    <div className="flex items-center justify-between mb-3">
+                      <div>
+                        <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+                          {section.teamName}
+                        </h2>
+                        <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                          {section.folders.length} folder{section.folders.length !== 1 ? 's' : ''} &middot; {section.profileCount} instance{section.profileCount !== 1 ? 's' : ''}
+                        </p>
                       </div>
-                      {activeCount > 0 && (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold" style={{ background: 'var(--success-subtle)', color: 'var(--success)' }}>
-                          <Circle size={6} className="fill-current status-dot-active" />
-                          {activeCount} active
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Name */}
-                    <h3 className="text-[14px] font-semibold truncate mb-1" style={{ color: 'var(--text-primary)' }}>
-                      {folder.name}
-                      {childIds.length > 0 && (
-                        <span className="ml-1.5 text-[10px] font-normal" style={{ color: 'var(--text-muted)' }}>
-                          ({childIds.length} sub)
-                        </span>
-                      )}
-                    </h3>
-
-                    {/* Stats */}
-                    <div className="flex items-center gap-3 text-[12px] mb-2" style={{ color: 'var(--text-muted)' }}>
-                      <span className="flex items-center gap-1">
-                        <Users size={12} />
-                        {folderProfiles.length} instance{folderProfiles.length !== 1 ? 's' : ''}
+                      <span className="text-[10px] px-2 py-1 rounded-md" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
+                        {section.teamId}
                       </span>
-                      {lastActivity && (
-                        <span>{formatDate(lastActivity)}</span>
-                      )}
                     </div>
-
-                    {/* Platform summary */}
-                    {folderProfiles.length > 0 && (
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        {getPlatformSummary(folderProfiles).slice(0, 4).map(p => (
-                          <span key={p.label} className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px]" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
-                            {p.icon} {p.count}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
-
-              {/* Unassigned card */}
-              {filteredUnassigned.length > 0 && (
-                <button
-                  onClick={() => onSelectFolder('__none__')}
-                  className="text-left p-5 rounded-xl transition-all"
-                  style={{
-                    background: 'var(--bg-surface)',
-                    border: '1px dashed var(--border-default)',
-                  }}
-                  onMouseEnter={e => {
-                    e.currentTarget.style.borderColor = 'var(--text-muted)';
-                  }}
-                  onMouseLeave={e => {
-                    e.currentTarget.style.borderColor = 'var(--border-default)';
-                  }}
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="w-12 h-12 rounded-xl flex items-center justify-center text-xl" style={{ background: 'var(--bg-elevated)' }}>
-                      <FolderOpen size={20} style={{ color: 'var(--text-muted)' }} />
+                    <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                      {section.folders.map(renderFolderCard)}
+                      {section.unassigned.length > 0 && renderUnassignedCard(section.unassigned, `unassigned-${section.teamId}`)}
                     </div>
-                  </div>
-                  <h3 className="text-[14px] font-semibold truncate mb-1" style={{ color: 'var(--text-secondary)' }}>
-                    Unassigned
-                  </h3>
-                  <div className="flex items-center gap-1 text-[12px]" style={{ color: 'var(--text-muted)' }}>
-                    <Users size={12} />
-                    {filteredUnassigned.length} instance{filteredUnassigned.length !== 1 ? 's' : ''}
-                  </div>
-                </button>
-              )}
-            </div>
+                  </section>
+                ))}
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {filteredFolders.map(renderFolderCard)}
+                {filteredUnassigned.length > 0 && renderUnassignedCard(filteredUnassigned)}
+              </div>
+            )
           )}
         </div>
       </div>

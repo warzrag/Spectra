@@ -26,6 +26,7 @@ import {
   subscribeToProfiles,
   subscribeToFolders,
   subscribeToExtensions,
+  subscribeToTeams,
   createProfile as firestoreCreateProfile,
   updateProfile as firestoreUpdateProfile,
   deleteProfile as firestoreDeleteProfile,
@@ -35,7 +36,7 @@ import {
   migrateLocalProfiles,
   migrateExistingDataToTeam,
 } from './services/firestore-service';
-import { Profile, Folder, Extension, AppPage, AppSettings, AppUser } from '../types';
+import { Profile, Folder, Extension, Team, AppPage, AppSettings, AppUser } from '../types';
 import {
   uploadProfileToCloud,
   downloadProfileFromCloud,
@@ -167,6 +168,7 @@ function App() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [extensions, setExtensions] = useState<Extension[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
   const [loading, setLoading] = useState(true);
   const [activePage, setActivePage] = useState<AppPage>('profiles');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
@@ -328,10 +330,15 @@ function App() {
       setExtensions(allExtensions);
     });
 
+    const unsubTeams = user.role === 'super_admin'
+      ? subscribeToTeams(setTeams)
+      : () => setTeams([]);
+
     return () => {
       unsubProfiles();
       unsubFolders();
       unsubExtensions();
+      unsubTeams();
     };
   }, [user]);
 
@@ -841,6 +848,7 @@ function App() {
           <Dashboard
             profiles={visibleProfiles}
             folders={visibleFolders}
+            teams={teams}
             loading={loading}
             selectedFolderId={selectedFolderId}
             onSelectFolder={setSelectedFolderId}
@@ -927,6 +935,7 @@ function App() {
             activePage={activePage}
             onNavigate={setActivePage}
             folders={visibleFolders}
+            teams={teams}
             selectedFolderId={selectedFolderId}
             profileCounts={profileCounts}
             totalProfiles={visibleProfiles.length}

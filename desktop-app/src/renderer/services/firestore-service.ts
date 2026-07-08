@@ -1,9 +1,10 @@
 import { collection, addDoc, getDocs, query, orderBy, limit, where, startAfter, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, Unsubscribe } from 'firebase/firestore';
 import { db } from './firebase';
-import { ActivityLogEntry, UserProfile, Profile, Folder, Extension } from '../../types';
+import { ActivityLogEntry, UserProfile, Profile, Folder, Extension, Team } from '../../types';
 
 const ACTIVITY_COLLECTION = 'activityLogs';
 const USERS_COLLECTION = 'users';
+const TEAMS_COLLECTION = 'teams';
 const PROFILES_COLLECTION = 'profiles';
 const FOLDERS_COLLECTION = 'folders';
 const EXTENSIONS_COLLECTION = 'extensions';
@@ -91,6 +92,19 @@ export async function getAllUsers(teamId?: string): Promise<UserProfile[]> {
     console.error('Failed to get users:', error);
     return [];
   }
+}
+
+export function subscribeToTeams(callback: (teams: Team[]) => void): Unsubscribe {
+  const q = query(collection(db, TEAMS_COLLECTION), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snapshot) => {
+    const teams: Team[] = snapshot.docs.map(d => ({
+      id: d.id,
+      ...d.data(),
+    })) as Team[];
+    callback(teams);
+  }, (error) => {
+    console.error('Teams subscription error:', error);
+  });
 }
 
 // ── Profiles (Cloud Sync) ──────────────────────────────────────
