@@ -48,6 +48,46 @@ export class PuppeteerLauncher {
     return this.activeProfiles.has(profileId);
   }
 
+  private static focusProfileWindow(profileId: string): boolean {
+    const instance = this.activeProfiles.get(profileId);
+    const pid = instance?.chromeProcess?.pid;
+    if (!pid || process.platform !== 'win32') return false;
+
+    const ps = `
+      Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+      $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue
+      if ($p) {
+        $deadline = (Get-Date).AddSeconds(3)
+        while ($p.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline) {
+          Start-Sleep -Milliseconds 150
+          $p.Refresh()
+        }
+        if ($p.MainWindowHandle -ne 0) {
+          [Win32]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+          [Win32]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+        }
+      }
+    `;
+
+    try {
+      spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+        detached: true,
+        stdio: 'ignore',
+      }).unref();
+      return true;
+    } catch (error) {
+      console.error(`[WindowFocus] Failed to focus profile ${profileId}:`, error);
+      return false;
+    }
+  }
+
   private static getWindowPlacement(layout?: { index: number; total: number }) {
     let workArea = { x: 0, y: 0, width: 1920, height: 1080 };
 
@@ -370,6 +410,7 @@ public class Win32 {
       if (this.isProfileActive(options.profileId)) {
         const instance = this.activeProfiles.get(options.profileId);
         if (instance && instance.chromeProcess && !instance.chromeProcess.killed) {
+          this.focusProfileWindow(options.profileId);
           return { success: false, error: 'Profile already running', alreadyRunning: true };
         }
       }
