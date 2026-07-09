@@ -311,7 +311,12 @@ export function subscribeToExtensions(teamId: string | null | undefined, callbac
 
 export async function registerExtension(ext: Omit<Extension, 'id'> & { id: string }, teamId: string): Promise<void> {
   const { id, ...data } = ext;
-  await setDoc(doc(db, EXTENSIONS_COLLECTION, id), { ...data, teamId });
+  const teamExtensionId = id.startsWith(`${teamId}_`) ? id : `${teamId}_${id}`;
+  await setDoc(doc(db, EXTENSIONS_COLLECTION, teamExtensionId), { ...data, teamId });
+
+  if (teamExtensionId !== id) {
+    await deleteDoc(doc(db, EXTENSIONS_COLLECTION, id)).catch(() => {});
+  }
 }
 
 export async function setExtensionEnabled(extensionId: string, enabled: boolean): Promise<void> {

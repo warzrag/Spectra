@@ -64,7 +64,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
         // Helper: get a fresh download URL (stored URLs may have expired tokens)
         const getFreshUrl = async (): Promise<string> => {
           try {
-            const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+            const storageRef = ref(storage, ext.teamId ? `extensions/${ext.teamId}/${ext.id}.zip` : `extensions/${ext.id}.zip`);
             return await getDownloadURL(storageRef);
           } catch {
             // Fallback to stored URL
@@ -137,7 +137,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
     try {
       const zipPath = await window.electronAPI.extensions!.zip(ext.id);
       const zipBuffer = await window.electronAPI.extensions!.readZip(zipPath);
-      const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+      const storageRef = ref(storage, `extensions/${teamId}/${ext.id}.zip`);
       await uploadBytes(storageRef, new Uint8Array(zipBuffer));
       storageUrl = await getDownloadURL(storageRef);
     } catch (e) {
@@ -177,7 +177,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
       try {
         const zipPath = await window.electronAPI.extensions!.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions!.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${teamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -267,7 +267,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
       try {
         const zipPath = await window.electronAPI.extensions.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${ext.teamId || teamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -316,7 +316,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
       try {
         const zipPath = await window.electronAPI.extensions.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${ext.teamId || teamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
