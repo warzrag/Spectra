@@ -247,6 +247,12 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
 
   const handleUpdate = async (ext: Extension) => {
     if (!window.electronAPI?.extensions) return;
+    const targetTeamId = ext.teamId || teamId;
+    if (!targetTeamId) {
+      showToast('This extension has no team. Reassign it before updating.', 'warning');
+      return;
+    }
+
     setUpdating(ext.id);
     try {
       // Ask user to pick new file or folder
@@ -267,7 +273,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
       try {
         const zipPath = await window.electronAPI.extensions.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.teamId || teamId}/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${targetTeamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -285,7 +291,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
         storageUrl,
         createdAt: ext.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      }, teamId);
+      }, targetTeamId);
 
       showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
     } catch (error) {
@@ -298,6 +304,12 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
 
   const handleUpdateFolder = async (ext: Extension) => {
     if (!window.electronAPI?.extensions?.selectFolder) return;
+    const targetTeamId = ext.teamId || teamId;
+    if (!targetTeamId) {
+      showToast('This extension has no team. Reassign it before updating.', 'warning');
+      return;
+    }
+
     setUpdating(ext.id);
     try {
       const folderPath = await window.electronAPI.extensions.selectFolder();
@@ -316,7 +328,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
       try {
         const zipPath = await window.electronAPI.extensions.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.teamId || teamId}/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${targetTeamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -333,7 +345,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
         storageUrl,
         createdAt: ext.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      }, teamId);
+      }, targetTeamId);
 
       showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
     } catch (error) {

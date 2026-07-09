@@ -310,6 +310,10 @@ export function subscribeToExtensions(teamId: string | null | undefined, callbac
 }
 
 export async function registerExtension(ext: Omit<Extension, 'id'> & { id: string }, teamId: string): Promise<void> {
+  if (!teamId) {
+    throw new Error('Cannot register extension without a teamId');
+  }
+
   const { id, ...data } = ext;
   const teamExtensionId = id.startsWith(`${teamId}_`) ? id : `${teamId}_${id}`;
   await setDoc(doc(db, EXTENSIONS_COLLECTION, teamExtensionId), { ...data, teamId });
