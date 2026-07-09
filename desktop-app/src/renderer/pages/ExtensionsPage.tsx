@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link, ChevronDown, ChevronRight } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
-import { Extension, Team } from '../../types';
+import { Extension, Team, UserProfile } from '../../types';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { storage } from '../services/firebase';
 import {
   subscribeToExtensions,
+  getAllUsers,
   registerExtension,
   setExtensionEnabled,
   unregisterExtension,
@@ -25,6 +26,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
   const [storeUrl, setStoreUrl] = useState('');
   const [installingFromStore, setInstallingFromStore] = useState(false);
   const [expandedTeamIds, setExpandedTeamIds] = useState<Set<string>>(new Set());
+  const [users, setUsers] = useState<UserProfile[]>([]);
 
   // Subscribe to Firestore extensions (super admin = global, others = scoped by teamId)
   useEffect(() => {
@@ -33,6 +35,16 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
       setLoading(false);
     });
     return () => unsub();
+  }, [teamId]);
+
+  useEffect(() => {
+    if (teamId !== null) return;
+    getAllUsers()
+      .then(setUsers)
+      .catch((error) => {
+        console.error('Failed to load extension team members:', error);
+        setUsers([]);
+      });
   }, [teamId]);
 
   // Check which extensions are installed locally + auto-download missing/outdated ones
@@ -352,15 +364,26 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
   }
 
   const isGlobalView = teamId === null;
-  const teamNameById = new Map(teams.map(team => [team.id, team.name]));
+  const teamById = new Map(teams.map(team => [team.id, team]));
   const teamSections = Array.from(new Set(extensions.map(ext => ext.teamId || 'unknown')))
-    .map(sectionTeamId => ({
-      teamId: sectionTeamId,
-      teamName: teamNameById.get(sectionTeamId) || (sectionTeamId === 'unknown' ? 'No team' : `Team ${sectionTeamId.slice(0, 6)}`),
-      extensions: extensions.filter(ext => (ext.teamId || 'unknown') === sectionTeamId),
-    }))
+    .map(sectionTeamId => {
+      const team = teamById.get(sectionTeamId);
+      const members = users.filter(user => (user.teamId || 'unknown') === sectionTeamId);
+      const owner = team?.ownerId
+        ? users.find(user => user.uid === team.ownerId)
+        : members.find(user => user.role === 'owner' || user.role === 'super_admin');
+      const otherMembers = members.filter(user => user.uid !== owner?.uid);
+
+      return {
+        teamId: sectionTeamId,
+        teamName: team?.name || owner?.email || (sectionTeamId === 'unknown' ? 'No team' : `Team ${sectionTeamId.slice(0, 6)}`),
+        ownerEmail: owner?.email || (team?.name?.includes('@') ? team.name : ''),
+        members: otherMembers,
+        extensions: extensions.filter(ext => (ext.teamId || 'unknown') === sectionTeamId),
+      };
+    })
     .filter(section => section.extensions.length > 0)
-    .sort((a, b) => a.teamName.localeCompare(b.teamName));
+    .sort((a, b) => (a.ownerEmail || a.teamName).localeCompare(b.ownerEmail || b.teamName));
 
   const renderExtensionRow = (ext: Extension) => {
     const isLocal = localInstalled.has(ext.id);
@@ -547,7 +570,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
                     <FolderOpen size={18} />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 min-w-0">
+                    <div className="flex items-center gap-2 min-w-0 mb-1">
                       <h2 className="text-[14px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
                         {section.teamName}
                       </h2>
@@ -555,7 +578,32 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
                         {section.extensions.length} extension{section.extensions.length !== 1 ? 's' : ''}
                       </span>
                     </div>
-                    <p className="text-[10px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
+                    <div className="flex items-center gap-2 flex-wrap text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                      <span className="truncate max-w-[260px]">
+                        Owner: <span style={{ color: 'var(--text-secondary)' }}>{section.ownerEmail || 'inconnu'}</span>
+                      </span>
+                      <span>·</span>
+                      <span className="truncate max-w-[360px]">
+                        Membres: <span style={{ color: 'var(--text-secondary)' }}>
+                          {section.members.length > 0
+                            ? section.members.map(member => member.email).join(', ')
+                            : 'aucun'}
+                        </span>
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                      {section.extensions.slice(0, 4).map(ext => (
+                        <span key={ext.id} className="text-[10px] px-1.5 py-0.5 rounded-md truncate max-w-[180px]" style={{ background: ext.enabled ? 'var(--accent-subtle)' : 'var(--bg-elevated)', color: ext.enabled ? 'var(--accent-light)' : 'var(--text-muted)' }}>
+                          {ext.name}
+                        </span>
+                      ))}
+                      {section.extensions.length > 4 && (
+                        <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                          +{section.extensions.length - 4}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[9px] mt-1 truncate" style={{ color: 'var(--text-muted)', opacity: 0.65 }}>
                       {section.teamId}
                     </p>
                   </div>
