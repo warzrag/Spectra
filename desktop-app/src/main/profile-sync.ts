@@ -31,6 +31,7 @@ const ESSENTIAL_FILES = new Set([
 // Directories in Default/ to sync entirely (contain session/identity data)
 // Note: Extensions are synced separately via Firebase (ExtensionsPage), not here
 const ESSENTIAL_DIRS = new Set([
+  'Network',
   'Local Storage',
   'Session Storage',
   'IndexedDB',
