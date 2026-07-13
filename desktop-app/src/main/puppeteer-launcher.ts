@@ -437,9 +437,10 @@ public class Win32 {
       }
       const placement = this.getWindowPlacement(options.windowLayout);
       this.applyCleanLaunchState(profilePath, prefs);
-      if (options.autoStartTwitterBot) {
-        this.clearChromeSessionRestore(profilePath);
-      }
+      // Always discard Chrome's stale tab/session files. The URL Spectra should
+      // reopen is tracked separately, and stale sessions can make Chrome exit
+      // before showing a window on an individual launch.
+      this.clearChromeSessionRestore(profilePath);
       prefs.browser = {
         ...(prefs.browser || {}),
         window_placement: {
