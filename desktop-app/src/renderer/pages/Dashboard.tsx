@@ -187,14 +187,14 @@ const Dashboard: React.FC<DashboardProps> = ({
   );
 
   const handleSelectProfile = (profileId: string) => {
-    if (!isAdmin) return;
+    if (!isAdmin && !isVA) return;
     setSelectedProfiles(prev =>
       prev.includes(profileId) ? prev.filter(id => id !== profileId) : [...prev, profileId]
     );
   };
 
   const handleSelectAll = () => {
-    if (!isAdmin) return;
+    if (!isAdmin && !isVA) return;
     if (selectedProfiles.length === filteredProfiles.length) {
       setSelectedProfiles([]);
     } else {
@@ -749,6 +749,26 @@ const Dashboard: React.FC<DashboardProps> = ({
               )}
             </>
           )}
+          {isVA && selectedProfiles.length > 0 && (
+            <button
+              onClick={() => onBulkLaunch(selectedProfiles)}
+              disabled={!!bulkLaunching}
+              className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors"
+              style={{ background: 'var(--success-subtle, rgba(34,197,94,0.1))', border: '1px solid var(--success, #22c55e)', color: 'var(--success, #22c55e)' }}
+            >
+              {bulkLaunching ? (
+                <>
+                  <Loader2 size={14} className="animate-spin" />
+                  {bulkLaunching.current}/{bulkLaunching.total}
+                </>
+              ) : (
+                <>
+                  <Rocket size={14} />
+                  Open selected ({selectedProfiles.length})
+                </>
+              )}
+            </button>
+          )}
           <span className="text-[12px] tabular-nums" style={{ color: 'var(--text-muted)' }}>
             {filteredProfiles.length} instance{filteredProfiles.length !== 1 ? 's' : ''}
           </span>
@@ -858,7 +878,7 @@ const Dashboard: React.FC<DashboardProps> = ({
           <table className="profile-table w-full">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                {isAdmin && (
+                {(isAdmin || isVA) && (
                   <th className="w-10 px-3 py-2.5 text-left">
                     <input
                       type="checkbox"
@@ -930,7 +950,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                     onDrop={(e) => { if (!isAdmin) return; e.preventDefault(); handleDrop(profile.id); }}
                     onDragEnd={() => { setDragId(null); setDragOverId(null); }}
                   >
-                    {isAdmin && (
+                    {(isAdmin || isVA) && (
                       <td className="px-3 py-2.5">
                         <input
                           type="checkbox"
