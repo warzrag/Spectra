@@ -375,6 +375,47 @@ public class Win32 {
     }).unref();
   }
 
+  private static spawnChromeAndVerify(
+    chromePath: string,
+    args: string[],
+    env: Record<string, string | undefined>
+  ): Promise<ChildProcess> {
+    return new Promise((resolve, reject) => {
+      const chromeProcess = spawn(chromePath, args, {
+        detached: false,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: env as any,
+      });
+
+      let settled = false;
+      let stderr = '';
+      let startupTimer: NodeJS.Timeout;
+      const onStderr = (chunk: Buffer) => {
+        stderr = (stderr + chunk.toString()).slice(-4000);
+      };
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(startupTimer);
+        chromeProcess.removeListener('error', onError);
+        chromeProcess.removeListener('exit', onEarlyExit);
+        chromeProcess.stderr?.removeListener('data', onStderr);
+        if (error) reject(error);
+        else resolve(chromeProcess);
+      };
+      const onError = (error: Error) => finish(new Error(`Chrome could not start: ${error.message}`));
+      const onEarlyExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        const detail = stderr.trim().replace(/\s+/g, ' ').slice(-500);
+        finish(new Error(`Chrome closed during startup (code ${code ?? 'unknown'}${signal ? `, signal ${signal}` : ''})${detail ? `: ${detail}` : ''}`));
+      };
+      startupTimer = setTimeout(() => finish(), 1500);
+
+      chromeProcess.stderr?.on('data', onStderr);
+      chromeProcess.once('error', onError);
+      chromeProcess.once('exit', onEarlyExit);
+    });
+  }
+
   /**
    * Clean Chrome-internal state from a profile directory to fix version incompatibility.
    */
@@ -717,11 +758,16 @@ setTimeout(exportCookies, 5000);
       }
 
       // === SPAWN Chrome — no Puppeteer, no CDP, no debug port ===
-      const chromeProcess = spawn(chromePath, args, {
-        detached: false,
-        stdio: 'ignore',
-        env: cleanEnv as any,
-      });
+      // Verify that the process survives startup. Some VPS/RDP machines reject
+      // normal GPU initialization and previously looked like a successful launch.
+      let chromeProcess: ChildProcess;
+      try {
+        chromeProcess = await this.spawnChromeAndVerify(chromePath, args, cleanEnv);
+      } catch (firstError: any) {
+        if (process.platform !== 'win32') throw firstError;
+        console.warn(`[Chrome] Standard startup failed, retrying in VPS compatibility mode: ${firstError.message}`);
+        chromeProcess = await this.spawnChromeAndVerify(chromePath, [...args, '--disable-gpu'], cleanEnv);
+      }
       this.enforceWindowPlacement(chromeProcess.pid, placement);
 
       console.log(`[Chrome] Process spawned (PID: ${chromeProcess.pid}) — CDP-free`);
@@ -734,24 +780,36 @@ setTimeout(exportCookies, 5000);
         localProxyServer,
       });
 
-      // Monitor Chrome process exit
-      chromeProcess.on('exit', (code, signal) => {
-        console.log(`[Chrome] Process exited (code: ${code}) for profile: ${options.profileId}`);
-        // Close local proxy server
+      let processCleanedUp = false;
+      const cleanupChromeProcess = () => {
+        if (processCleanedUp) return;
+        processCleanedUp = true;
+
         if (localProxyServer) {
           localProxyServer.close();
           console.log(`[Proxy] Local relay closed for profile: ${options.profileId}`);
         }
-
-        // Save last URL from open_tabs.json (updated by extension or Chrome itself)
-        // Note: Without CDP we can't export cookies on exit, but Chrome saves them
-        // to its native Cookies DB which is included in profile sync
 
         this.activeProfiles.delete(options.profileId);
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('profiles:activeUpdate', Array.from(this.activeProfiles.keys()));
           this.mainWindow.webContents.send('profile:closed', options.profileId);
         }
+      };
+
+      chromeProcess.on('error', (error) => {
+        console.error(`[Chrome] Process error for profile ${options.profileId}:`, error);
+        cleanupChromeProcess();
+      });
+
+      // Monitor Chrome process exit
+      chromeProcess.on('exit', (code, signal) => {
+        console.log(`[Chrome] Process exited (code: ${code}) for profile: ${options.profileId}`);
+
+        // Save last URL from open_tabs.json (updated by extension or Chrome itself)
+        // Note: Without CDP we can't export cookies on exit, but Chrome saves them
+        // to its native Cookies DB which is included in profile sync
+        cleanupChromeProcess();
       });
 
       console.log(`Chrome launched successfully for profile: ${options.profileId}`);
