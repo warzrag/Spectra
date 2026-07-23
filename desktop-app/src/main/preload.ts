@@ -65,6 +65,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     hasLocalData: (profileId: string) => ipcRenderer.invoke('profile:hasLocalData', profileId),
     getLocalSyncVersion: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncVersion', profileId),
     setLocalSyncVersion: (profileId: string, version: number) => ipcRenderer.invoke('profile:setLocalSyncVersion', profileId, version),
+    getLocalSyncRevision: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncRevision', profileId),
+    setLocalSyncRevision: (profileId: string, revision: string) => ipcRenderer.invoke('profile:setLocalSyncRevision', profileId, revision),
     getHostname: () => ipcRenderer.invoke('system:hostname'),
     onProfileClosed: (callback: (profileId: string) => void) => {
       const listener = (_event: any, profileId: string) => callback(profileId);

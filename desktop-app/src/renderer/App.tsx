@@ -134,6 +134,8 @@ declare global {
         hasLocalData: (profileId: string) => Promise<boolean>;
         getLocalSyncVersion: (profileId: string) => Promise<number>;
         setLocalSyncVersion: (profileId: string, version: number) => Promise<boolean>;
+        getLocalSyncRevision: (profileId: string) => Promise<string | null>;
+        setLocalSyncRevision: (profileId: string, revision: string) => Promise<boolean>;
         getHostname: () => Promise<string>;
         onProfileClosed: (callback: (profileId: string) => void) => () => void;
       };
@@ -660,8 +662,7 @@ function App() {
           setSyncProgress({ profileId: profile.id, percent: 0, type: 'download', profileName: profile.name });
           showToast('Téléchargement du profil depuis le cloud...', 'info');
           await downloadProfileFromCloud(
-            profile.id,
-            profile.cloudSyncVersion!,
+            profile,
             (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
           );
           setSyncProgress(null);
@@ -670,13 +671,10 @@ function App() {
       } catch (dlError) {
         console.error('Cloud download failed:', dlError);
         setSyncProgress(null);
-        // Continue with local data if available, or show error
-        const hasLocal = await window.electronAPI?.profileSync?.hasLocalData(profile.id);
-        if (!hasLocal) {
-          showToast('Échec du téléchargement du profil', 'error');
-          await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
-          return;
-        }
+        // Never upload a stale local copy over a newer cloud revision.
+        showToast('Échec du téléchargement du profil - lancement annulé', 'error');
+        await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
+        return;
       }
 
       // Get enabled extensions and auto-download missing ones from cloud

@@ -11,7 +11,15 @@ import ProxyManager from './proxy-manager';
 import NetworkManager from './network-manager';
 import { installExtension, updateExtension, getInstalledExtensions, removeExtension, getExtensionPaths, zipExtension, readZipFile, downloadAndInstallExtension } from './extension-manager';
 import { generateFingerprint } from './fingerprint-generator';
-import { zipProfileDir, unzipProfileDir, profileDirExists, getLocalSyncVersion, setLocalSyncVersion } from './profile-sync';
+import {
+  zipProfileDir,
+  unzipProfileDir,
+  profileDirExists,
+  getLocalSyncVersion,
+  setLocalSyncVersion,
+  getLocalSyncRevision,
+  setLocalSyncRevision,
+} from './profile-sync';
 
 const Store = require('electron-store');
 
@@ -453,6 +461,15 @@ ipcMain.handle('profile:getLocalSyncVersion', (_, profileId: string) => {
 
 ipcMain.handle('profile:setLocalSyncVersion', (_, profileId: string, version: number) => {
   setLocalSyncVersion(profileId, version);
+  return true;
+});
+
+ipcMain.handle('profile:getLocalSyncRevision', (_, profileId: string) => {
+  return getLocalSyncRevision(profileId);
+});
+
+ipcMain.handle('profile:setLocalSyncRevision', (_, profileId: string, revision: string) => {
+  setLocalSyncRevision(profileId, revision);
   return true;
 });
 

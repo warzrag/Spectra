@@ -90,6 +90,8 @@ export interface Profile {
   cloudSyncedAt?: string;
   cloudSyncSize?: number;
   cloudSyncVersion?: number;
+  cloudSyncRevision?: string;
+  cloudSyncedBy?: string;
 
   // Profile lock
   lockedBy?: string | null;

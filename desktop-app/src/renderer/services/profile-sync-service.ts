@@ -1,8 +1,7 @@
-import { ref, uploadBytesResumable, getDownloadURL, getBlob } from 'firebase/storage';
-import { doc, getDoc } from 'firebase/firestore';
+import { ref, uploadBytes, uploadBytesResumable, getDownloadURL, getBlob } from 'firebase/storage';
+import { doc, runTransaction } from 'firebase/firestore';
 import { storage } from './firebase';
 import { db } from './firebase';
-import { updateProfile } from './firestore-service';
 import { Profile } from '../../types';
 
 const STALE_LOCK_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -21,8 +20,10 @@ export async function uploadProfileToCloud(
   const zipData = new Uint8Array(result.buffer);
   console.log(`[ProfileSync] Zip ready: ${(result.size / 1024 / 1024).toFixed(2)} MB`);
 
-  // 2. Upload to Firebase Storage with progress
-  const storageRef = ref(storage, `profiles/${profileId}/profile.zip`);
+  // Upload an immutable revision so concurrent PCs cannot overwrite the bytes
+  // behind a version that another machine already considers current.
+  const revisionId = `${Date.now()}-${crypto.randomUUID()}`;
+  const storageRef = ref(storage, `profiles/${profileId}/revisions/${revisionId}.zip`);
   const uploadTask = uploadBytesResumable(storageRef, zipData);
 
   await new Promise<void>((resolve, reject) => {
@@ -39,35 +40,50 @@ export async function uploadProfileToCloud(
   // 3. Get download URL
   const downloadUrl = await getDownloadURL(storageRef);
 
-  // 4. Update Firestore metadata
-  const localVersion = await (window as any).electronAPI.profileSync.getLocalSyncVersion(profileId);
-  const newVersion = (localVersion || 0) + 1;
+  // Keep a transition mirror for clients older than the revision protocol.
+  // New clients never use this mutable object when a valid revision URL exists.
+  await uploadBytes(ref(storage, `profiles/${profileId}/profile.zip`), zipData);
 
-  await updateProfile(profileId, {
-    cloudStorageUrl: downloadUrl,
-    cloudSyncedAt: new Date().toISOString(),
-    cloudSyncSize: result.size,
-    cloudSyncVersion: newVersion,
-  } as any);
+  // Allocate the next cloud version atomically from the server value.
+  const profileRef = doc(db, 'profiles', profileId);
+  let newVersion = 0;
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(profileRef);
+    if (!snapshot.exists()) throw new Error('Profile no longer exists');
+
+    newVersion = Number(snapshot.data().cloudSyncVersion || 0) + 1;
+    transaction.update(profileRef, {
+      cloudStorageUrl: downloadUrl,
+      cloudSyncedAt: new Date().toISOString(),
+      cloudSyncSize: result.size,
+      cloudSyncVersion: newVersion,
+      cloudSyncRevision: revisionId,
+      cloudSyncedBy: currentUser.uid,
+    });
+  });
 
   // 5. Update local sync version
   await (window as any).electronAPI.profileSync.setLocalSyncVersion(profileId, newVersion);
-  console.log(`[ProfileSync] Upload complete, version=${newVersion}`);
+  await (window as any).electronAPI.profileSync.setLocalSyncRevision(profileId, revisionId);
+  console.log(`[ProfileSync] Upload complete, version=${newVersion}, revision=${revisionId}`);
 }
 
 /**
  * Download a Chrome profile from Firebase Storage before launching.
  */
 export async function downloadProfileFromCloud(
-  profileId: string,
-  cloudSyncVersion: number,
+  profile: Profile,
   onProgress?: (percent: number) => void
 ): Promise<void> {
+  const profileId = profile.id;
+  const cloudSyncVersion = Number(profile.cloudSyncVersion || 0);
   console.log(`[ProfileSync] Starting download for ${profileId}`);
   onProgress?.(10);
 
   // 1. Download zip from Firebase Storage
-  const storageRef = ref(storage, `profiles/${profileId}/profile.zip`);
+  const storageRef = profile.cloudStorageUrl
+    ? ref(storage, profile.cloudStorageUrl)
+    : ref(storage, `profiles/${profileId}/profile.zip`);
   const blob = await getBlob(storageRef);
   const arrayBuffer = await blob.arrayBuffer();
   const zipData = new Uint8Array(arrayBuffer);
@@ -80,8 +96,12 @@ export async function downloadProfileFromCloud(
 
   // 3. Update local sync version
   await (window as any).electronAPI.profileSync.setLocalSyncVersion(profileId, cloudSyncVersion);
+  const expectedRevision = getExpectedCloudRevision(profile);
+  if (expectedRevision) {
+    await (window as any).electronAPI.profileSync.setLocalSyncRevision(profileId, expectedRevision);
+  }
   onProgress?.(100);
-  console.log(`[ProfileSync] Download complete, version=${cloudSyncVersion}`);
+  console.log(`[ProfileSync] Download complete, version=${cloudSyncVersion}, revision=${profile.cloudSyncRevision || 'legacy'}`);
 }
 
 /**
@@ -93,8 +113,28 @@ export async function needsCloudDownload(profile: Profile): Promise<boolean> {
   const hasLocal = await (window as any).electronAPI.profileSync.hasLocalData(profile.id);
   if (!hasLocal) return true;
 
+  if (profile.cloudSyncRevision) {
+    const localRevision = await (window as any).electronAPI.profileSync.getLocalSyncRevision(profile.id);
+    return localRevision !== getExpectedCloudRevision(profile);
+  }
+
   const localVersion = await (window as any).electronAPI.profileSync.getLocalSyncVersion(profile.id);
-  return profile.cloudSyncVersion > localVersion;
+  return Number(profile.cloudSyncVersion) > Number(localVersion || 0);
+}
+
+function getExpectedCloudRevision(profile: Profile): string | null {
+  if (!profile.cloudSyncRevision) return null;
+
+  // Older Spectra clients overwrite cloudStorageUrl with the mutable legacy
+  // profile.zip without clearing cloudSyncRevision. Treat that write as its own
+  // revision so updated clients download it instead of incorrectly skipping.
+  const urlPointsToRevision = Boolean(
+    profile.cloudStorageUrl &&
+    profile.cloudStorageUrl.includes(profile.cloudSyncRevision)
+  );
+  if (urlPointsToRevision) return profile.cloudSyncRevision;
+
+  return `legacy:${profile.cloudSyncedAt || 'unknown'}:${Number(profile.cloudSyncVersion || 0)}`;
 }
 
 /**
@@ -130,12 +170,31 @@ export async function acquireProfileLock(
     deviceName = await (window as any).electronAPI.profileSync.getHostname();
   } catch {}
 
-  await updateProfile(profileId, {
-    lockedBy: user.uid,
-    lockedByEmail: user.email,
-    lockedByDevice: deviceName,
-    lockedAt: new Date().toISOString(),
-  } as any);
+  const profileRef = doc(db, 'profiles', profileId);
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(profileRef);
+    if (!snapshot.exists()) throw new Error('Profile no longer exists');
+
+    const profile = snapshot.data() as Profile;
+    const lockAge = profile.lockedAt
+      ? Date.now() - new Date(profile.lockedAt).getTime()
+      : Number.POSITIVE_INFINITY;
+    const lockIsFresh = Boolean(profile.lockedBy && lockAge <= STALE_LOCK_MS);
+    const belongsToThisDevice =
+      profile.lockedBy === user.uid &&
+      (!profile.lockedByDevice || profile.lockedByDevice === deviceName);
+
+    if (lockIsFresh && !belongsToThisDevice) {
+      throw new Error(`Profile in use by ${profile.lockedByEmail || 'another user'} on ${profile.lockedByDevice || 'another PC'}`);
+    }
+
+    transaction.update(profileRef, {
+      lockedBy: user.uid,
+      lockedByEmail: user.email,
+      lockedByDevice: deviceName,
+      lockedAt: new Date().toISOString(),
+    });
+  });
 
   return deviceName;
 }
@@ -147,16 +206,18 @@ export async function refreshProfileLock(
   profileId: string,
   owner?: { uid: string; deviceName?: string | null }
 ): Promise<void> {
-  if (owner) {
-    const profileDoc = await getDoc(doc(db, 'profiles', profileId));
-    const data = profileDoc.data() as Profile | undefined;
-    if (!data || data.lockedBy !== owner.uid) return;
-    if (owner.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
-  }
+  const profileRef = doc(db, 'profiles', profileId);
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(profileRef);
+    const data = snapshot.data() as Profile | undefined;
+    if (!data) return;
+    if (owner && data.lockedBy !== owner.uid) return;
+    if (owner?.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
 
-  await updateProfile(profileId, {
-    lockedAt: new Date().toISOString(),
-  } as any);
+    transaction.update(profileRef, {
+      lockedAt: new Date().toISOString(),
+    });
+  });
 }
 
 /**
@@ -166,17 +227,19 @@ export async function releaseProfileLock(
   profileId: string,
   owner?: { uid: string; deviceName?: string | null }
 ): Promise<void> {
-  if (owner) {
-    const profileDoc = await getDoc(doc(db, 'profiles', profileId));
-    const data = profileDoc.data() as Profile | undefined;
-    if (!data || data.lockedBy !== owner.uid) return;
-    if (owner.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
-  }
+  const profileRef = doc(db, 'profiles', profileId);
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(profileRef);
+    const data = snapshot.data() as Profile | undefined;
+    if (!data) return;
+    if (owner && data.lockedBy !== owner.uid) return;
+    if (owner?.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
 
-  await updateProfile(profileId, {
-    lockedBy: null,
-    lockedByEmail: null,
-    lockedByDevice: null,
-    lockedAt: null,
-  } as any);
+    transaction.update(profileRef, {
+      lockedBy: null,
+      lockedByEmail: null,
+      lockedByDevice: null,
+      lockedAt: null,
+    });
+  });
 }

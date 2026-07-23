@@ -134,7 +134,7 @@ export async function zipProfileDir(profileId: string): Promise<{ buffer: Buffer
 
 /**
  * Extract a zip buffer into a Chrome profile directory.
- * Merges essential data into existing profile (does NOT delete the whole directory).
+ * Replaces managed data directories and preserves unrelated local profile data.
  */
 export async function unzipProfileDir(profileId: string, zipBuffer: Buffer): Promise<void> {
   const profilePath = getProfilePath(profileId);
@@ -146,11 +146,32 @@ export async function unzipProfileDir(profileId: string, zipBuffer: Buffer): Pro
 
   const zip = new AdmZip(zipBuffer);
   const entries = zip.getEntries();
+  const profileRoot = path.resolve(profilePath);
+
+  // LevelDB-backed directories cannot be merged file by file. Stale MANIFEST,
+  // LOG or table files can win over the downloaded state and lose extension
+  // keys. Replace every managed directory represented by this snapshot.
+  for (const dir of ESSENTIAL_DIRS) {
+    const zipPrefix = `Default/${dir}/`;
+    const isIncluded = entries.some(entry =>
+      entry.entryName.replace(/\\/g, '/').startsWith(zipPrefix)
+    );
+    if (!isIncluded) continue;
+
+    const targetDir = path.resolve(profilePath, 'Default', dir);
+    if (targetDir.startsWith(`${profileRoot}${path.sep}`) && fs.existsSync(targetDir)) {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    }
+  }
 
   for (const entry of entries) {
     if (entry.isDirectory) continue;
 
-    const targetPath = path.join(profilePath, entry.entryName);
+    const targetPath = path.resolve(profilePath, entry.entryName);
+    if (!targetPath.startsWith(`${profileRoot}${path.sep}`)) {
+      console.warn(`[ProfileSync] Skipped unsafe archive path: ${entry.entryName}`);
+      continue;
+    }
     const targetDir = path.dirname(targetPath);
 
     try {
@@ -199,4 +220,22 @@ export function setLocalSyncVersion(profileId: string, version: number): void {
     fs.mkdirSync(profilePath, { recursive: true });
   }
   fs.writeFileSync(path.join(profilePath, '.sync_version'), String(version));
+}
+
+export function getLocalSyncRevision(profileId: string): string | null {
+  const revisionPath = path.join(getProfilePath(profileId), '.sync_revision');
+  try {
+    if (fs.existsSync(revisionPath)) {
+      return fs.readFileSync(revisionPath, 'utf8').trim() || null;
+    }
+  } catch {}
+  return null;
+}
+
+export function setLocalSyncRevision(profileId: string, revision: string): void {
+  const profilePath = getProfilePath(profileId);
+  if (!fs.existsSync(profilePath)) {
+    fs.mkdirSync(profilePath, { recursive: true });
+  }
+  fs.writeFileSync(path.join(profilePath, '.sync_revision'), revision);
 }
