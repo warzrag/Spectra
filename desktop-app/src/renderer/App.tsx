@@ -126,7 +126,7 @@ declare global {
         getPaths: (extensionIds: string[]) => Promise<string[]>;
         zip: (extensionId: string) => Promise<string>;
         readZip: (zipPath: string) => Promise<Buffer>;
-        downloadAndInstall: (extensionId: string, url: string, updatedAt?: string) => Promise<boolean>;
+        downloadAndInstall: (extensionId: string, url: string, updatedAt?: string, expectedVersion?: string) => Promise<boolean>;
       };
       profileSync?: {
         zipForSync: (profileId: string) => Promise<{ buffer: Uint8Array; size: number }>;
@@ -683,15 +683,25 @@ function App() {
       const enabledExtIds = enabledExts.map(e => e.id);
 
       if (enabledExtIds.length > 0 && window.electronAPI?.extensions) {
-        const localExts = await window.electronAPI.extensions.getAll();
-        const localIds = new Set(localExts.map((e: any) => e.id));
-        const missing = enabledExts.filter(e => !localIds.has(e.id) && e.storageUrl);
-        for (const ext of missing) {
+        const cloudExtensions = enabledExts.filter(e => e.storageUrl);
+        let extensionSyncFailed = false;
+        for (const ext of cloudExtensions) {
           try {
-            await window.electronAPI.extensions.downloadAndInstall(ext.id, ext.storageUrl!, (ext as any).updatedAt);
+            await window.electronAPI.extensions.downloadAndInstall(
+              ext.id,
+              ext.storageUrl!,
+              ext.updatedAt,
+              ext.version
+            );
           } catch (e) {
-            console.error(`Failed to download extension ${ext.name}:`, e);
+            console.error(`Failed to synchronize extension ${ext.name}:`, e);
+            extensionSyncFailed = true;
           }
+        }
+        if (extensionSyncFailed) {
+          showToast('Extension update failed - launch cancelled', 'error');
+          await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
+          return;
         }
         extensionPaths = await window.electronAPI.extensions.getPaths(enabledExtIds);
       }

@@ -76,7 +76,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
           // Missing locally → download
           try {
             const url = await getFreshUrl();
-            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt);
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt, ext.version);
             localIds.add(ext.id);
             console.log(`[ExtSync] Downloaded missing extension: ${ext.name}`);
           } catch (e) {
@@ -86,26 +86,12 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) =
           (ext.version && local.version && ext.version !== local.version) ||
           (ext.updatedAt && ext.updatedAt !== local.updatedAt)
         )) {
-          // Version or timestamp mismatch → remove old and re-download
+          // Version or timestamp mismatch: validate and atomically replace.
           try {
             console.log(`[ExtSync] Updating ${ext.name}: ${local.version} → ${ext.version}`);
-            // Rename old version instead of deleting (so we can rollback)
-            const oldPath = local.localPath;
-            const backupId = ext.id + '_backup';
-            try {
-              // Use main process to rename
-              await window.electronAPI.extensions!.remove(backupId); // clean any previous backup
-            } catch {}
-            await window.electronAPI.extensions!.remove(ext.id);
-            try {
-              const url = await getFreshUrl();
-              await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt);
-              console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
-            } catch (dlError) {
-              console.error(`[ExtSync] Download failed for ${ext.name}, keeping old version:`, dlError);
-              // Download failed - old version is already removed, re-download won't help
-              // User will need to update manually or wait for next sync
-            }
+            const url = await getFreshUrl();
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt, ext.version);
+            console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
           } catch (e) {
             console.error(`Failed to update extension ${ext.name}:`, e);
           }

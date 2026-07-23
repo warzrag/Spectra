@@ -649,8 +649,14 @@ ipcMain.handle('extensions:readZip', (_, zipPath: string) => {
   return readZipFile(zipPath);
 });
 
-ipcMain.handle('extensions:downloadAndInstall', async (_, extensionId: string, url: string, updatedAt?: string) => {
-  await downloadAndInstallExtension(extensionId, url, updatedAt);
+ipcMain.handle('extensions:downloadAndInstall', async (
+  _,
+  extensionId: string,
+  url: string,
+  updatedAt?: string,
+  expectedVersion?: string
+) => {
+  await downloadAndInstallExtension(extensionId, url, updatedAt, expectedVersion);
   return true;
 });
 

@@ -108,7 +108,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getPaths: (extensionIds: string[]) => ipcRenderer.invoke('extensions:getPaths', extensionIds),
     zip: (extensionId: string) => ipcRenderer.invoke('extensions:zip', extensionId),
     readZip: (zipPath: string) => ipcRenderer.invoke('extensions:readZip', zipPath),
-    downloadAndInstall: (extensionId: string, url: string, updatedAt?: string) => ipcRenderer.invoke('extensions:downloadAndInstall', extensionId, url, updatedAt),
+    downloadAndInstall: (extensionId: string, url: string, updatedAt?: string, expectedVersion?: string) =>
+      ipcRenderer.invoke('extensions:downloadAndInstall', extensionId, url, updatedAt, expectedVersion),
     installFromStore: (storeUrl: string) => ipcRenderer.invoke('extensions:installFromStore', storeUrl),
   },
 
