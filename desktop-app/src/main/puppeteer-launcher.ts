@@ -169,7 +169,7 @@ public class Win32 {
 
     try {
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      if (manifest.name !== 'Twitter Auto Reply DM Client Secure') return false;
+      if (!this.isTwitterAutoReplyManifest(manifest)) return false;
 
       const autostartFile = 'spectra-autostart.js';
       const autostartPath = path.join(extensionPath, autostartFile);
@@ -236,6 +236,14 @@ public class Win32 {
     }
   }
 
+  private static isTwitterAutoReplyManifest(manifest: any): boolean {
+    const name = typeof manifest?.name === 'string'
+      ? manifest.name.trim().toLowerCase()
+      : '';
+
+    return name.includes('twitter auto reply dm');
+  }
+
   private static findTwitterAutoReplyExtensionPath(): string | null {
     const extensionRoots = [
       path.join(os.homedir(), '.antidetect-browser', 'extensions'),
@@ -252,7 +260,7 @@ public class Win32 {
             if (!fs.existsSync(manifestPath)) return false;
             try {
               const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-              return manifest.name === 'Twitter Auto Reply DM Client Secure';
+              return this.isTwitterAutoReplyManifest(manifest);
             } catch {
               return false;
             }
