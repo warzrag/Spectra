@@ -63,9 +63,13 @@ test('bulk launch persists the complete bot state without a startup reload', () 
   assert.match(launcher, /autonomousPhase:\s*'requests'/);
   assert.match(launcher, /requestsWasIdle:\s*false/);
   assert.doesNotMatch(launcher, /window\.setTimeout\(\(\) => window\.location\.reload\(\)/);
+  assert.match(launcher, /waitForAuthenticatedRequests/);
+  assert.match(launcher, /AppTabBar_Home_Link/);
   assert.match(app, /lastUrl:\s*'https:\/\/x\.com\/i\/chat\/requests'/);
   assert.match(launcher, /tab\.id !== target\.id/);
   assert.match(launcher, /chrome\.tabs\.create\(\{ url: START_URL, active: true \}\)/);
+  assert.doesNotMatch(launcher, /update\.url = START_URL/);
+  assert.match(launcher, /let bootstrapComplete = false/);
   assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true/);
   assert.match(launcher, /suppressExtensionInstallTabs\(runtimePath\)/);
   assert.match(launcher, /workerSource\.includes\('html\/initialSetup\.html'\)/);

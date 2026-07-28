@@ -317,7 +317,11 @@ public class Win32 {
   const reloadMarker = 'spectra:auto-reply-autostart-ready';
   if (sessionStorage.getItem(reloadMarker) === '1') return;
 
-  try {
+  const isRequestsPage = () =>
+    /^\\/(?:i\\/chat|messages)\\/requests\\/?$/i.test(window.location.pathname);
+
+  const activate = () => {
+    if (!isRequestsPage()) return;
     const startedAt = Date.now();
     chrome.storage.local.set({
       isEnabled: true,
@@ -337,16 +341,38 @@ public class Win32 {
       sessionStorage.setItem(reloadMarker, '1');
       console.log('[Spectra] Auto Reply DM activated without page reload');
     });
-  } catch (error) {
-    console.warn('[Spectra] Auto Reply DM autostart failed:', error);
-  }
+  };
+
+  const deadline = Date.now() + 20000;
+  const waitForAuthenticatedRequests = () => {
+    try {
+      if (!isRequestsPage()) return;
+      const authenticatedUi = document.querySelector(
+        '[data-testid="AppTabBar_Home_Link"], [data-testid="SideNav_AccountSwitcher_Button"]'
+      );
+      if (authenticatedUi) {
+        activate();
+        return;
+      }
+      if (Date.now() < deadline) window.setTimeout(waitForAuthenticatedRequests, 500);
+    } catch (error) {
+      console.warn('[Spectra] Auto Reply DM autostart failed:', error);
+    }
+  };
+
+  waitForAuthenticatedRequests();
 })();
 `;
       if (enabled && (!fs.existsSync(autostartPath) || fs.readFileSync(autostartPath, 'utf8') !== autostartScript)) {
         fs.writeFileSync(autostartPath, autostartScript);
       }
 
-      const matches = ['https://twitter.com/*', 'https://x.com/*', 'https://x.com/i/*'];
+      const matches = [
+        'https://x.com/i/chat/requests*',
+        'https://twitter.com/i/chat/requests*',
+        'https://x.com/messages/requests*',
+        'https://twitter.com/messages/requests*',
+      ];
       const contentScripts = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
       const alreadyRegistered = contentScripts.some((script: any) =>
         Array.isArray(script.js) && script.js.includes(autostartFile)
@@ -499,10 +525,10 @@ importScripts(${JSON.stringify(originalWorkerName)});
     fs.writeFileSync(path.join(cleanerPath, 'background.js'), `
 const START_URL = ${JSON.stringify(startUrl)};
 const isTargetTab = (url) => /^https?:\\/\\/(www\\.)?(x\\.com|twitter\\.com)\\//i.test(url || '');
-const normalizeUrl = (url) => String(url || '').replace(/\\/+$/, '');
 const cleanupStartedAt = Date.now();
 let cleanupUntil = Date.now() + 20000;
 let cleanupTimer = null;
+let fallbackTabCreated = false;
 
 async function cleanTabs() {
   try {
@@ -512,24 +538,18 @@ async function cleanTabs() {
     );
 
     if (targetTabs.length === 0) {
-      if (Date.now() - cleanupStartedAt >= 3000) {
+      if (!fallbackTabCreated && Date.now() - cleanupStartedAt >= 3000) {
+        fallbackTabCreated = true;
         await chrome.tabs.create({ url: START_URL, active: true }).catch(() => {});
       }
       scheduleCleanTabs(1000);
       return;
     }
 
-    const exactTarget = targetTabs.find((tab) =>
-      normalizeUrl(tab.pendingUrl || tab.url) === normalizeUrl(START_URL)
-    );
-    const target = exactTarget || targetTabs[0];
+    const target = targetTabs[0];
     if (!target?.id) return;
 
-    const update = { active: true };
-    if (normalizeUrl(target.pendingUrl || target.url) !== normalizeUrl(START_URL)) {
-      update.url = START_URL;
-    }
-    await chrome.tabs.update(target.id, update).catch(() => {});
+    await chrome.tabs.update(target.id, { active: true }).catch(() => {});
 
     for (const tab of tabs) {
       if (tab.id && tab.id !== target.id) {
@@ -981,6 +1001,7 @@ public class Win32 {
 const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
 const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
 let bootstrapPromise = null;
+let bootstrapComplete = false;
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -1060,10 +1081,12 @@ async function openStartUrl() {
 }
 
 function bootstrap() {
+  if (bootstrapComplete) return Promise.resolve();
   if (!bootstrapPromise) {
     bootstrapPromise = (async () => {
       await importCookies();
       await openStartUrl();
+      bootstrapComplete = true;
     })().finally(() => {
       bootstrapPromise = null;
     });
