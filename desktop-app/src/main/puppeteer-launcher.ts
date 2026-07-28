@@ -446,24 +446,34 @@ public class Win32 {
     fs.writeFileSync(path.join(cleanerPath, 'background.js'), `
 const START_URL = ${JSON.stringify(startUrl)};
 const isTargetTab = (url) => /^https?:\\/\\/(www\\.)?(x\\.com|twitter\\.com)\\//i.test(url || '');
-const isExtensionSetupTab = (url) => /^chrome-extension:\\/\\/.*\\/html\\/initialSetup\\.html/i.test(url || '');
+const normalizeUrl = (url) => String(url || '').replace(/\\/+$/, '');
 let cleanupUntil = Date.now() + 20000;
 let cleanupTimer = null;
 
 async function cleanTabs() {
   try {
     const tabs = await chrome.tabs.query({});
-    const targetTabs = tabs.filter((tab) => isTargetTab(tab.url));
+    const targetTabs = tabs.filter((tab) => tab.id && isTargetTab(tab.url));
 
     if (targetTabs.length === 0) {
       scheduleCleanTabs(1000);
       return;
     }
 
-    await chrome.tabs.update(targetTabs[0].id, { active: true }).catch(() => {});
+    const exactTarget = targetTabs.find((tab) =>
+      normalizeUrl(tab.url) === normalizeUrl(START_URL)
+    );
+    const target = exactTarget || targetTabs[0];
+    if (!target?.id) return;
+
+    const update = { active: true };
+    if (normalizeUrl(target.url) !== normalizeUrl(START_URL)) {
+      update.url = START_URL;
+    }
+    await chrome.tabs.update(target.id, update).catch(() => {});
 
     for (const tab of tabs) {
-      if (tab.id && isExtensionSetupTab(tab.url)) {
+      if (tab.id && tab.id !== target.id) {
         await chrome.tabs.remove(tab.id).catch(() => {});
       }
     }
@@ -1051,7 +1061,7 @@ setTimeout(exportCookies, 5000);
         } catch {}
       }
       if (shouldAutoStartTwitterBot && !startUrl.includes('twitter.com') && !startUrl.includes('x.com')) {
-        startUrl = 'https://x.com/messages/requests';
+        startUrl = 'https://x.com/i/chat/requests';
       }
       fs.writeFileSync(
         path.join(cookieSyncPath, 'start_url.json'),

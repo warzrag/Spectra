@@ -814,7 +814,7 @@ function App() {
 
       const launched = await handleLaunchProfile({
         ...profile,
-        lastUrl: 'https://x.com/messages/requests',
+        lastUrl: 'https://x.com/i/chat/requests',
         autoStartTwitterBot: true,
         windowLayout: { index: i, total: profilesToLaunch.length },
       });
