@@ -75,6 +75,23 @@ export class PuppeteerLauncher {
     }
   }
 
+  private static async terminateProfileProcesses(profilePath: string): Promise<void> {
+    if (process.platform !== 'win32') return;
+    const escapedPath = profilePath.replace(/'/g, "''");
+    try {
+      await this.runPowerShell(`
+        $profilePath = '${escapedPath}'
+        Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+          Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) } |
+          ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+          }
+      `);
+    } catch (error) {
+      console.warn('[Chrome] Could not terminate stale profile processes:', error);
+    }
+  }
+
   private static async waitForVisibleWindow(profilePath: string, timeoutMs = 12000): Promise<number | null> {
     if (process.platform !== 'win32') return null;
     const escapedPath = profilePath.replace(/'/g, "''");
@@ -599,15 +616,6 @@ public class Win32 {
     try {
       this.assertSafeId(options.profileId, 'profile ID');
 
-      // Check if already running
-      if (this.isProfileActive(options.profileId)) {
-        const instance = this.activeProfiles.get(options.profileId);
-        if (instance && instance.chromeProcess && !instance.chromeProcess.killed) {
-          this.focusProfileWindow(options.profileId);
-          return { success: false, error: 'Profile already running', alreadyRunning: true };
-        }
-      }
-
       // Get user data directory path
       const userDataDir = process.platform === 'win32'
         ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
@@ -620,7 +628,25 @@ public class Win32 {
 
       const existingProfileProcesses = await this.getProfileProcessIds(profilePath);
       if (existingProfileProcesses.length > 0) {
-        return { success: false, error: 'Profile already running', alreadyRunning: true };
+        let visibleWindowExists = process.platform !== 'win32';
+        if (process.platform === 'win32') {
+          try {
+            visibleWindowExists = Boolean(await this.waitForVisibleWindow(profilePath, 1500));
+          } catch {
+            visibleWindowExists = false;
+          }
+        }
+
+        if (visibleWindowExists) {
+          this.focusProfileWindow(options.profileId);
+          return { success: false, error: 'Profile already running', alreadyRunning: true };
+        }
+
+        console.warn(
+          `[Chrome] Found ${existingProfileProcesses.length} stale process(es) without a visible window for ${options.profileId}`
+        );
+        await this.terminateProfileProcesses(profilePath);
+        this.activeProfiles.delete(options.profileId);
       }
       this.clearStaleSingletonFiles(profilePath);
 
@@ -1309,13 +1335,13 @@ setTimeout(exportCookies, 5000);
             }
           }
         `);
-      } else if (instance.chromeProcess && !instance.chromeProcess.killed) {
+      } else if (instance.chromeProcess && instance.chromeProcess.exitCode === null) {
         instance.chromeProcess.kill('SIGTERM');
       }
     } catch (error) {
       console.warn(`[Chrome] Graceful close failed for ${profileId}, forcing shutdown:`, error);
       try {
-        if (instance.chromeProcess && !instance.chromeProcess.killed) {
+        if (instance.chromeProcess && instance.chromeProcess.exitCode === null) {
           instance.chromeProcess.kill();
         }
       } catch {}
@@ -1323,6 +1349,12 @@ setTimeout(exportCookies, 5000);
   }
 
   static getActiveProfiles(): string[] {
+    for (const [profileId, instance] of this.activeProfiles) {
+      const processExited = !instance?.chromeProcess ||
+        instance.chromeProcess.exitCode !== null ||
+        instance.chromeProcess.signalCode !== null;
+      if (processExited) this.activeProfiles.delete(profileId);
+    }
     return Array.from(this.activeProfiles.keys());
   }
 

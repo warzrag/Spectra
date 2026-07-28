@@ -34,6 +34,8 @@ test('Firestore and Storage access is scoped by role, team, and profile', () => 
 test('Chrome launch waits for a visible window and repairs stale singleton files', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   assert.match(launcher, /waitForVisibleWindow/);
+  assert.match(launcher, /terminateProfileProcesses/);
+  assert.match(launcher, /stale process\(es\) without a visible window/);
   assert.match(launcher, /clearStaleSingletonFiles/);
   assert.match(launcher, /Chrome started but no visible window appeared/);
 });
