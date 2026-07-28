@@ -52,3 +52,11 @@ test('cross-device cookies are restored before navigation and Chrome closes grac
   assert.match(launcher, /await importCookies\(\);\s+await openStartUrl\(\)/);
   assert.match(launcher, /CloseMainWindow\(\)/);
 });
+
+test('bulk launch persists the complete bot state before a single startup reload', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.match(launcher, /spectra:auto-reply-autostart-ready/);
+  assert.match(launcher, /autonomousPhase:\s*'requests'/);
+  assert.match(launcher, /requestsWasIdle:\s*false/);
+  assert.match(launcher, /window\.location\.reload\(\)/);
+});

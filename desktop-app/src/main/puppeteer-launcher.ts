@@ -314,23 +314,32 @@ public class Win32 {
       const autostartPath = path.join(extensionPath, autostartFile);
       const autostartScript = `
 (function () {
-  const start = () => {
-    try {
-      chrome.storage.local.set({
-        isEnabled: true,
-        pendingAutoStart: true,
-        pendingMode: 'autonomous',
-        mode: 'autonomous',
-        manualPause: false,
-        autonomousPhaseStartTime: Date.now()
-      });
-    } catch (error) {
-      console.warn('[Spectra] Auto Reply DM autostart failed:', error);
-    }
-  };
+  const reloadMarker = 'spectra:auto-reply-autostart-ready';
+  if (sessionStorage.getItem(reloadMarker) === '1') return;
 
-  start();
-  setTimeout(start, 1500);
+  try {
+    const startedAt = Date.now();
+    chrome.storage.local.set({
+      isEnabled: true,
+      mode: 'autonomous',
+      autonomousPhase: 'requests',
+      autonomousPhaseStartTime: startedAt,
+      requestsWasIdle: false,
+      pendingAutoStart: true,
+      pendingMode: 'autonomous',
+      manualPause: false
+    }, () => {
+      if (chrome.runtime.lastError) {
+        console.warn('[Spectra] Auto Reply DM autostart failed:', chrome.runtime.lastError);
+        return;
+      }
+
+      sessionStorage.setItem(reloadMarker, '1');
+      window.setTimeout(() => window.location.reload(), 150);
+    });
+  } catch (error) {
+    console.warn('[Spectra] Auto Reply DM autostart failed:', error);
+  }
 })();
 `;
       if (enabled && (!fs.existsSync(autostartPath) || fs.readFileSync(autostartPath, 'utf8') !== autostartScript)) {
