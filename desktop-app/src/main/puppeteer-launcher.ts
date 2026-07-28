@@ -462,8 +462,6 @@ public class Win32 {
   const PROFILE_NAME = ${JSON.stringify(launchContext.profileName)};
   const LAUNCH_ID = ${JSON.stringify(launchContext.launchId)};
   const VENUS_VERSION = ${JSON.stringify(venusVersion)};
-  const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
-  const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
   const READY_MARKER = 'spectra:startup-tabs-ready:' + LAUNCH_ID;
   const INIT_MARKER = 'spectra:autostart-initializing:' + LAUNCH_ID;
   const COMMAND_MARKER = 'spectra:autostart-command-sent:' + LAUNCH_ID;
@@ -471,25 +469,6 @@ public class Win32 {
   const resolveVenusAutostartState = ${stateResolverSource};
   let activationInFlight = false;
   sessionStorage.setItem(INIT_MARKER, '1');
-
-  const reportStatus = (status, details = {}, attempt = 1) => {
-    fetch(SERVER + '/api/launch-status', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + SERVER_TOKEN
-      },
-      body: JSON.stringify({ profileId: PROFILE_ID, launchId: LAUNCH_ID, status, details })
-    }).then((response) => {
-      if (!response.ok) throw new Error('Status server returned ' + response.status);
-    }).catch((error) => {
-      if (attempt < 5) {
-        window.setTimeout(() => reportStatus(status, details, attempt + 1), attempt * 500);
-      } else {
-        console.warn('[Spectra AutoStart] Status report failed:', error);
-      }
-    });
-  };
 
   const isRequestsPage = () =>
     /^\\/(?:i\\/chat|messages)\\/requests\\/?$/i.test(window.location.pathname);
@@ -522,11 +501,6 @@ public class Win32 {
             sessionStorage.removeItem(INIT_MARKER);
             chrome.storage.local.remove('spectraPendingLaunchId');
             console.log('[Spectra AutoStart] VenusBot confirmed running');
-            reportStatus('venus-confirmed', {
-              phase: state.autonomousPhase,
-              phaseStartTime: state.autonomousPhaseStartTime,
-              tabId: sessionStorage.getItem(READY_MARKER)
-            });
             return;
           }
           if (Date.now() < deadline) {
@@ -579,7 +553,6 @@ public class Win32 {
             sessionStorage.setItem('spectra:autostart-manual-pause:' + LAUNCH_ID, '1');
             sessionStorage.removeItem(INIT_MARKER);
             console.log('[Spectra AutoStart] Manual pause preserved; autostart skipped');
-            reportStatus('manual-pause-preserved');
           }
         );
         return;
