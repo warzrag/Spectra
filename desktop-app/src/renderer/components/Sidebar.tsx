@@ -1,12 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, ArrowLeftRight, UserPlus, X, Crown, Activity } from 'lucide-react';
+import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, Crown, Activity } from 'lucide-react';
 import { Folder as FolderType, Team, AppPage } from '../../types';
 import { useAuth } from '../contexts/AuthContext';
-
-const SWITCH_UIDS = [
-  'EsZbVc0qtNYwTsUmXm9drmF5hu53',  // florentivo95270@gmail.com
-  'OVH4X3zvyohKCYZfV5Q8cSWvj1M2',  // ivorraflorent1@gmail.com
-];
 
 interface SidebarProps {
   activePage: AppPage;
@@ -56,45 +51,10 @@ const Sidebar: React.FC<SidebarProps> = ({
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
   const [showNewDropdown, setShowNewDropdown] = useState(false);
   const [appVersion, setAppVersion] = useState('');
-  const [showSwitchMenu, setShowSwitchMenu] = useState(false);
-  const [showAddAccount, setShowAddAccount] = useState(false);
-  const [newEmail, setNewEmail] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [savedAccounts, setSavedAccounts] = useState<{ email: string; password: string }[]>([]);
-
-  const isOwner = SWITCH_UIDS.includes(user?.uid || '');
-
-  // Load saved accounts from localStorage
+  // Remove credentials stored by versions prior to 1.10.
   useEffect(() => {
-    if (!isOwner) return;
-    try {
-      const stored = localStorage.getItem('spectra_saved_accounts');
-      if (stored) setSavedAccounts(JSON.parse(stored));
-    } catch {}
-  }, [isOwner]);
-
-  const saveAccounts = (accounts: { email: string; password: string }[]) => {
-    setSavedAccounts(accounts);
-    localStorage.setItem('spectra_saved_accounts', JSON.stringify(accounts));
-  };
-
-  const handleAddAccount = () => {
-    if (!newEmail || !newPassword) return;
-    const updated = [...savedAccounts.filter(a => a.email !== newEmail), { email: newEmail, password: newPassword }];
-    saveAccounts(updated);
-    setNewEmail('');
-    setNewPassword('');
-    setShowAddAccount(false);
-  };
-
-  const handleRemoveAccount = (email: string) => {
-    saveAccounts(savedAccounts.filter(a => a.email !== email));
-  };
-
-  const handleSwitch = (account: { email: string; password: string }) => {
-    setShowSwitchMenu(false);
-    onSwitchAccount?.(account.email, account.password);
-  };
+    localStorage.removeItem('spectra_saved_accounts');
+  }, []);
 
   useEffect(() => {
     window.electronAPI.getVersion().then(v => setAppVersion(v));
@@ -105,11 +65,11 @@ const Sidebar: React.FC<SidebarProps> = ({
     { page: 'profiles', label: 'Instances', icon: <Users size={18} /> },
     { page: 'proxies', label: 'Proxies', icon: <Globe size={18} />, adminOnly: true },
     { page: 'extensions', label: 'Extensions', icon: <Puzzle size={18} />, adminOnly: true },
-    { page: 'diagnostics', label: 'Diagnostics', icon: <Activity size={18} />, adminOnly: true },
+    { page: 'diagnostics', label: 'Diagnostics', icon: <Activity size={18} /> },
     { page: 'recycle-bin', label: 'Recycle Bin', icon: <Trash2 size={18} />, adminOnly: true },
   ];
 
-  const isSuperAdmin = user?.role === 'super_admin' || user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53';
+  const isSuperAdmin = user?.role === 'super_admin';
 
   // Team section items
   const teamNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean; superAdminOnly?: boolean }[] = [
@@ -513,18 +473,6 @@ const Sidebar: React.FC<SidebarProps> = ({
                       {user.role}
                     </div>
                   </div>
-                  {isOwner && (
-                    <button
-                      onClick={() => setShowSwitchMenu(!showSwitchMenu)}
-                      className="p-1.5 rounded-lg transition-colors shrink-0"
-                      title="Switch account"
-                      style={{ color: 'var(--text-muted)' }}
-                      onMouseEnter={e => { e.currentTarget.style.background = 'var(--accent-subtle)'; e.currentTarget.style.color = 'var(--accent-light)'; }}
-                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
-                    >
-                      <ArrowLeftRight size={14} />
-                    </button>
-                  )}
                   <button onClick={onLogout} className="p-1.5 rounded-lg transition-colors shrink-0" title="Sign out"
                     style={{ color: 'var(--text-muted)' }}
                     onMouseEnter={e => { e.currentTarget.style.background = 'var(--danger-subtle)'; e.currentTarget.style.color = 'var(--danger)'; }}
@@ -532,104 +480,6 @@ const Sidebar: React.FC<SidebarProps> = ({
                     <LogOut size={14} />
                   </button>
                 </div>
-
-                {/* Switch Account Menu */}
-                {showSwitchMenu && isOwner && (
-                  <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-xl shadow-2xl z-50 overflow-hidden"
-                    style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}>
-                    <div className="px-3 py-2 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                      <span className="text-[12px] font-semibold" style={{ color: 'var(--text-primary)' }}>Switch Account</span>
-                      <button onClick={() => setShowSwitchMenu(false)} className="p-0.5 rounded" style={{ color: 'var(--text-muted)' }}>
-                        <X size={12} />
-                      </button>
-                    </div>
-
-                    {savedAccounts.map((account) => (
-                      <div
-                        key={account.email}
-                        className="px-3 py-2 flex items-center gap-2 cursor-pointer transition-colors"
-                        style={{ color: account.email === user?.email ? 'var(--accent-light)' : 'var(--text-secondary)' }}
-                        onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
-                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                        onClick={() => account.email !== user?.email && handleSwitch(account)}
-                      >
-                        <div className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold text-white shrink-0"
-                          style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)' }}>
-                          {account.email.charAt(0).toUpperCase()}
-                        </div>
-                        <span className="text-[12px] flex-1 truncate">{account.email}</span>
-                        {account.email === user?.email && (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded-full" style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}>active</span>
-                        )}
-                        {account.email !== user?.email && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleRemoveAccount(account.email); }}
-                            className="p-0.5 rounded transition-colors"
-                            style={{ color: 'var(--text-muted)' }}
-                            onMouseEnter={e => { e.currentTarget.style.color = 'var(--danger)'; }}
-                            onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-                          >
-                            <X size={11} />
-                          </button>
-                        )}
-                      </div>
-                    ))}
-
-                    {savedAccounts.length === 0 && (
-                      <div className="px-3 py-3 text-[12px] text-center" style={{ color: 'var(--text-muted)' }}>
-                        No saved accounts
-                      </div>
-                    )}
-
-                    {!showAddAccount ? (
-                      <button
-                        onClick={() => setShowAddAccount(true)}
-                        className="w-full px-3 py-2 flex items-center gap-2 text-[12px] transition-colors"
-                        style={{ color: 'var(--text-muted)', borderTop: '1px solid var(--border-subtle)' }}
-                        onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-elevated)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
-                        onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
-                      >
-                        <UserPlus size={13} />
-                        Add account
-                      </button>
-                    ) : (
-                      <div className="px-3 py-2 space-y-2" style={{ borderTop: '1px solid var(--border-subtle)' }}>
-                        <input
-                          type="email"
-                          placeholder="Email"
-                          value={newEmail}
-                          onChange={e => setNewEmail(e.target.value)}
-                          className="w-full px-2 py-1.5 rounded-lg text-[12px]"
-                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
-                        />
-                        <input
-                          type="password"
-                          placeholder="Password"
-                          value={newPassword}
-                          onChange={e => setNewPassword(e.target.value)}
-                          className="w-full px-2 py-1.5 rounded-lg text-[12px]"
-                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
-                        />
-                        <div className="flex gap-1">
-                          <button
-                            onClick={handleAddAccount}
-                            className="flex-1 py-1.5 rounded-lg text-[11px] font-medium text-white"
-                            style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)' }}
-                          >
-                            Save
-                          </button>
-                          <button
-                            onClick={() => { setShowAddAccount(false); setNewEmail(''); setNewPassword(''); }}
-                            className="px-3 py-1.5 rounded-lg text-[11px] font-medium"
-                            style={{ color: 'var(--text-muted)', border: '1px solid var(--border-default)' }}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
 
                 <div className="flex items-center justify-between px-1">
                   <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Profiles</span>

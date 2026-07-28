@@ -6,6 +6,12 @@ import AdmZip from 'adm-zip';
 
 const EXTENSIONS_DIR = path.join(os.homedir(), '.antidetect-browser', 'extensions');
 
+function assertSafeExtensionId(extensionId: string): void {
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(extensionId)) {
+    throw new Error('Invalid extension ID');
+  }
+}
+
 export interface InstalledExtension {
   id: string;
   name: string;
@@ -173,6 +179,7 @@ export function installExtension(filePath: string): InstalledExtension {
  * Replaces all files but keeps the directory.
  */
 export function updateExtension(extensionId: string, filePath: string): InstalledExtension {
+  assertSafeExtensionId(extensionId);
   const extDir = path.join(EXTENSIONS_DIR, extensionId);
   if (!fs.existsSync(extDir)) {
     throw new Error(`Extension ${extensionId} not found`);
@@ -305,6 +312,7 @@ export function getInstalledExtensions(): InstalledExtension[] {
 }
 
 export function removeExtension(extensionId: string): boolean {
+  assertSafeExtensionId(extensionId);
   const extDir = path.join(EXTENSIONS_DIR, extensionId);
   if (fs.existsSync(extDir)) {
     fs.rmSync(extDir, { recursive: true, force: true });
@@ -315,11 +323,13 @@ export function removeExtension(extensionId: string): boolean {
 
 export function getExtensionPaths(extensionIds: string[]): string[] {
   return extensionIds
+    .filter(id => /^[A-Za-z0-9_-]{1,200}$/.test(id))
     .map(id => path.join(EXTENSIONS_DIR, id))
     .filter(p => fs.existsSync(p) && fs.existsSync(path.join(p, 'manifest.json')));
 }
 
 export function zipExtension(extensionId: string): string {
+  assertSafeExtensionId(extensionId);
   const extDir = path.join(EXTENSIONS_DIR, extensionId);
   if (!fs.existsSync(extDir)) throw new Error(`Extension ${extensionId} not found locally`);
 
@@ -340,8 +350,21 @@ export function downloadAndInstallExtension(
   updatedAt?: string,
   expectedVersion?: string
 ): Promise<void> {
+  assertSafeExtensionId(extensionId);
   ensureExtensionsDir();
   const extDir = path.join(EXTENSIONS_DIR, extensionId);
+  const maxDownloadBytes = 100 * 1024 * 1024;
+  const validateDownloadUrl = (value: string): URL => {
+    const parsed = new URL(value);
+    const allowedHost = parsed.hostname === 'firebasestorage.googleapis.com' ||
+      parsed.hostname === 'storage.googleapis.com' ||
+      parsed.hostname.endsWith('.firebasestorage.app');
+    if (parsed.protocol !== 'https:' || !allowedHost) {
+      throw new Error('Extension download URL is not an approved Firebase Storage URL');
+    }
+    return parsed;
+  };
+  validateDownloadUrl(url);
 
   // Older Spectra versions could update .sync_meta without replacing files.
   // Require both the real manifest version and the marker to match.
@@ -363,7 +386,12 @@ export function downloadAndInstallExtension(
     const stagingDir = `${extDir}.download-${operationId}`;
     const backupDir = `${extDir}.previous-${operationId}`;
 
-    const doRequest = (requestUrl: string) => {
+    const doRequest = (requestUrl: string, redirectCount = 0) => {
+      validateDownloadUrl(requestUrl);
+      if (redirectCount > 5) {
+        reject(new Error('Too many extension download redirects'));
+        return;
+      }
       const client = requestUrl.startsWith('https')
         ? require('https')
         : require('http');
@@ -371,7 +399,11 @@ export function downloadAndInstallExtension(
       client.get(requestUrl, (res: any) => {
         // Follow redirects
         if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
-          doRequest(res.headers.location);
+          if (!res.headers.location) {
+            reject(new Error('Extension download redirect has no location'));
+            return;
+          }
+          doRequest(new URL(res.headers.location, requestUrl).toString(), redirectCount + 1);
           return;
         }
 
@@ -381,7 +413,15 @@ export function downloadAndInstallExtension(
         }
 
         const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        let downloadedBytes = 0;
+        res.on('data', (chunk: Buffer) => {
+          downloadedBytes += chunk.length;
+          if (downloadedBytes > maxDownloadBytes) {
+            res.destroy(new Error('Extension download exceeds 100 MB'));
+            return;
+          }
+          chunks.push(chunk);
+        });
         res.on('end', () => {
           try {
             const zipBuffer = Buffer.concat(chunks);
@@ -441,6 +481,8 @@ export function downloadAndInstallExtension(
           }
         });
         res.on('error', reject);
+      }).setTimeout(30000, function() {
+        this.destroy(new Error('Extension download timed out'));
       }).on('error', reject);
     };
 

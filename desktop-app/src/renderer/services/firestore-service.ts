@@ -109,9 +109,19 @@ export function subscribeToTeams(callback: (teams: Team[]) => void): Unsubscribe
 
 // ── Profiles (Cloud Sync) ──────────────────────────────────────
 
-export function subscribeToProfiles(teamId: string | null | undefined, callback: (profiles: Profile[]) => void): Unsubscribe {
+export function subscribeToProfiles(
+  teamId: string | null | undefined,
+  callback: (profiles: Profile[]) => void,
+  assignedFolderId?: string | null
+): Unsubscribe {
   const q = teamId
-    ? query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+    ? assignedFolderId
+      ? query(
+          collection(db, PROFILES_COLLECTION),
+          where('teamId', '==', teamId),
+          where('folderId', '==', assignedFolderId)
+        )
+      : query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
     : query(collection(db, PROFILES_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const profiles: Profile[] = snapshot.docs.map(d => ({
@@ -124,7 +134,18 @@ export function subscribeToProfiles(teamId: string | null | undefined, callback:
   });
 }
 
-export function subscribeToFolders(teamId: string | null | undefined, callback: (folders: Folder[]) => void): Unsubscribe {
+export function subscribeToFolders(
+  teamId: string | null | undefined,
+  callback: (folders: Folder[]) => void,
+  assignedFolderId?: string | null
+): Unsubscribe {
+  if (teamId && assignedFolderId) {
+    return onSnapshot(doc(db, FOLDERS_COLLECTION, assignedFolderId), (snapshot) => {
+      callback(snapshot.exists() ? [{ id: snapshot.id, ...snapshot.data() } as Folder] : []);
+    }, (error) => {
+      console.error('Folder subscription error:', error);
+    });
+  }
   const q = teamId
     ? query(collection(db, FOLDERS_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
     : query(collection(db, FOLDERS_COLLECTION), orderBy('createdAt', 'desc'));

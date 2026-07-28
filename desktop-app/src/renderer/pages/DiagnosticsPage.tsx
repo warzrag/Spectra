@@ -21,6 +21,7 @@ interface DiagnosticState {
   currentIp: string;
   activeConnection: string;
   copied: boolean;
+  environment: any | null;
 }
 
 const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({ user, profiles, activeProfiles }) => {
@@ -30,16 +31,18 @@ const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({ user, profiles, activ
     currentIp: '',
     activeConnection: '',
     copied: false,
+    environment: null,
   });
   const [loading, setLoading] = useState(false);
 
   const loadDiagnostics = async () => {
     setLoading(true);
-    const [appVersion, hostname, currentIp, activeConnection] = await Promise.all([
+    const [appVersion, hostname, currentIp, activeConnection, environment] = await Promise.all([
       window.electronAPI.getVersion().catch(() => ''),
       window.electronAPI.profileSync?.getHostname?.().catch(() => '') || Promise.resolve(''),
       window.electronAPI.network?.getCurrentIP?.().catch(() => '') || Promise.resolve(''),
       window.electronAPI.network?.getActiveConnection?.().catch(() => null) || Promise.resolve(null),
+      window.electronAPI.diagnostics?.getEnvironment?.().catch(() => null) || Promise.resolve(null),
     ]);
 
     setState(prev => ({
@@ -48,6 +51,7 @@ const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({ user, profiles, activ
       hostname,
       currentIp: currentIp || 'Unavailable',
       activeConnection: activeConnection?.name || activeConnection?.interfaceName || 'Unavailable',
+      environment,
     }));
     setLoading(false);
   };
@@ -69,6 +73,12 @@ const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({ user, profiles, activ
     `Active connection: ${state.activeConnection}`,
     `Profiles: ${profiles.length}`,
     `Running profiles: ${activeProfiles.length}`,
+    `Platform: ${state.environment?.platform || 'unknown'} ${state.environment?.architecture || ''}`,
+    `Managed browser: ${state.environment?.managedBrowserReady ? 'ready' : 'missing'}`,
+    `Managed browser path: ${state.environment?.managedBrowserPath || 'none'}`,
+    `System browser: ${state.environment?.systemBrowserPath || 'not found'}`,
+    `Profiles directory writable: ${state.environment?.profilesDirectoryWritable ? 'yes' : 'no'}`,
+    `PowerShell available: ${state.environment?.powershellAvailable ? 'yes' : 'no'}`,
   ].join('\n');
 
   const copyDiagnostics = async () => {
@@ -89,6 +99,11 @@ const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({ user, profiles, activ
     ['Active connection', state.activeConnection || 'Unknown'],
     ['Total profiles', String(profiles.length)],
     ['Running profiles', String(activeProfiles.length)],
+    ['Operating system', `${state.environment?.platform || 'Unknown'} ${state.environment?.architecture || ''}`],
+    ['Managed browser', state.environment?.managedBrowserReady ? 'Ready' : 'Missing'],
+    ['System Chrome fallback', state.environment?.systemBrowserPath || 'Not found'],
+    ['Profiles directory', state.environment?.profilesDirectoryWritable ? 'Writable' : 'Not writable'],
+    ['Windows launcher', state.environment?.powershellAvailable ? 'Ready' : 'Unavailable'],
   ];
 
   return (
@@ -168,7 +183,12 @@ const DiagnosticsPage: React.FC<DiagnosticsPageProps> = ({ user, profiles, activ
         <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <StatusTile icon={<Shield size={18} />} label="Build isolation" value="Local branch" healthy />
           <StatusTile icon={<User size={18} />} label="Authentication" value={user ? 'Signed in' : 'No user'} healthy={Boolean(user)} />
-          <StatusTile icon={<Monitor size={18} />} label="Browser sessions" value={`${activeProfiles.length} running`} healthy />
+          <StatusTile
+            icon={<Monitor size={18} />}
+            label="Browser runtime"
+            value={state.environment?.managedBrowserReady || state.environment?.systemBrowserPath ? 'Ready' : 'Missing'}
+            healthy={Boolean(state.environment?.managedBrowserReady || state.environment?.systemBrowserPath)}
+          />
         </section>
       </div>
     </div>

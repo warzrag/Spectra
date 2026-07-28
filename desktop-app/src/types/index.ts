@@ -91,12 +91,14 @@ export interface Profile {
   cloudSyncSize?: number;
   cloudSyncVersion?: number;
   cloudSyncRevision?: string;
+  cloudSyncChecksum?: string;
   cloudSyncedBy?: string;
 
   // Profile lock
   lockedBy?: string | null;
   lockedByEmail?: string | null;
   lockedByDevice?: string | null;
+  lockedByInstallationId?: string | null;
   lockedAt?: string | null;
 
   // Custom sort order

@@ -56,6 +56,9 @@ function getProfilesBaseDir(): string {
 }
 
 function getProfilePath(profileId: string): string {
+  if (!/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
+    throw new Error('Invalid profile ID');
+  }
   return path.join(getProfilesBaseDir(), profileId);
 }
 

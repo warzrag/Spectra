@@ -1,65 +1,217 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
 
-    // Users collection
-    match /users/{userId} {
-      allow read: if request.auth != null;
+    function currentUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
 
-      // Nobody can modify/delete the owner's document (except the owner themselves)
-      // Owner and admin can write other user documents
-      // Users can write their own document
-      allow write: if request.auth != null && (
-        // Block anyone from modifying an owner's doc (except the owner)
-        (resource == null || resource.data.role != 'owner' || request.auth.uid == userId)
-        &&
-        // Block anyone from setting role to 'owner' (except: creating own doc, or already owner)
-        (!('role' in request.resource.data) || request.resource.data.role != 'owner' || (resource == null && request.auth.uid == userId) || (resource != null && resource.data.role == 'owner' && request.auth.uid == userId))
-        &&
-        // Permission: own doc, or owner, or admin
+    function isSuperAdmin() {
+      return signedIn() && currentUser().role == 'super_admin';
+    }
+
+    function isTeamMember(teamId) {
+      return signedIn() && currentUser().teamId == teamId;
+    }
+
+    function isTeamAdmin(teamId) {
+      return isSuperAdmin() || (
+        isTeamMember(teamId) &&
+        currentUser().role in ['owner', 'admin']
+      );
+    }
+
+    function canReadFolder(teamId, folderId) {
+      return isSuperAdmin() || (
+        isTeamMember(teamId) &&
         (
-          request.auth.uid == userId ||
-          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner' ||
-          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+          currentUser().role in ['owner', 'admin'] ||
+          currentUser().assignedFolderId == folderId
         )
       );
     }
 
-    // Profiles collection - any authenticated user can CRUD
+    function canReadProfile(data) {
+      return isSuperAdmin() || (
+        isTeamMember(data.teamId) &&
+        (
+          currentUser().role in ['owner', 'admin'] ||
+          (
+            currentUser().role == 'va' &&
+            currentUser().assignedFolderId != null &&
+            currentUser().assignedFolderId == data.folderId
+          )
+        )
+      );
+    }
+
+    match /users/{userId} {
+      allow get: if signedIn() && (
+        request.auth.uid == userId ||
+        isSuperAdmin() ||
+        (
+          resource.data.teamId == currentUser().teamId &&
+          currentUser().role in ['owner', 'admin']
+        )
+      );
+      allow list: if isSuperAdmin() || (
+        signedIn() &&
+        currentUser().role in ['owner', 'admin'] &&
+        resource.data.teamId == currentUser().teamId
+      );
+
+      allow create: if signedIn() && (
+        isSuperAdmin() ||
+        (
+          request.auth.uid == userId &&
+          request.resource.data.uid == request.auth.uid &&
+          (
+            (
+              request.resource.data.role == 'owner' &&
+              request.resource.data.inviteCode is string &&
+              getAfter(/databases/$(database)/documents/teams/$(request.resource.data.teamId)).data.ownerId == request.auth.uid &&
+              getAfter(/databases/$(database)/documents/teams/$(request.resource.data.teamId)).data.inviteCode == request.resource.data.inviteCode &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.codeType == 'personal' &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.used == true &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.usedBy == request.auth.uid
+            ) ||
+            (
+              request.resource.data.role == 'va' &&
+              request.resource.data.inviteCode is string &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.used == true &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.usedBy == request.auth.uid &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.codeType == 'team' &&
+              getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.teamId == request.resource.data.teamId
+            )
+          )
+        ) ||
+        (
+          isTeamAdmin(request.resource.data.teamId) &&
+          request.resource.data.role in ['admin', 'va']
+        )
+      );
+
+      allow update: if signedIn() && (
+        isSuperAdmin() ||
+        (
+          request.auth.uid == userId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName'])
+        ) ||
+        (
+          isTeamAdmin(resource.data.teamId) &&
+          resource.data.teamId == request.resource.data.teamId &&
+          resource.data.role != 'owner' &&
+          request.resource.data.role in ['admin', 'va'] &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['role', 'assignedFolderId', 'displayName'])
+        )
+      );
+
+      allow delete: if isSuperAdmin() || (
+        isTeamAdmin(resource.data.teamId) &&
+        resource.data.role != 'owner' &&
+        request.auth.uid != userId
+      );
+    }
+
     match /profiles/{profileId} {
-      allow read, write: if request.auth != null;
+      allow read: if canReadProfile(resource.data);
+      allow create: if isTeamAdmin(request.resource.data.teamId);
+      allow delete: if isTeamAdmin(resource.data.teamId);
+      allow update: if isTeamAdmin(resource.data.teamId) || (
+        canReadProfile(resource.data) &&
+        resource.data.teamId == request.resource.data.teamId &&
+        resource.data.folderId == request.resource.data.folderId &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'lastUsed', 'lastUrl',
+          'lockedBy', 'lockedByEmail', 'lockedByDevice', 'lockedByInstallationId', 'lockedAt',
+          'cloudStorageUrl', 'cloudSyncedAt', 'cloudSyncSize', 'cloudSyncVersion',
+          'cloudSyncRevision', 'cloudSyncChecksum', 'cloudSyncedBy'
+        ])
+      );
     }
 
-    // Folders collection - any authenticated user can CRUD
     match /folders/{folderId} {
-      allow read, write: if request.auth != null;
+      allow read: if canReadFolder(resource.data.teamId, folderId);
+      allow create: if isTeamAdmin(request.resource.data.teamId);
+      allow update, delete: if isTeamAdmin(resource.data.teamId);
     }
 
-    // Extensions collection - any authenticated user can CRUD
     match /extensions/{extensionId} {
-      allow read, write: if request.auth != null;
+      allow read: if isSuperAdmin() || isTeamMember(resource.data.teamId);
+      allow create: if isTeamAdmin(request.resource.data.teamId);
+      allow update, delete: if isTeamAdmin(resource.data.teamId);
     }
 
-    // Proxies collection - any authenticated user can CRUD
     match /proxies/{proxyId} {
-      allow read, write: if request.auth != null;
+      allow read: if isTeamAdmin(resource.data.teamId);
+      allow create: if isTeamAdmin(request.resource.data.teamId);
+      allow update, delete: if isTeamAdmin(resource.data.teamId);
     }
 
-    // Activity logs - any authenticated user can create, admins can read
     match /activityLogs/{logId} {
-      allow create: if request.auth != null;
-      allow read: if request.auth != null;
+      allow create: if signedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        isTeamMember(request.resource.data.teamId);
+      allow read: if isSuperAdmin() || isTeamAdmin(resource.data.teamId);
     }
 
-    // Teams collection - any authenticated user can read, owners/admins can write
     match /teams/{teamId} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null;
+      allow read: if isSuperAdmin() || isTeamMember(teamId);
+      allow create: if isSuperAdmin() || (
+        signedIn() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.inviteCode is string &&
+        getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.codeType == 'personal' &&
+        getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.used == true &&
+        getAfter(/databases/$(database)/documents/inviteCodes/$(request.resource.data.inviteCode)).data.usedBy == request.auth.uid
+      );
+      allow update: if isSuperAdmin() || (
+        isTeamMember(teamId) &&
+        currentUser().role == 'owner' &&
+        request.resource.data.ownerId == resource.data.ownerId
+      );
+      allow delete: if isSuperAdmin();
     }
 
-    // Invite codes - any authenticated user can read/write
     match /inviteCodes/{codeId} {
-      allow read, write: if request.auth != null;
+      allow get: if signedIn();
+      allow list: if isSuperAdmin() || (
+        signedIn() &&
+        currentUser().role in ['owner', 'admin'] &&
+        resource.data.createdBy == request.auth.uid
+      );
+      allow create: if signedIn() &&
+        request.resource.data.createdBy == request.auth.uid &&
+        (
+          isSuperAdmin() ||
+          (
+            request.resource.data.codeType == 'team' &&
+            isTeamAdmin(request.resource.data.teamId)
+          ) ||
+          (
+            request.resource.data.codeType == 'personal' &&
+            currentUser().role in ['owner', 'admin']
+          )
+        );
+      allow update: if signedIn() && (
+        isSuperAdmin() ||
+        request.auth.uid == resource.data.createdBy ||
+        (
+          resource.data.used == false &&
+          request.resource.data.used == true &&
+          request.resource.data.usedBy == request.auth.uid &&
+          getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.inviteCode == codeId &&
+          request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['used', 'usedBy', 'usedByEmail', 'usedAt'])
+        )
+      );
+      allow delete: if isSuperAdmin() || (
+        signedIn() && request.auth.uid == resource.data.createdBy
+      );
     }
   }
 }

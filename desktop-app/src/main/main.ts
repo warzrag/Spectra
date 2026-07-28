@@ -25,6 +25,18 @@ const Store = require('electron-store');
 
 const isDev = !app.isPackaged;
 
+function assertSafeId(value: string, label: string): void {
+  if (!/^[A-Za-z0-9_-]{1,160}$/.test(value)) {
+    throw new Error(`Invalid ${label}`);
+  }
+}
+
+function getProfilesBaseDir(): string {
+  return process.platform === 'win32'
+    ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+    : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+}
+
 const store = new Store({
   defaults: {
     profiles: [],
@@ -54,7 +66,7 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js'),
-      webSecurity: false,
+      webSecurity: true,
     },
     titleBarStyle: 'hidden',
     frame: false,
@@ -120,13 +132,11 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
 function setupAutoUpdater() {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
-  const _t = [103,104,112,95,80,57,83,69,53,50,104,66,116,107,56,82,68,77,97,108,78,122,76,117,86,99,83,98,82,112,84,104,89,108,51,98,66,86,78,107];
   autoUpdater.setFeedURL({
     provider: 'github',
     owner: 'warzrag',
     repo: 'Spectra',
-    private: true,
-    token: _t.map(c => String.fromCharCode(c)).join(''),
+    private: false,
   });
 
   autoUpdater.on('update-available', (info) => {
@@ -171,7 +181,11 @@ ipcMain.handle('app:installUpdate', () => {
 });
 
 ipcMain.handle('app:openExternal', (_, url: string) => {
-  shell.openExternal(url);
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') {
+    throw new Error('Only HTTPS links can be opened externally');
+  }
+  return shell.openExternal(parsed.toString());
 });
 
 ipcMain.handle('app:quit', () => {
@@ -191,7 +205,7 @@ if (!gotTheLock) {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   createWindow();
 
   // Check for updates after window loads
@@ -203,7 +217,12 @@ app.whenReady().then(() => {
   PuppeteerLauncher.setMainWindow(mainWindow);
 
   // Start URL tracking server
-  urlServer.start();
+  try {
+    const localServerConfig = await urlServer.start();
+    PuppeteerLauncher.setLocalServerConfig(localServerConfig);
+  } catch (error) {
+    console.error('[LocalServer] Cookie tracking server could not start:', error);
+  }
   
   // Sync profile URL states periodically - send to renderer for Firestore update
   const urlCache = new Map<string, string>();
@@ -280,6 +299,10 @@ ipcMain.handle('app:getVersion', () => {
   return app.getVersion();
 });
 
+ipcMain.handle('diagnostics:environment', () => {
+  return PuppeteerLauncher.diagnoseEnvironment();
+});
+
 ipcMain.handle('window:minimize', () => {
   mainWindow?.minimize();
 });
@@ -337,7 +360,8 @@ ipcMain.handle('folders:getLegacy', () => {
 
 // Clean up local Chrome profile directory (Firestore handles metadata)
 ipcMain.handle('profile:cleanupLocal', (_, profileId: string) => {
-  const profileDir = path.join(os.homedir(), '.antidetect-browser', 'profiles', profileId);
+  assertSafeId(profileId, 'profile ID');
+  const profileDir = path.join(getProfilesBaseDir(), profileId);
   if (fs.existsSync(profileDir)) {
     fs.rmSync(profileDir, { recursive: true, force: true });
   }
@@ -477,6 +501,15 @@ ipcMain.handle('system:hostname', () => {
   return os.hostname();
 });
 
+ipcMain.handle('system:installationId', () => {
+  let installationId = store.get('installationId') as string | undefined;
+  if (!installationId) {
+    installationId = require('crypto').randomUUID();
+    store.set('installationId', installationId);
+  }
+  return installationId;
+});
+
 // Network handlers
 const networkManager = NetworkManager.getInstance();
 
@@ -527,15 +560,16 @@ ipcMain.handle('auth:setUser', (_, user) => {
 // Cookie handlers
 ipcMain.handle('cookies:import', async (_, profileId: string, cookieData: string, format: 'json' | 'netscape') => {
   try {
+    assertSafeId(profileId, 'profile ID');
     const { parseJsonCookies, parseNetscapeCookies } = require('./cookie-utils');
     const cookies = format === 'json' ? parseJsonCookies(cookieData) : parseNetscapeCookies(cookieData);
 
-    const profileDir = path.join(os.homedir(), '.antidetect-browser', 'profiles', profileId);
+    const profileDir = path.join(getProfilesBaseDir(), profileId);
     if (!fs.existsSync(profileDir)) {
       fs.mkdirSync(profileDir, { recursive: true });
     }
 
-    const cookieStagingPath = path.join(profileDir, 'pending_cookies.json');
+    const cookieStagingPath = path.join(profileDir, 'synced_cookies.json');
     fs.writeFileSync(cookieStagingPath, JSON.stringify(cookies));
     console.log(`Staged ${cookies.length} cookies for profile ${profileId}`);
     return { success: true, count: cookies.length };
@@ -547,10 +581,16 @@ ipcMain.handle('cookies:import', async (_, profileId: string, cookieData: string
 
 ipcMain.handle('cookies:export', async (_, profileId: string) => {
   try {
+    assertSafeId(profileId, 'profile ID');
     // Extract cookies from running browser via CDP
     if (PuppeteerLauncher.isProfileActive(profileId)) {
       const cookies = await PuppeteerLauncher.getCookies(profileId);
       return { success: true, cookies };
+    }
+    const syncedPath = path.join(getProfilesBaseDir(), profileId, 'synced_cookies.json');
+    if (fs.existsSync(syncedPath)) {
+      const cookies = JSON.parse(fs.readFileSync(syncedPath, 'utf8'));
+      return { success: true, cookies: Array.isArray(cookies) ? cookies : [] };
     }
     return { success: true, cookies: [] };
   } catch (error: any) {

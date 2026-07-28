@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as http from 'http';
 import * as net from 'net';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
 
 // Get the Chrome version this Puppeteer version supports
@@ -32,10 +32,91 @@ export interface PuppeteerLaunchOptions {
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
   private static mainWindow: any = null;
+  private static localServerConfig: { port: number; token: string } | null = null;
   private static readonly compactWindow = { width: 480, height: 500, margin: 0, gap: 0 };
+
+  private static assertSafeId(value: string, label: string): void {
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(value)) {
+      throw new Error(`Invalid ${label}`);
+    }
+  }
+
+  private static runPowerShell(script: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+        { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 },
+        (error, stdout, stderr) => {
+          if (error) {
+            reject(new Error((stderr || error.message).trim()));
+            return;
+          }
+          resolve(stdout.trim());
+        }
+      );
+    });
+  }
+
+  private static async getProfileProcessIds(profilePath: string): Promise<number[]> {
+    if (process.platform !== 'win32') return [];
+    const escapedPath = profilePath.replace(/'/g, "''");
+    try {
+      const output = await this.runPowerShell(`
+        $profilePath = '${escapedPath}'
+        Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+          Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) } |
+          ForEach-Object { $_.ProcessId }
+      `);
+      return output.split(/\r?\n/).map(Number).filter(Number.isFinite);
+    } catch (error) {
+      console.warn('[Chrome] Could not inspect existing profile processes:', error);
+      return [];
+    }
+  }
+
+  private static async waitForVisibleWindow(profilePath: string, timeoutMs = 12000): Promise<number | null> {
+    if (process.platform !== 'win32') return null;
+    const escapedPath = profilePath.replace(/'/g, "''");
+    const timeoutSeconds = Math.max(3, Math.ceil(timeoutMs / 1000));
+    const output = await this.runPowerShell(`
+      $profilePath = '${escapedPath}'
+      $deadline = (Get-Date).AddSeconds(${timeoutSeconds})
+      do {
+        $browserProcesses = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+          Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) }
+        foreach ($browserProcess in $browserProcesses) {
+          $process = Get-Process -Id $browserProcess.ProcessId -ErrorAction SilentlyContinue
+          if ($process -and $process.MainWindowHandle -ne 0) {
+            Write-Output $process.MainWindowHandle
+            exit 0
+          }
+        }
+        Start-Sleep -Milliseconds 250
+      } while ((Get-Date) -lt $deadline)
+      exit 2
+    `);
+    const handle = Number(output.split(/\r?\n/).find(Boolean));
+    return Number.isFinite(handle) && handle > 0 ? handle : null;
+  }
+
+  private static clearStaleSingletonFiles(profilePath: string): void {
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      const target = path.join(profilePath, name);
+      try {
+        if (fs.existsSync(target)) fs.rmSync(target, { force: true, recursive: true });
+      } catch (error) {
+        console.warn(`[Chrome] Could not remove stale ${name}:`, error);
+      }
+    }
+  }
 
   static setMainWindow(win: any) {
     this.mainWindow = win;
+  }
+
+  static setLocalServerConfig(config: { port: number; token: string }) {
+    this.localServerConfig = config;
   }
 
   private static sendProgress(percent: number, status: string) {
@@ -46,6 +127,47 @@ export class PuppeteerLauncher {
 
   static isProfileActive(profileId: string): boolean {
     return this.activeProfiles.has(profileId);
+  }
+
+  static async diagnoseEnvironment() {
+    const cacheDir = path.join(os.homedir(), '.antidetect-browser', 'browser');
+    const markerPath = path.join(cacheDir, '.installed');
+    const profilesDir = process.platform === 'win32'
+      ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+      : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+    let managedBrowserPath = '';
+    try {
+      managedBrowserPath = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, 'utf8').trim() : '';
+    } catch {}
+
+    let profilesDirectoryWritable = false;
+    try {
+      fs.mkdirSync(profilesDir, { recursive: true });
+      const probe = path.join(profilesDir, `.spectra-write-test-${process.pid}`);
+      fs.writeFileSync(probe, 'ok');
+      fs.unlinkSync(probe);
+      profilesDirectoryWritable = true;
+    } catch {}
+
+    let powershellAvailable = process.platform !== 'win32';
+    if (process.platform === 'win32') {
+      try {
+        powershellAvailable = (await this.runPowerShell("Write-Output 'ok'")) === 'ok';
+      } catch {}
+    }
+
+    return {
+      platform: process.platform,
+      architecture: process.arch,
+      osRelease: os.release(),
+      managedBrowserPath,
+      managedBrowserReady: Boolean(managedBrowserPath && fs.existsSync(managedBrowserPath)),
+      systemBrowserPath: this.findSystemChrome() || '',
+      profilesDir,
+      profilesDirectoryWritable,
+      powershellAvailable,
+      activeProfileIds: this.getActiveProfiles(),
+    };
   }
 
   private static focusProfileWindow(profileId: string): boolean {
@@ -273,6 +395,13 @@ public class Win32 {
     return null;
   }
 
+  private static createRuntimeExtensionCopy(runtimeRoot: string, sourcePath: string, index: number): string {
+    const sourceName = path.basename(sourcePath).replace(/[^A-Za-z0-9_-]/g, '_');
+    const destination = path.join(runtimeRoot, `${index}-${sourceName}`);
+    fs.cpSync(sourcePath, destination, { recursive: true, force: true });
+    return destination;
+  }
+
   private static createStartupTabCleanerExtension(profilePath: string, startUrl: string): string {
     const cleanerPath = path.join(profilePath, '__startup_tab_cleaner_ext');
     if (fs.existsSync(cleanerPath)) {
@@ -383,12 +512,13 @@ public class Win32 {
     }).unref();
   }
 
-  private static spawnChromeAndVerify(
+  private static async spawnChromeAndVerify(
     chromePath: string,
     args: string[],
-    env: Record<string, string | undefined>
+    env: Record<string, string | undefined>,
+    profilePath: string
   ): Promise<ChildProcess> {
-    return new Promise((resolve, reject) => {
+    const chromeProcess = await new Promise<ChildProcess>((resolve, reject) => {
       const chromeProcess = spawn(chromePath, args, {
         detached: false,
         stdio: ['ignore', 'ignore', 'pipe'],
@@ -422,6 +552,18 @@ public class Win32 {
       chromeProcess.once('error', onError);
       chromeProcess.once('exit', onEarlyExit);
     });
+
+    if (process.platform === 'win32') {
+      try {
+        const handle = await this.waitForVisibleWindow(profilePath);
+        if (!handle) throw new Error('no visible window');
+      } catch (error: any) {
+        try { chromeProcess.kill(); } catch {}
+        throw new Error(`Chrome started but no visible window appeared: ${error.message}`);
+      }
+    }
+
+    return chromeProcess;
   }
 
   /**
@@ -455,6 +597,8 @@ public class Win32 {
 
   static async launch(options: PuppeteerLaunchOptions) {
     try {
+      this.assertSafeId(options.profileId, 'profile ID');
+
       // Check if already running
       if (this.isProfileActive(options.profileId)) {
         const instance = this.activeProfiles.get(options.profileId);
@@ -473,6 +617,12 @@ public class Win32 {
       if (!fs.existsSync(profilePath)) {
         fs.mkdirSync(profilePath, { recursive: true });
       }
+
+      const existingProfileProcesses = await this.getProfileProcessIds(profilePath);
+      if (existingProfileProcesses.length > 0) {
+        return { success: false, error: 'Profile already running', alreadyRunning: true };
+      }
+      this.clearStaleSingletonFiles(profilePath);
 
       // Prepare Default directory and Preferences
       const defaultDir = path.join(profilePath, 'Default');
@@ -524,7 +674,17 @@ public class Win32 {
       }
 
       // Get Chrome for Testing (supports --load-extension for unpacked extensions)
-      const chromePath = await this.downloadChromeForTesting();
+      let chromePath: string;
+      try {
+        chromePath = await this.downloadChromeForTesting();
+      } catch (downloadError: any) {
+        const systemChrome = this.findSystemChrome();
+        if (!systemChrome) {
+          throw new Error(`Managed browser unavailable and system Chrome was not found: ${downloadError.message}`);
+        }
+        console.warn(`[Browser] Managed browser unavailable, using system Chrome: ${downloadError.message}`);
+        chromePath = systemChrome;
+      }
 
       // Build Chrome args — MINIMAL flags only
       const compactWindowSize = `${placement.width},${placement.height}`;
@@ -541,7 +701,7 @@ public class Win32 {
         `--window-size=${compactWindowSize}`,
         `--window-position=${compactWindowPosition}`,
         `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
-        '--disable-features=UserAgentClientHint,CalculateNativeWinOcclusion',
+        '--disable-features=CalculateNativeWinOcclusion',
       ];
 
       // Force User-Agent to match fingerprint (consistent across Mac/Windows)
@@ -574,7 +734,7 @@ public class Win32 {
         }
       }
 
-      // Create platform-fix extension (overrides navigator.platform to match UA)
+      // Apply the stored fingerprint before page scripts execute.
       let platformFixPath: string | null = null;
       if (userAgent) {
         const isWindows = userAgent.includes('Windows');
@@ -589,21 +749,96 @@ public class Win32 {
 
         fs.writeFileSync(path.join(platformFixPath, 'manifest.json'), JSON.stringify({
           manifest_version: 3,
-          name: 'Platform',
-          version: '1.0',
+          name: 'Spectra Fingerprint Runtime',
+          version: '2.0',
           content_scripts: [{
             matches: ['<all_urls>'],
-            js: ['platform.js'],
+            js: ['fingerprint.js'],
             run_at: 'document_start',
             all_frames: true,
             world: 'MAIN',
           }],
         }));
 
-        fs.writeFileSync(path.join(platformFixPath, 'platform.js'),
-          `Object.defineProperty(navigator, 'platform', { get: () => ${JSON.stringify(platform)} });`
-        );
-        console.log(`[Platform] Override: ${platform}`);
+        const fp = { ...(options.fingerprint || {}), platform };
+        fs.writeFileSync(path.join(platformFixPath, 'fingerprint.js'), `
+(() => {
+  const fp = ${JSON.stringify(fp)};
+  const define = (target, property, value) => {
+    if (value === undefined || value === null) return;
+    try { Object.defineProperty(target, property, { configurable: true, get: () => value }); } catch {}
+  };
+
+  define(Navigator.prototype, 'platform', fp.platform);
+  define(Navigator.prototype, 'language', fp.language);
+  define(Navigator.prototype, 'languages', Object.freeze([...(fp.languages || [fp.language])]));
+  define(Navigator.prototype, 'hardwareConcurrency', fp.hardwareConcurrency);
+  define(Navigator.prototype, 'deviceMemory', fp.deviceMemory);
+  define(Navigator.prototype, 'maxTouchPoints', fp.maxTouchPoints);
+  define(Navigator.prototype, 'vendor', fp.vendor || 'Google Inc.');
+  define(Navigator.prototype, 'doNotTrack', fp.doNotTrack ? '1' : null);
+
+  if (navigator.userAgentData) {
+    define(Object.getPrototypeOf(navigator.userAgentData), 'platform',
+      fp.platform === 'Win32' ? 'Windows' : fp.platform === 'MacIntel' ? 'macOS' : 'Linux');
+  }
+
+  const screenValues = {
+    width: fp.screenWidth,
+    height: fp.screenHeight,
+    availWidth: fp.availWidth,
+    availHeight: fp.availHeight,
+    colorDepth: fp.colorDepth,
+    pixelDepth: fp.pixelDepth,
+  };
+  for (const [key, value] of Object.entries(screenValues)) define(Screen.prototype, key, value);
+  define(window, 'devicePixelRatio', fp.devicePixelRatio);
+
+  const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445 && fp.webglVendor) return fp.webglVendor;
+    if (parameter === 37446 && fp.webglRenderer) return fp.webglRenderer;
+    return originalGetParameter.call(this, parameter);
+  };
+  if (typeof WebGL2RenderingContext !== 'undefined') {
+    const originalWebGL2GetParameter = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+      if (parameter === 37445 && fp.webglVendor) return fp.webglVendor;
+      if (parameter === 37446 && fp.webglRenderer) return fp.webglRenderer;
+      return originalWebGL2GetParameter.call(this, parameter);
+    };
+  }
+
+  if (fp.canvasNoise && fp.canvasNoiseSeed) {
+    const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    CanvasRenderingContext2D.prototype.getImageData = function(...args) {
+      const image = originalGetImageData.apply(this, args);
+      const seed = Number(fp.canvasNoiseSeed) || 1;
+      for (let index = 0; index < image.data.length; index += 4096) {
+        image.data[index] = (image.data[index] + ((seed + index) % 3) - 1) & 255;
+      }
+      return image;
+    };
+  }
+
+  if (fp.audioNoise && fp.audioNoiseSeed && typeof AudioBuffer !== 'undefined') {
+    const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+    const processed = new WeakSet();
+    AudioBuffer.prototype.getChannelData = function(channel) {
+      const data = originalGetChannelData.call(this, channel);
+      if (!processed.has(data)) {
+        const seed = Number(fp.audioNoiseSeed) || 1;
+        for (let index = 0; index < data.length; index += 500) {
+          data[index] += (((seed + index) % 5) - 2) * 1e-8;
+        }
+        processed.add(data);
+      }
+      return data;
+    };
+  }
+})();
+`);
+        console.log(`[Fingerprint] Runtime applied for ${platform}`);
       }
 
       // Create cookie-sync extension (export/import cookies for cloud sync)
@@ -617,16 +852,19 @@ public class Win32 {
         manifest_version: 3,
         name: 'Cookie Sync',
         version: '1.0',
-        permissions: ['cookies'],
+        permissions: ['cookies', 'tabs'],
         host_permissions: ['<all_urls>'],
         background: { service_worker: 'background.js' },
       }));
 
       // Write synced cookies as cookies.json for import
       const syncedCookiesPath = path.join(profilePath, 'synced_cookies.json');
+      let hasStagedCookies = false;
       if (fs.existsSync(syncedCookiesPath)) {
         try {
           const cookies = fs.readFileSync(syncedCookiesPath, 'utf8');
+          const parsedCookies = JSON.parse(cookies);
+          hasStagedCookies = Array.isArray(parsedCookies) && parsedCookies.length > 0;
           fs.writeFileSync(path.join(cookieSyncPath, 'cookies.json'), cookies);
           console.log(`[CookieSync] Loaded cookies for import`);
         } catch {}
@@ -636,7 +874,11 @@ public class Win32 {
 
       fs.writeFileSync(path.join(cookieSyncPath, 'background.js'),
 `const PROFILE_ID = ${JSON.stringify(options.profileId)};
-const SERVER = 'http://127.0.0.1:45678';
+const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
+const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
+let bootstrapPromise = null;
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 // Import cookies from cookies.json at startup
 async function importCookies() {
@@ -668,21 +910,55 @@ async function importCookies() {
   } catch (e) {}
 }
 
+async function openStartUrl() {
+  try {
+    const response = await fetch(chrome.runtime.getURL('start_url.json'));
+    if (!response.ok) return;
+    const { startUrl } = await response.json();
+    if (!/^https?:\\/\\//i.test(startUrl || '')) return;
+
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const tabs = await chrome.tabs.query({});
+      const target = tabs.find((tab) =>
+        tab.id && !/^chrome-extension:|^chrome:\\/\\//i.test(tab.url || '')
+      );
+      if (target?.id) {
+        await chrome.tabs.update(target.id, { url: startUrl, active: true });
+        return;
+      }
+      await wait(250);
+    }
+  } catch (e) {}
+}
+
+function bootstrap() {
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async () => {
+      await importCookies();
+      await openStartUrl();
+    })().finally(() => {
+      bootstrapPromise = null;
+    });
+  }
+  return bootstrapPromise;
+}
+
 // Export all cookies to local server
 async function exportCookies() {
   try {
     const cookies = await chrome.cookies.getAll({});
     await fetch(SERVER + '/api/save-cookies', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SERVER_TOKEN },
       body: JSON.stringify({ profileId: PROFILE_ID, cookies }),
     });
     console.log('[CookieSync] Exported ' + cookies.length + ' cookies');
   } catch (e) {}
 }
 
-// Import on startup
-importCookies();
+bootstrap();
+chrome.runtime.onStartup.addListener(() => bootstrap());
+chrome.runtime.onInstalled.addListener(() => bootstrap());
 
 // Export every 30 seconds
 setInterval(exportCookies, 30000);
@@ -693,30 +969,38 @@ setTimeout(exportCookies, 5000);
       );
       console.log(`[CookieSync] Created cookie sync extension`);
 
+      // Use per-profile immutable copies so an update or autostart change cannot
+      // alter extension files used by another running profile.
+      const runtimeExtensionsRoot = path.join(profilePath, '__runtime_extensions');
+      fs.rmSync(runtimeExtensionsRoot, { recursive: true, force: true });
+      fs.mkdirSync(runtimeExtensionsRoot, { recursive: true });
+
       // Collect extensions
       const extPaths: string[] = [cookieSyncPath];
       let shouldAutoStartTwitterBot = false;
       if (platformFixPath) extPaths.push(platformFixPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
-        const validPaths = options.extensionPaths.filter(p => {
+        const validPaths = options.extensionPaths.flatMap((p, index) => {
           const manifestPath = path.join(p, 'manifest.json');
           const exists = fs.existsSync(manifestPath);
-          const extensionName = exists ? this.getExtensionName(p) : null;
           console.log(`[Extensions] ${p} — manifest exists: ${exists}`);
-          if (exists && this.configureTwitterAutoReplyAutostart(p, options.autoStartTwitterBot === true)) {
+          if (!exists) return [];
+          const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, p, index);
+          if (this.configureTwitterAutoReplyAutostart(runtimePath, options.autoStartTwitterBot === true)) {
             shouldAutoStartTwitterBot = options.autoStartTwitterBot === true;
           }
-          return exists;
+          return [runtimePath];
         });
         extPaths.push(...validPaths);
       }
-      if (options.autoStartTwitterBot) {
+      if (options.autoStartTwitterBot && !shouldAutoStartTwitterBot) {
         const twitterAutoReplyPath = this.findTwitterAutoReplyExtensionPath();
-        if (twitterAutoReplyPath && !extPaths.includes(twitterAutoReplyPath)) {
-          this.configureTwitterAutoReplyAutostart(twitterAutoReplyPath, true);
+        if (twitterAutoReplyPath) {
+          const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, twitterAutoReplyPath, extPaths.length);
+          this.configureTwitterAutoReplyAutostart(runtimePath, true);
           shouldAutoStartTwitterBot = true;
-          extPaths.push(twitterAutoReplyPath);
-          console.log(`[Extensions] Auto-start extension added: ${twitterAutoReplyPath}`);
+          extPaths.push(runtimePath);
+          console.log(`[Extensions] Auto-start extension added: ${runtimePath}`);
         }
       }
       // Determine start URL
@@ -734,6 +1018,10 @@ setTimeout(exportCookies, 5000);
       if (shouldAutoStartTwitterBot && !startUrl.includes('twitter.com') && !startUrl.includes('x.com')) {
         startUrl = 'https://x.com/messages/requests';
       }
+      fs.writeFileSync(
+        path.join(cookieSyncPath, 'start_url.json'),
+        JSON.stringify({ startUrl })
+      );
 
       if (options.autoStartTwitterBot) {
         extPaths.push(this.createStartupTabCleanerExtension(profilePath, startUrl));
@@ -746,10 +1034,13 @@ setTimeout(exportCookies, 5000);
         console.log(`[Extensions] Loading ${uniqueExtPaths.length} extension(s)`);
       }
 
-      args.push(startUrl);
+      // Native Chrome cookies are encrypted for their source Windows account.
+      // On another PC, import the portable JSON cookies before navigating to X.
+      const launchUrl = hasStagedCookies ? 'about:blank' : startUrl;
+      args.push(launchUrl);
 
       console.log(`Launching Chrome: ${chromePath}`);
-      console.log(`Start URL: ${startUrl}`);
+      console.log(`Start URL: ${startUrl}${hasStagedCookies ? ' (after cookie import)' : ''}`);
       console.log(`Mode: ZERO CDP (no debug port, no WebSocket, fully clean)`);
 
       // Clean environment
@@ -770,11 +1061,11 @@ setTimeout(exportCookies, 5000);
       // normal GPU initialization and previously looked like a successful launch.
       let chromeProcess: ChildProcess;
       try {
-        chromeProcess = await this.spawnChromeAndVerify(chromePath, args, cleanEnv);
+        chromeProcess = await this.spawnChromeAndVerify(chromePath, args, cleanEnv, profilePath);
       } catch (firstError: any) {
         if (process.platform !== 'win32') throw firstError;
         console.warn(`[Chrome] Standard startup failed, retrying in VPS compatibility mode: ${firstError.message}`);
-        chromeProcess = await this.spawnChromeAndVerify(chromePath, [...args, '--disable-gpu'], cleanEnv);
+        chromeProcess = await this.spawnChromeAndVerify(chromePath, [...args, '--disable-gpu'], cleanEnv, profilePath);
       }
       this.enforceWindowPlacement(chromeProcess.pid, placement);
 
@@ -988,15 +1279,46 @@ setTimeout(exportCookies, 5000);
   }
 
   static async closeProfile(profileId: string) {
+    this.assertSafeId(profileId, 'profile ID');
     const instance = this.activeProfiles.get(profileId);
-    if (instance) {
+    if (!instance) return;
+
+    try {
+      if (process.platform === 'win32') {
+        const escapedPath = instance.profilePath.replace(/'/g, "''");
+        await this.runPowerShell(`
+          $profilePath = '${escapedPath}'
+          $deadline = (Get-Date).AddSeconds(10)
+          $browserProcesses = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) }
+          $windowProcess = $browserProcesses |
+            ForEach-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue } |
+            Where-Object { $_ -and $_.MainWindowHandle -ne 0 } |
+            Select-Object -First 1
+          if ($windowProcess) {
+            [void]$windowProcess.CloseMainWindow()
+          }
+          do {
+            Start-Sleep -Milliseconds 250
+            $remaining = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+              Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) }
+          } while ($remaining -and (Get-Date) -lt $deadline)
+          if ($remaining) {
+            $remaining | ForEach-Object {
+              Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+          }
+        `);
+      } else if (instance.chromeProcess && !instance.chromeProcess.killed) {
+        instance.chromeProcess.kill('SIGTERM');
+      }
+    } catch (error) {
+      console.warn(`[Chrome] Graceful close failed for ${profileId}, forcing shutdown:`, error);
       try {
-        if (instance.localProxyServer) instance.localProxyServer.close();
         if (instance.chromeProcess && !instance.chromeProcess.killed) {
           instance.chromeProcess.kill();
         }
       } catch {}
-      this.activeProfiles.delete(profileId);
     }
   }
 

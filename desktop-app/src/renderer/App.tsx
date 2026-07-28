@@ -51,6 +51,9 @@ declare global {
   interface Window {
     electronAPI: {
       getVersion: () => Promise<string>;
+      diagnostics?: {
+        getEnvironment: () => Promise<any>;
+      };
       window: {
         minimize: () => void;
         maximize: () => void;
@@ -137,6 +140,7 @@ declare global {
         getLocalSyncRevision: (profileId: string) => Promise<string | null>;
         setLocalSyncRevision: (profileId: string, revision: string) => Promise<boolean>;
         getHostname: () => Promise<string>;
+        getInstallationId: () => Promise<string>;
         onProfileClosed: (callback: (profileId: string) => void) => () => void;
       };
       browser?: {
@@ -177,6 +181,7 @@ function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
   const [currentDeviceName, setCurrentDeviceName] = useState<string | null>(null);
+  const [currentInstallationId, setCurrentInstallationId] = useState<string | null>(null);
 
   // Lifted states from Dashboard
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
@@ -249,6 +254,9 @@ function App() {
     window.electronAPI.profileSync?.getHostname?.()
       .then(setCurrentDeviceName)
       .catch(() => setCurrentDeviceName(null));
+    window.electronAPI.profileSync?.getInstallationId?.()
+      .then(setCurrentInstallationId)
+      .catch(() => setCurrentInstallationId(null));
   }, []);
 
   // Auth state listener
@@ -318,16 +326,17 @@ function App() {
     migrateTeam();
 
     const scopeTeamId = user.role === 'super_admin' ? null : user.teamId;
+    const assignedFolderScope = user.role === 'va' ? user.assignedFolderId : null;
 
     // Subscribe to Firestore collections (super admin = global, others = scoped by teamId)
     const unsubProfiles = subscribeToProfiles(scopeTeamId, (allProfiles) => {
       setProfiles(allProfiles);
       setLoading(false);
-    });
+    }, assignedFolderScope);
 
     const unsubFolders = subscribeToFolders(scopeTeamId, (allFolders) => {
       setFolders(allFolders);
-    });
+    }, assignedFolderScope);
 
     const unsubExtensions = subscribeToExtensions(scopeTeamId, (allExtensions) => {
       setExtensions(allExtensions);
@@ -360,10 +369,14 @@ function App() {
       } catch {}
 
       for (const p of profiles) {
-        const lockedByThisDevice = p.lockedBy === user.uid && p.lockedByDevice === currentDeviceName;
+        const lockedByThisDevice = p.lockedBy === user.uid && (
+          p.lockedByInstallationId
+            ? p.lockedByInstallationId === currentInstallationId
+            : p.lockedByDevice === currentDeviceName
+        );
         if (lockedByThisDevice && !activeIds.includes(p.id)) {
           try {
-            await releaseProfileLock(p.id, { uid: user.uid, deviceName: currentDeviceName });
+            await releaseProfileLock(p.id, { uid: user.uid, deviceName: currentDeviceName, installationId: currentInstallationId });
             console.log(`[LockCleanup] Released lock on "${p.name}" (was ${p.lockedByEmail || p.lockedBy})`);
           } catch (e) {
             console.error(`[LockCleanup] Failed to release lock on "${p.name}":`, e);
@@ -373,14 +386,14 @@ function App() {
     };
 
     cleanupLocks();
-  }, [user, currentDeviceName, profiles.length > 0]);
+  }, [user, currentDeviceName, currentInstallationId, profiles.length > 0]);
 
   useEffect(() => {
     if (!user || !currentDeviceName || activeProfiles.length === 0) return;
 
     const refreshOwnActiveLocks = () => {
       activeProfiles.forEach(profileId => {
-        refreshProfileLock(profileId, { uid: user.uid, deviceName: currentDeviceName }).catch((error) => {
+        refreshProfileLock(profileId, { uid: user.uid, deviceName: currentDeviceName, installationId: currentInstallationId }).catch((error) => {
           console.error('[LockHeartbeat] Failed to refresh lock:', error);
         });
       });
@@ -389,7 +402,7 @@ function App() {
     refreshOwnActiveLocks();
     const interval = window.setInterval(refreshOwnActiveLocks, 30000);
     return () => window.clearInterval(interval);
-  }, [user, currentDeviceName, activeProfiles]);
+  }, [user, currentDeviceName, currentInstallationId, activeProfiles]);
 
   // Keep a ref of profile IDs so the URL listener always has the latest
   const profileIdsRef = useRef<Set<string>>(new Set());
@@ -418,39 +431,47 @@ function App() {
     if (!user) return;
     if (!window.electronAPI?.profileSync?.onProfileClosed) return;
 
-    const uploadQueue: { profileId: string; profileName: string }[] = [];
+    const queueStorageKey = `spectra-profile-upload-queue:${user.uid}`;
+    let uploadQueue: { profileId: string; profileName: string }[] = [];
+    try {
+      const storedQueue = JSON.parse(localStorage.getItem(queueStorageKey) || '[]');
+      if (Array.isArray(storedQueue)) uploadQueue = storedQueue;
+    } catch {}
     let isProcessing = false;
+    let retryTimer: number | null = null;
+
+    const persistQueue = () => {
+      localStorage.setItem(queueStorageKey, JSON.stringify(uploadQueue));
+    };
 
     const processQueue = async () => {
       if (isProcessing || uploadQueue.length === 0) return;
       isProcessing = true;
 
       while (uploadQueue.length > 0) {
-        const { profileId, profileName } = uploadQueue.shift()!;
-
-        // Upload to cloud FIRST, then release lock
+        const { profileId, profileName } = uploadQueue[0];
         try {
           setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
-
           await uploadProfileToCloud(
             profileId,
             { uid: user.uid, email: user.email },
             (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
           );
-
+          await releaseProfileLock(profileId, {
+            uid: user.uid,
+            deviceName: currentDeviceName,
+            installationId: currentInstallationId,
+          });
+          uploadQueue.shift();
+          persistQueue();
           setSyncProgress(null);
-          showToast(`"${profileName}" synchronisé`, 'success');
+          showToast(`"${profileName}" synchronized`, 'success');
         } catch (error) {
-          console.error('[ProfileSync] Upload failed:', error);
+          console.error('[ProfileSync] Upload failed; lock retained:', error);
           setSyncProgress(null);
-          showToast(`Échec sync "${profileName}"`, 'error');
-        }
-
-        // Release lock AFTER upload is done (or failed)
-        try {
-          await releaseProfileLock(profileId, { uid: user.uid, deviceName: currentDeviceName });
-        } catch (error) {
-          console.error('[ProfileSync] Failed to release lock:', error);
+          showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
+          retryTimer = window.setTimeout(processQueue, 30000);
+          break;
         }
       }
 
@@ -460,12 +481,20 @@ function App() {
     const unsubscribe = window.electronAPI.profileSync.onProfileClosed(async (profileId) => {
       const profile = profilesRef.current.find(p => p.id === profileId);
       const profileName = profile?.name || profileId;
-      uploadQueue.push({ profileId, profileName });
+      if (!uploadQueue.some(item => item.profileId === profileId)) {
+        uploadQueue.push({ profileId, profileName });
+        persistQueue();
+      }
       processQueue();
     });
 
-    return () => unsubscribe();
-  }, [user]);
+    processQueue();
+
+    return () => {
+      unsubscribe();
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [user, currentDeviceName, currentInstallationId]);
 
   const handleLogout = async () => {
     if (user) {
@@ -642,17 +671,17 @@ function App() {
     }
   };
 
-  const handleLaunchProfile = async (profile: any) => {
+  const handleLaunchProfile = async (profile: any): Promise<boolean> => {
     try {
       // Check if profile is locked by another user
-      if (user && isLockedByOther(profile, user.uid, currentDeviceName)) {
+      if (user && isLockedByOther(profile, user.uid, currentDeviceName, currentInstallationId)) {
         showToast(`Profil utilisé par ${profile.lockedByEmail || 'un autre utilisateur'} sur ${profile.lockedByDevice || 'un autre PC'}`, 'warning');
-        return;
+        return false;
       }
 
       // Acquire lock
       if (user) {
-        await acquireProfileLock(profile.id, { uid: user.uid, email: user.email });
+        await acquireProfileLock(profile.id, { uid: user.uid, email: user.email }, currentInstallationId);
       }
 
       // Download from cloud if needed
@@ -673,8 +702,14 @@ function App() {
         setSyncProgress(null);
         // Never upload a stale local copy over a newer cloud revision.
         showToast('Échec du téléchargement du profil - lancement annulé', 'error');
-        await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
-        return;
+        if (user) {
+          await releaseProfileLock(profile.id, {
+            uid: user.uid,
+            deviceName: currentDeviceName,
+            installationId: currentInstallationId,
+          }).catch(() => {});
+        }
+        return false;
       }
 
       // Get enabled extensions and auto-download missing ones from cloud
@@ -700,8 +735,14 @@ function App() {
         }
         if (extensionSyncFailed) {
           showToast('Extension update failed - launch cancelled', 'error');
-          await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
-          return;
+          if (user) {
+            await releaseProfileLock(profile.id, {
+              uid: user.uid,
+              deviceName: currentDeviceName,
+              installationId: currentInstallationId,
+            }).catch(() => {});
+          }
+          return false;
         }
         extensionPaths = await window.electronAPI.extensions.getPaths(enabledExtIds);
       }
@@ -718,19 +759,35 @@ function App() {
             timestamp: new Date().toISOString(),
           }).catch(() => {});
         }
+        return true;
       } else {
         if (result.alreadyRunning) {
-          showToast(`"${profile.name}" is already running — window focused`, 'info');
+          showToast(`"${profile.name}" is already running`, 'info');
+          return true;
         } else {
           console.error('Launch failed:', result.error);
           showToast(`Launch failed: ${result.error}`, 'error');
-          await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
+          if (user) {
+            await releaseProfileLock(profile.id, {
+              uid: user.uid,
+              deviceName: currentDeviceName,
+              installationId: currentInstallationId,
+            }).catch(() => {});
+          }
+          return false;
         }
       }
     } catch (error) {
       console.error('Failed to launch profile:', error);
       showToast('Failed to launch browser', 'error');
-      await releaseProfileLock(profile.id, { uid: user.uid, deviceName: currentDeviceName }).catch(() => {});
+      if (user) {
+        await releaseProfileLock(profile.id, {
+          uid: user.uid,
+          deviceName: currentDeviceName,
+          installationId: currentInstallationId,
+        }).catch(() => {});
+      }
+      return false;
     }
   };
 
@@ -740,7 +797,7 @@ function App() {
     const profilesToLaunch = visibleProfiles.filter(p =>
       profileIds.includes(p.id) &&
       !activeProfiles.includes(p.id) &&
-      !(user && isLockedByOther(p, user.uid, currentDeviceName))
+      !(user && isLockedByOther(p, user.uid, currentDeviceName, currentInstallationId))
     );
 
     if (profilesToLaunch.length === 0) {
@@ -750,16 +807,18 @@ function App() {
 
     setBulkLaunching({ total: profilesToLaunch.length, current: 0, name: '' });
 
+    let launchedCount = 0;
     for (let i = 0; i < profilesToLaunch.length; i++) {
       const profile = profilesToLaunch[i];
       setBulkLaunching({ total: profilesToLaunch.length, current: i + 1, name: profile.name });
 
-      await handleLaunchProfile({
+      const launched = await handleLaunchProfile({
         ...profile,
         lastUrl: 'https://x.com/messages/requests',
         autoStartTwitterBot: true,
         windowLayout: { index: i, total: profilesToLaunch.length },
       });
+      if (launched) launchedCount++;
 
       // Small delay between launches to avoid overwhelming the system
       if (i < profilesToLaunch.length - 1) {
@@ -768,7 +827,13 @@ function App() {
     }
 
     setBulkLaunching(null);
-    showToast(`${profilesToLaunch.length} instances lancées`, 'success');
+    const failedCount = profilesToLaunch.length - launchedCount;
+    showToast(
+      failedCount === 0
+        ? `${launchedCount} instances launched`
+        : `${launchedCount} launched, ${failedCount} failed`,
+      failedCount === 0 ? 'success' : 'warning'
+    );
   };
 
   const handleCreateFolder = async (folderData: any) => {
@@ -896,9 +961,7 @@ function App() {
       case 'extensions':
         return hasAdminAccess ? <ExtensionsPage teamId={user?.role === 'super_admin' ? null : user?.teamId || null} teams={teams} /> : null;
       case 'diagnostics':
-        return hasAdminAccess ? (
-          <DiagnosticsPage user={user} profiles={visibleProfiles} activeProfiles={activeProfiles} />
-        ) : null;
+        return <DiagnosticsPage user={user} profiles={visibleProfiles} activeProfiles={activeProfiles} />;
       case 'settings':
         return <SettingsPage settings={settings} onSettingsChange={handleSettingsChange} user={user} onLogout={handleLogout} />;
       case 'activity':
@@ -917,7 +980,7 @@ function App() {
       case 'members':
         return hasAdminAccess ? <MembersPage teamId={user?.teamId || ''} folders={folders} /> : null;
       case 'admin-panel':
-        return user?.role === 'super_admin' || user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53' ? <AdminPage /> : null;
+        return user?.role === 'super_admin' ? <AdminPage /> : null;
       default:
         return null;
     }

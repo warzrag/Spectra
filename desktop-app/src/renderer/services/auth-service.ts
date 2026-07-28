@@ -1,12 +1,7 @@
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged as firebaseOnAuthStateChanged, User } from 'firebase/auth';
-import { doc, getDoc, setDoc, addDoc, collection, updateDoc } from 'firebase/firestore';
+import { doc, getDoc, collection, runTransaction } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import { AppUser, UserRole } from '../../types';
-
-// Admin UIDs - these users always get admin role
-const ADMIN_UIDS = [
-  'EsZbVc0qtNYwTsUmXm9drmF5hu53',
-];
 
 async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string; assignedFolderId: string | null }> {
   const userRef = doc(db, 'users', user.uid);
@@ -14,44 +9,17 @@ async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string
 
   if (userDoc.exists()) {
     const data = userDoc.data();
-    const role: UserRole = ADMIN_UIDS.includes(user.uid)
-      ? 'super_admin'
-      : (data.role as UserRole) || 'va';
+    const role: UserRole = (data.role as UserRole) || 'va';
     const teamId = data.teamId;
 
-    // Safety: if existing user has no teamId (legacy), create a team for them
     if (!teamId) {
-      const teamRef = await addDoc(collection(db, 'teams'), {
-        name: user.email || 'My Team',
-        ownerId: user.uid,
-        createdAt: new Date().toISOString(),
-      });
-      await setDoc(userRef, { ...data, teamId: teamRef.id, role }, { merge: true });
-      return { role, teamId: teamRef.id, assignedFolderId: data.assignedFolderId || null };
+      throw new Error('Ce compte doit être rattaché à une équipe par un administrateur');
     }
 
     return { role, teamId, assignedFolderId: data.assignedFolderId || null };
   }
 
-  // First login ever → create team + user document
-  const isAdmin = ADMIN_UIDS.includes(user.uid);
-  const role: UserRole = isAdmin ? 'super_admin' : 'owner'; // New users are owners; platform admins are global.
-
-  const teamRef = await addDoc(collection(db, 'teams'), {
-    name: user.email || 'My Team',
-    ownerId: user.uid,
-    createdAt: new Date().toISOString(),
-  });
-
-  await setDoc(userRef, {
-    uid: user.uid,
-    email: user.email,
-    role,
-    teamId: teamRef.id,
-    createdAt: new Date().toISOString(),
-  });
-
-  return { role, teamId: teamRef.id, assignedFolderId: null };
+  throw new Error('Compte non configuré. Utilisez un code d’invitation valide.');
 }
 
 export async function loginWithEmail(email: string, password: string): Promise<AppUser> {
@@ -89,35 +57,54 @@ export async function registerWithInviteCode(email: string, password: string, in
     // 3. Determine team based on code type
     let teamId: string;
     let role: UserRole;
+    let personalTeamRef: ReturnType<typeof doc> | null = null;
 
     if (codeData.codeType === 'team' && codeData.teamId) {
       teamId = codeData.teamId;
       role = 'va';
     } else {
-      const teamRef = await addDoc(collection(db, 'teams'), {
-        name: email,
-        ownerId: user.uid,
-        createdAt: new Date().toISOString(),
-      });
-      teamId = teamRef.id;
+      personalTeamRef = doc(collection(db, 'teams'));
+      teamId = personalTeamRef.id;
       role = 'owner';
     }
 
-    // 4. Create user document
-    await setDoc(doc(db, 'users', user.uid), {
-      uid: user.uid,
-      email: user.email,
-      role,
-      teamId,
-      createdAt: new Date().toISOString(),
-    });
+    // 4. Claim the invite and create the membership atomically.
+    await runTransaction(db, async (transaction) => {
+      const latestCodeSnap = await transaction.get(codeRef);
+      if (!latestCodeSnap.exists() || latestCodeSnap.data().used) {
+        throw new Error('Ce code a déjà été utilisé');
+      }
+      const latestCode = latestCodeSnap.data();
+      if (
+        (role === 'va' && (latestCode.codeType !== 'team' || latestCode.teamId !== teamId)) ||
+        (role === 'owner' && latestCode.codeType !== 'personal')
+      ) {
+        throw new Error('Ce code d\'invitation ne correspond pas à ce compte');
+      }
 
-    // 5. Mark invite code as used
-    await updateDoc(codeRef, {
-      used: true,
-      usedBy: user.uid,
-      usedByEmail: email,
-      usedAt: new Date().toISOString(),
+      const now = new Date().toISOString();
+      if (personalTeamRef) {
+        transaction.set(personalTeamRef, {
+          name: email,
+          ownerId: user.uid,
+          inviteCode,
+          createdAt: now,
+        });
+      }
+      transaction.set(doc(db, 'users', user.uid), {
+        uid: user.uid,
+        email: user.email,
+        role,
+        teamId,
+        inviteCode,
+        createdAt: now,
+      });
+      transaction.update(codeRef, {
+        used: true,
+        usedBy: user.uid,
+        usedByEmail: email,
+        usedAt: now,
+      });
     });
 
     return {
@@ -141,15 +128,21 @@ export async function logout(): Promise<void> {
 export function onAuthStateChanged(callback: (user: AppUser | null) => void): () => void {
   return firebaseOnAuthStateChanged(auth, async (firebaseUser) => {
     if (firebaseUser) {
-      const { role, teamId, assignedFolderId } = await resolveUser(firebaseUser);
-      callback({
-        uid: firebaseUser.uid,
-        email: firebaseUser.email || '',
-        displayName: firebaseUser.displayName,
-        role,
-        teamId,
-        assignedFolderId,
-      });
+      try {
+        const { role, teamId, assignedFolderId } = await resolveUser(firebaseUser);
+        callback({
+          uid: firebaseUser.uid,
+          email: firebaseUser.email || '',
+          displayName: firebaseUser.displayName,
+          role,
+          teamId,
+          assignedFolderId,
+        });
+      } catch (error) {
+        console.error('Unable to resolve authenticated user:', error);
+        await signOut(auth).catch(() => {});
+        callback(null);
+      }
     } else {
       callback(null);
     }

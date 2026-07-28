@@ -6,6 +6,14 @@ import { Profile } from '../../types';
 
 const STALE_LOCK_MS = 2 * 60 * 60 * 1000; // 2 hours
 
+async function sha256Hex(data: Uint8Array): Promise<string> {
+  const bytes = Uint8Array.from(data);
+  const digest = await crypto.subtle.digest('SHA-256', bytes.buffer);
+  return Array.from(new Uint8Array(digest))
+    .map(byte => byte.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 /**
  * Upload a Chrome profile to Firebase Storage after the browser closes.
  */
@@ -18,6 +26,7 @@ export async function uploadProfileToCloud(
   console.log(`[ProfileSync] Starting upload for ${profileId}`);
   const result = await (window as any).electronAPI.profileSync.zipForSync(profileId);
   const zipData = new Uint8Array(result.buffer);
+  const checksum = await sha256Hex(zipData);
   console.log(`[ProfileSync] Zip ready: ${(result.size / 1024 / 1024).toFixed(2)} MB`);
 
   // Upload an immutable revision so concurrent PCs cannot overwrite the bytes
@@ -58,6 +67,7 @@ export async function uploadProfileToCloud(
       cloudSyncSize: result.size,
       cloudSyncVersion: newVersion,
       cloudSyncRevision: revisionId,
+      cloudSyncChecksum: checksum,
       cloudSyncedBy: currentUser.uid,
     });
   });
@@ -87,6 +97,12 @@ export async function downloadProfileFromCloud(
   const blob = await getBlob(storageRef);
   const arrayBuffer = await blob.arrayBuffer();
   const zipData = new Uint8Array(arrayBuffer);
+  if (profile.cloudSyncChecksum) {
+    const actualChecksum = await sha256Hex(zipData);
+    if (actualChecksum !== profile.cloudSyncChecksum) {
+      throw new Error('Cloud profile integrity check failed');
+    }
+  }
   console.log(`[ProfileSync] Downloaded: ${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
   onProgress?.(60);
 
@@ -140,7 +156,12 @@ function getExpectedCloudRevision(profile: Profile): string | null {
 /**
  * Check if a profile is locked by another user.
  */
-export function isLockedByOther(profile: Profile, currentUserId: string, currentDeviceName?: string | null): boolean {
+export function isLockedByOther(
+  profile: Profile,
+  currentUserId: string,
+  currentDeviceName?: string | null,
+  currentInstallationId?: string | null
+): boolean {
   if (!profile.lockedBy) return false;
 
   // Check if lock is stale
@@ -150,6 +171,10 @@ export function isLockedByOther(profile: Profile, currentUserId: string, current
   }
 
   if (profile.lockedBy !== currentUserId) return true;
+
+  if (currentInstallationId && profile.lockedByInstallationId) {
+    return profile.lockedByInstallationId !== currentInstallationId;
+  }
 
   return !!(
     currentDeviceName &&
@@ -163,7 +188,8 @@ export function isLockedByOther(profile: Profile, currentUserId: string, current
  */
 export async function acquireProfileLock(
   profileId: string,
-  user: { uid: string; email: string }
+  user: { uid: string; email: string },
+  installationId?: string | null
 ): Promise<string> {
   let deviceName = 'PC';
   try {
@@ -192,6 +218,7 @@ export async function acquireProfileLock(
       lockedBy: user.uid,
       lockedByEmail: user.email,
       lockedByDevice: deviceName,
+      lockedByInstallationId: installationId || null,
       lockedAt: new Date().toISOString(),
     });
   });
@@ -204,7 +231,7 @@ export async function acquireProfileLock(
  */
 export async function refreshProfileLock(
   profileId: string,
-  owner?: { uid: string; deviceName?: string | null }
+  owner?: { uid: string; deviceName?: string | null; installationId?: string | null }
 ): Promise<void> {
   const profileRef = doc(db, 'profiles', profileId);
   await runTransaction(db, async (transaction) => {
@@ -212,6 +239,7 @@ export async function refreshProfileLock(
     const data = snapshot.data() as Profile | undefined;
     if (!data) return;
     if (owner && data.lockedBy !== owner.uid) return;
+    if (owner?.installationId && data.lockedByInstallationId && data.lockedByInstallationId !== owner.installationId) return;
     if (owner?.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
 
     transaction.update(profileRef, {
@@ -225,7 +253,7 @@ export async function refreshProfileLock(
  */
 export async function releaseProfileLock(
   profileId: string,
-  owner?: { uid: string; deviceName?: string | null }
+  owner?: { uid: string; deviceName?: string | null; installationId?: string | null }
 ): Promise<void> {
   const profileRef = doc(db, 'profiles', profileId);
   await runTransaction(db, async (transaction) => {
@@ -233,12 +261,14 @@ export async function releaseProfileLock(
     const data = snapshot.data() as Profile | undefined;
     if (!data) return;
     if (owner && data.lockedBy !== owner.uid) return;
+    if (owner?.installationId && data.lockedByInstallationId && data.lockedByInstallationId !== owner.installationId) return;
     if (owner?.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
 
     transaction.update(profileRef, {
       lockedBy: null,
       lockedByEmail: null,
       lockedByDevice: null,
+      lockedByInstallationId: null,
       lockedAt: null,
     });
   });

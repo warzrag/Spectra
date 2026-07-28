@@ -2,6 +2,9 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 contextBridge.exposeInMainWorld('electronAPI', {
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
+  diagnostics: {
+    getEnvironment: () => ipcRenderer.invoke('diagnostics:environment'),
+  },
 
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
@@ -68,6 +71,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getLocalSyncRevision: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncRevision', profileId),
     setLocalSyncRevision: (profileId: string, revision: string) => ipcRenderer.invoke('profile:setLocalSyncRevision', profileId, revision),
     getHostname: () => ipcRenderer.invoke('system:hostname'),
+    getInstallationId: () => ipcRenderer.invoke('system:installationId'),
     onProfileClosed: (callback: (profileId: string) => void) => {
       const listener = (_event: any, profileId: string) => callback(profileId);
       ipcRenderer.on('profile:closed', listener);

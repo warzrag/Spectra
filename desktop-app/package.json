@@ -1,6 +1,6 @@
 {
   "name": "spectra",
-  "version": "1.9.30",
+  "version": "1.10.1",
   "description": "Spectra - Multi-profile browser management",
   "main": "dist/src/main/main.js",
   "scripts": {
@@ -14,7 +14,9 @@
     "icons": "node scripts/generate-icon.js && node scripts/png-to-ico.js",
     "compile": "electron-builder --config electron-builder.json",
     "dist": "npm run build && npm run compile",
-    "dist:win": "npm run build && npm run compile -- --win"
+    "dist:win": "npm run build && npm run compile -- --win",
+    "test": "node --test tests/*.test.js",
+    "check": "npm run test && npm run build"
   },
   "keywords": [
     "antidetect",
@@ -23,48 +25,46 @@
   ],
   "author": "Spectra Team",
   "license": "MIT",
+  "overrides": {
+    "brace-expansion": "5.0.8"
+  },
   "devDependencies": {
+    "@tailwindcss/forms": "^0.5.10",
     "@tailwindcss/postcss": "^4.1.13",
+    "@tailwindcss/typography": "^0.5.19",
     "@types/adm-zip": "^0.5.7",
     "@types/node": "^24.3.1",
     "@types/react": "^19.1.12",
     "@types/react-dom": "^19.1.9",
+    "autoprefixer": "^10.5.4",
     "concurrently": "^9.2.1",
-    "copy-webpack-plugin": "^13.0.1",
+    "copy-webpack-plugin": "^14.0.0",
     "css-loader": "^7.1.2",
-    "electron": "^38.0.0",
-    "electron-builder": "^26.0.12",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "html-webpack-plugin": "^5.6.4",
+    "postcss": "^8.5.23",
     "postcss-loader": "^8.2.0",
     "style-loader": "^4.0.0",
+    "tailwindcss": "^3.4.17",
     "ts-loader": "^9.5.4",
     "typescript": "^5.9.2",
     "wait-on": "^8.0.4",
     "webpack": "^5.101.3",
     "webpack-cli": "^6.0.1",
-    "webpack-dev-server": "^5.2.2"
+    "webpack-dev-server": "^6.0.0"
   },
   "dependencies": {
-    "@tailwindcss/forms": "^0.5.7",
-    "@tailwindcss/typography": "^0.5.16",
-    "@types/react-router-dom": "^5.3.3",
     "7zip-bin": "^5.2.0",
-    "adm-zip": "^0.5.16",
-    "autoprefixer": "^10.4.21",
-    "axios": "^1.11.0",
+    "adm-zip": "^0.6.0",
+    "axios": "^1.18.1",
     "electron-store": "^8.1.0",
-    "electron-updater": "^6.7.3",
-    "firebase": "^12.8.0",
+    "electron-updater": "^6.8.9",
+    "firebase": "^12.16.0",
     "lucide-react": "^0.542.0",
-    "postcss": "^8.5.6",
-    "puppeteer": "^24.20.0",
-    "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer": "^25.4.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "react-router-dom": "^7.8.2",
-    "socks-proxy-agent": "^8.0.5",
-    "sqlite3": "^5.1.7",
-    "tailwindcss": "^3.4.0"
+    "socks-proxy-agent": "^8.0.5"
   }
 }

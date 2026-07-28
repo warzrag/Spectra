@@ -35,10 +35,18 @@ export interface GeneratedFingerprint {
 
 // --- Data arrays with weights ---
 
-// Chrome version MUST match the real Chrome binary (140.x)
-// Any mismatch causes Sec-CH-UA inconsistency that sites like Twitter detect
+// The advertised version must follow the managed browser bundled by Puppeteer.
+const MANAGED_CHROME_VERSION = (() => {
+  try {
+    const { PUPPETEER_REVISIONS } = require('puppeteer');
+    return PUPPETEER_REVISIONS?.chrome || '140.0.7339.82';
+  } catch {
+    return '140.0.7339.82';
+  }
+})();
+
 const CHROME_VERSIONS = [
-  { version: '140.0.7339.82', weight: 100 },
+  { version: MANAGED_CHROME_VERSION, weight: 100 },
 ];
 
 const UA_TEMPLATES: Record<string, string> = {
