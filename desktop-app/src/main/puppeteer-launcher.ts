@@ -335,7 +335,7 @@ public class Win32 {
       }
 
       sessionStorage.setItem(reloadMarker, '1');
-      window.setTimeout(() => window.location.reload(), 150);
+      console.log('[Spectra] Auto Reply DM activated without page reload');
     });
   } catch (error) {
     console.warn('[Spectra] Auto Reply DM autostart failed:', error);
