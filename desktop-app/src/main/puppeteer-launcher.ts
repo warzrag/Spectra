@@ -1052,6 +1052,9 @@ const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
 const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
 let bootstrapPromise = null;
 let bootstrapComplete = false;
+let exportInProgress = false;
+let exportAgain = false;
+let exportTimer = null;
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -1146,23 +1149,47 @@ function bootstrap() {
 
 // Export all cookies to local server
 async function exportCookies() {
+  if (exportInProgress) {
+    exportAgain = true;
+    return;
+  }
+  exportInProgress = true;
   try {
     const cookies = await chrome.cookies.getAll({});
-    await fetch(SERVER + '/api/save-cookies', {
+    const response = await fetch(SERVER + '/api/save-cookies', {
       method: 'POST',
-       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SERVER_TOKEN },
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + SERVER_TOKEN },
       body: JSON.stringify({ profileId: PROFILE_ID, cookies }),
     });
+    if (!response.ok) throw new Error('Cookie sync server returned ' + response.status);
     console.log('[CookieSync] Exported ' + cookies.length + ' cookies');
-  } catch (e) {}
+  } catch (e) {
+    console.warn('[CookieSync] Export failed', e);
+  } finally {
+    exportInProgress = false;
+    if (exportAgain) {
+      exportAgain = false;
+      scheduleExport(100);
+    }
+  }
+}
+
+function scheduleExport(delay = 750) {
+  if (exportTimer) clearTimeout(exportTimer);
+  exportTimer = setTimeout(() => {
+    exportTimer = null;
+    exportCookies();
+  }, delay);
 }
 
 bootstrap();
 chrome.runtime.onStartup.addListener(() => bootstrap());
 chrome.runtime.onInstalled.addListener(() => bootstrap());
+chrome.cookies.onChanged.addListener(() => scheduleExport());
+chrome.runtime.onSuspend.addListener(() => exportCookies());
 
-// Export every 30 seconds
-setInterval(exportCookies, 30000);
+// Safety snapshot in case Chrome does not emit a cookie change event.
+setInterval(exportCookies, 5000);
 
 // Also export after 5 seconds (initial page load)
 setTimeout(exportCookies, 5000);
@@ -1543,6 +1570,44 @@ setTimeout(exportCookies, 5000);
       if (processExited) this.activeProfiles.delete(profileId);
     }
     return Array.from(this.activeProfiles.keys());
+  }
+
+  static async getRunningProfiles(profileIds: string[]): Promise<string[]> {
+    const safeIds = Array.from(new Set(profileIds)).filter(id => {
+      try {
+        this.assertSafeId(id, 'profile ID');
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const running = new Set(this.getActiveProfiles());
+    if (process.platform !== 'win32' || safeIds.length === 0) {
+      return safeIds.filter(id => running.has(id));
+    }
+
+    const profilesRoot = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles');
+    const escapedRoot = profilesRoot.replace(/'/g, "''");
+    const powershellIds = safeIds.map(id => `'${id}'`).join(',');
+    try {
+      const output = await this.runPowerShell(`
+        $profilesRoot = '${escapedRoot}'
+        $ids = @(${powershellIds})
+        $processes = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+          Where-Object { $_.CommandLine }
+        foreach ($id in $ids) {
+          $profilePath = Join-Path $profilesRoot $id
+          if ($processes | Where-Object { $_.CommandLine.Contains($profilePath) } | Select-Object -First 1) {
+            Write-Output $id
+          }
+        }
+      `);
+      output.split(/\r?\n/).map(value => value.trim()).filter(Boolean).forEach(id => running.add(id));
+    } catch (error) {
+      console.warn('[Chrome] Could not discover running profiles:', error);
+      throw new Error('Unable to inspect running Chrome profiles');
+    }
+    return safeIds.filter(id => running.has(id));
   }
 
   static async getCookies(profileId: string): Promise<any[]> {

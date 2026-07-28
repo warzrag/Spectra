@@ -85,3 +85,47 @@ test('managed Chrome and the advertised user-agent stay version-aligned', () => 
   assert.match(launcher, /browserVersions\.get\(normalizedPath\)/);
   assert.match(launcher, /const fp = \{ \.\.\.\(options\.fingerprint \|\| \{\}\), userAgent, platform \}/);
 });
+
+test('team deletion is targeted and refuses teams that still own resources', () => {
+  const admin = read('desktop-app/src/renderer/pages/AdminPage.tsx');
+  assert.match(admin, /TEAM_RESOURCE_COLLECTIONS/);
+  assert.match(admin, /where\('teamId', '==', teamId\)/);
+  assert.match(admin, /Suppression refusée : team utilisée/);
+  assert.match(admin, /deleteDoc\(doc\(db, 'teams', teamId\)\)/);
+  assert.doesNotMatch(admin, /const ownerTeams = teams\.filter/);
+});
+
+test('cloud profile restore validates in staging and rolls back failed swaps', () => {
+  const sync = read('desktop-app/src/main/profile-sync.ts');
+  assert.match(sync, /Cloud profile archive is incomplete/);
+  assert.match(sync, /\.restore-\$\{transactionId\}/);
+  assert.match(sync, /\.backup-\$\{transactionId\}/);
+  assert.match(sync, /for \(const relativePath of installedPaths\.reverse\(\)\)/);
+  assert.match(sync, /fs\.renameSync\(savedPath, currentPath\)/);
+  assert.doesNotMatch(sync, /Failed to extract:/);
+});
+
+test('cookie and lock synchronization survive fast closes and app restarts', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const main = read('desktop-app/src/main/main.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const sync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
+  assert.match(launcher, /chrome\.cookies\.onChanged\.addListener/);
+  assert.match(launcher, /setInterval\(exportCookies, 5000\)/);
+  assert.match(main, /fs\.renameSync\(tempPath, syncedPath\)/);
+  assert.match(launcher, /static async getRunningProfiles/);
+  assert.match(app, /profiles\.getRunning\(locallyLockedIds\)/);
+  assert.match(sync, /lockedAt: serverTimestamp\(\)/);
+  assert.match(sync, /profile\.lockedByInstallationId === installationId/);
+});
+
+test('Spectra blocks shutdown and updates while profiles are active or syncing', () => {
+  const main = read('desktop-app/src/main/main.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  assert.match(main, /function hasUnsafeShutdownState/);
+  assert.match(main, /PuppeteerLauncher\.getActiveProfiles\(\)\.length > 0 \|\| profileSyncBusy/);
+  assert.match(main, /mainWindow\.on\('close'/);
+  assert.match(main, /ipcMain\.handle\('profileSync:setBusy'/);
+  assert.match(app, /profileSync\?\.setBusy\(true\)/);
+  assert.match(app, /profileSync\?\.setBusy\(false\)/);
+});

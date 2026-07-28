@@ -34,7 +34,6 @@ import {
   updateFolder as firestoreUpdateFolder,
   deleteFolder as firestoreDeleteFolder,
   migrateLocalProfiles,
-  migrateExistingDataToTeam,
 } from './services/firestore-service';
 import { Profile, Folder, Extension, Team, AppPage, AppSettings, AppUser } from '../types';
 import {
@@ -62,6 +61,7 @@ declare global {
       profiles: {
         getAll: () => Promise<Profile[]>;
         getActive: () => Promise<string[]>;
+        getRunning?: (profileIds: string[]) => Promise<string[]>;
         create: (profileData: any) => Promise<Profile>;
         update: (profileId: string, profileData: any) => Promise<Profile>;
         delete: (profileId: string) => Promise<boolean>;
@@ -139,6 +139,7 @@ declare global {
         setLocalSyncVersion: (profileId: string, version: number) => Promise<boolean>;
         getLocalSyncRevision: (profileId: string) => Promise<string | null>;
         setLocalSyncRevision: (profileId: string, revision: string) => Promise<boolean>;
+        setBusy: (busy: boolean) => Promise<boolean>;
         getHostname: () => Promise<string>;
         getInstallationId: () => Promise<string>;
         onProfileClosed: (callback: (profileId: string) => void) => () => void;
@@ -307,23 +308,13 @@ function App() {
             window.electronAPI.folders.getAll(),
           ]);
           await migrateLocalProfiles(localProfiles, localFolders, user.uid, user.teamId);
+          localStorage.setItem('spectra-firestore-migrated', 'true');
         } catch (e) {
           console.error('Migration error:', e);
         }
-        localStorage.setItem('spectra-firestore-migrated', 'true');
       }
     };
     migrate();
-
-    // Migration: assign teamId to legacy data without teamId
-    const migrateTeam = async () => {
-      try {
-        await migrateExistingDataToTeam(user.teamId);
-      } catch (e) {
-        console.error('Team migration error:', e);
-      }
-    };
-    migrateTeam();
 
     const scopeTeamId = user.role === 'super_admin' ? null : user.teamId;
     const assignedFolderScope = user.role === 'va' ? user.assignedFolderId : null;
@@ -355,18 +346,28 @@ function App() {
   }, [user]);
 
   // Release only this device/user's own stale local locks. Never clear another user's lock.
-  const lockCleanupDone = useRef(false);
+  const lockCleanupKey = useRef<string | null>(null);
   useEffect(() => {
-    if (!user || !currentDeviceName || profiles.length === 0 || lockCleanupDone.current) return;
-    lockCleanupDone.current = true;
+    if (!user || !currentDeviceName || profiles.length === 0) return;
+    const cleanupKey = `${user.uid}:${currentInstallationId || currentDeviceName}`;
+    if (lockCleanupKey.current === cleanupKey) return;
+    lockCleanupKey.current = cleanupKey;
 
     const cleanupLocks = async () => {
       let activeIds: string[] = [];
       try {
-        if (window.electronAPI?.profiles?.getActive) {
+        const locallyLockedIds = profiles
+          .filter(p => p.lockedBy === user.uid)
+          .map(p => p.id);
+        if (window.electronAPI?.profiles?.getRunning) {
+          activeIds = await window.electronAPI.profiles.getRunning(locallyLockedIds);
+        } else if (window.electronAPI?.profiles?.getActive) {
           activeIds = await window.electronAPI.profiles.getActive();
         }
-      } catch {}
+      } catch (error) {
+        console.error('[LockCleanup] Could not inspect local Chrome processes; locks retained:', error);
+        return;
+      }
 
       for (const p of profiles) {
         const lockedByThisDevice = p.lockedBy === user.uid && (
@@ -447,35 +448,39 @@ function App() {
     const processQueue = async () => {
       if (isProcessing || uploadQueue.length === 0) return;
       isProcessing = true;
+      await window.electronAPI.profileSync?.setBusy(true).catch(() => {});
 
-      while (uploadQueue.length > 0) {
-        const { profileId, profileName } = uploadQueue[0];
-        try {
-          setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
-          await uploadProfileToCloud(
-            profileId,
-            { uid: user.uid, email: user.email },
-            (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
-          );
-          await releaseProfileLock(profileId, {
-            uid: user.uid,
-            deviceName: currentDeviceName,
-            installationId: currentInstallationId,
-          });
-          uploadQueue.shift();
-          persistQueue();
-          setSyncProgress(null);
-          showToast(`"${profileName}" synchronized`, 'success');
-        } catch (error) {
-          console.error('[ProfileSync] Upload failed; lock retained:', error);
-          setSyncProgress(null);
-          showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
-          retryTimer = window.setTimeout(processQueue, 30000);
-          break;
+      try {
+        while (uploadQueue.length > 0) {
+          const { profileId, profileName } = uploadQueue[0];
+          try {
+            setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
+            await uploadProfileToCloud(
+              profileId,
+              { uid: user.uid, email: user.email },
+              (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
+            );
+            await releaseProfileLock(profileId, {
+              uid: user.uid,
+              deviceName: currentDeviceName,
+              installationId: currentInstallationId,
+            });
+            uploadQueue.shift();
+            persistQueue();
+            setSyncProgress(null);
+            showToast(`"${profileName}" synchronized`, 'success');
+          } catch (error) {
+            console.error('[ProfileSync] Upload failed; lock retained:', error);
+            setSyncProgress(null);
+            showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
+            retryTimer = window.setTimeout(processQueue, 30000);
+            break;
+          }
         }
+      } finally {
+        isProcessing = false;
+        await window.electronAPI.profileSync?.setBusy(false).catch(() => {});
       }
-
-      isProcessing = false;
     };
 
     const unsubscribe = window.electronAPI.profileSync.onProfileClosed(async (profileId) => {
@@ -497,6 +502,14 @@ function App() {
   }, [user, currentDeviceName, currentInstallationId]);
 
   const handleLogout = async () => {
+    if (activeProfiles.length > 0) {
+      showToast('Fermez les instances ouvertes et attendez leur synchronisation avant de vous déconnecter', 'warning');
+      return;
+    }
+    if (syncProgress) {
+      showToast('Synchronisation en cours : attendez sa fin avant de vous déconnecter', 'warning');
+      return;
+    }
     if (user) {
       logActivity({
         teamId: user.teamId,
@@ -512,6 +525,10 @@ function App() {
   };
 
   const handleSwitchAccount = async (email: string, password: string) => {
+    if (activeProfiles.length > 0 || syncProgress) {
+      showToast('Fermez les instances et attendez leur synchronisation avant de changer de compte', 'warning');
+      return;
+    }
     try {
       await authLogout();
       setUser(null);

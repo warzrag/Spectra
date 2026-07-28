@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import { Crown, Users, UsersRound, Ticket, Trash2, Shield, Eye, Calendar, MoreVertical, Loader2, Monitor, RefreshCw } from 'lucide-react';
-import { collection, getDocs, doc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { collection, getDocs, doc, updateDoc, deleteDoc, limit, query, where } from 'firebase/firestore';
 import { db } from '../services/firebase';
 import { useToast } from '../contexts/ToastContext';
 import { UserRole } from '../../types';
@@ -37,6 +37,15 @@ interface AdminInviteCode {
   createdAt: string;
   usedByEmail?: string;
 }
+
+const TEAM_RESOURCE_COLLECTIONS = [
+  { name: 'users', label: 'membre' },
+  { name: 'profiles', label: 'instance' },
+  { name: 'folders', label: 'dossier' },
+  { name: 'extensions', label: 'extension' },
+  { name: 'proxies', label: 'proxy' },
+  { name: 'activityLogs', label: 'journal' },
+] as const;
 
 const AdminPage: React.FC = () => {
   const { showToast } = useToast();
@@ -120,36 +129,52 @@ const AdminPage: React.FC = () => {
     } catch { showToast('Erreur', 'error'); }
   };
 
+  const getTeamResources = async (teamId: string): Promise<string[]> => {
+    const results = await Promise.all(TEAM_RESOURCE_COLLECTIONS.map(async ({ name, label }) => {
+      const snapshot = await getDocs(query(collection(db, name), where('teamId', '==', teamId), limit(1)));
+      return snapshot.empty ? null : label;
+    }));
+    return results.filter(label => label !== null);
+  };
+
   const handleDeleteEmptyTeams = async (ownerId: string, keepTeamId: string) => {
-    const toDelete = teams.filter(t => t.ownerId === ownerId && t.id !== keepTeamId);
-    if (toDelete.length === 0) return;
-    if (!window.confirm(`Supprimer ${toDelete.length} team(s) vide(s) en doublon ?`)) return;
+    const candidates = teams.filter(t => t.ownerId === ownerId && t.id !== keepTeamId);
+    if (candidates.length === 0) return;
     try {
-      for (const t of toDelete) {
+      const checks = await Promise.all(candidates.map(async team => ({
+        team,
+        resources: await getTeamResources(team.id),
+      })));
+      const emptyTeams = checks.filter(check => check.resources.length === 0).map(check => check.team);
+      const protectedTeams = checks.filter(check => check.resources.length > 0);
+
+      if (emptyTeams.length === 0) {
+        showToast('Aucun doublon vide : aucune team supprimée', 'error');
+        return;
+      }
+      const protectedMessage = protectedTeams.length > 0
+        ? `\n\n${protectedTeams.length} team(s) avec des données seront conservées.`
+        : '';
+      if (!window.confirm(`Supprimer uniquement ${emptyTeams.length} team(s) réellement vide(s) ?${protectedMessage}`)) return;
+
+      for (const t of emptyTeams) {
         await deleteDoc(doc(db, 'teams', t.id));
       }
-      showToast(`${toDelete.length} team(s) supprimée(s)`, 'success');
+      showToast(`${emptyTeams.length} team(s) vide(s) supprimée(s)`, 'success');
       await loadAll(); // Recharge tout depuis Firestore
     } catch { showToast('Erreur suppression', 'error'); }
   };
 
-  const handleDeleteTeam = async (teamId: string, ownerId: string) => {
-    const teamMembers = users.filter(u => u.teamId === teamId);
-    const msg = teamMembers.length > 0
-      ? `Supprimer cette team ? (${teamMembers.length} membre(s) seront sans team)`
-      : 'Supprimer cette team vide ?';
-    if (!window.confirm(msg)) return;
+  const handleDeleteTeam = async (teamId: string) => {
     try {
-      // Delete all team docs for this owner
-      const ownerTeams = teams.filter(t => t.ownerId === ownerId);
-      for (const t of ownerTeams) {
-        await deleteDoc(doc(db, 'teams', t.id));
+      const resources = await getTeamResources(teamId);
+      if (resources.length > 0) {
+        showToast(`Suppression refusée : team utilisée (${resources.join(', ')})`, 'error');
+        return;
       }
-      // Remove teamId from members so they become orphans
-      for (const m of teamMembers) {
-        await updateDoc(doc(db, 'users', m.uid), { teamId: '' });
-      }
-      showToast('Team supprimée', 'success');
+      if (!window.confirm('Supprimer cette team vide ? Cette action est définitive.')) return;
+      await deleteDoc(doc(db, 'teams', teamId));
+      showToast('Team vide supprimée', 'success');
       await loadAll();
     } catch { showToast('Erreur suppression team', 'error'); }
   };
@@ -270,7 +295,7 @@ const AdminPage: React.FC = () => {
               </div>
               {/* Delete team — not for super admin's own team */}
               {team.ownerId !== SUPER_ADMIN_UID && (
-                <button onClick={() => handleDeleteTeam(team.id, team.ownerId)}
+                <button onClick={() => handleDeleteTeam(team.id)}
                   className="p-1.5 rounded-lg transition-colors" style={{ color: 'var(--text-muted)' }}
                   onMouseEnter={e => { e.currentTarget.style.color = 'var(--danger)'; e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; }}
                   onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; e.currentTarget.style.background = 'transparent'; }}

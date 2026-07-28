@@ -55,6 +55,26 @@ const store = new Store({
 let mainWindow: BrowserWindow | null = null;
 const profileWindows = new Map<string, BrowserWindow>();
 const urlServer = new UrlTrackingServer();
+let profileSyncBusy = false;
+
+function hasUnsafeShutdownState(): boolean {
+  return PuppeteerLauncher.getActiveProfiles().length > 0 || profileSyncBusy;
+}
+
+function showUnsafeShutdownWarning(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const detail = PuppeteerLauncher.getActiveProfiles().length > 0
+    ? 'Fermez toutes les instances, puis attendez le message de synchronisation avant de quitter Spectra.'
+    : 'Un profil est encore en cours de synchronisation. Attendez la fin avant de quitter Spectra.';
+  dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    title: 'Synchronisation requise',
+    message: 'Spectra ne peut pas se fermer maintenant.',
+    detail,
+    buttons: ['OK'],
+    defaultId: 0,
+  }).catch(() => {});
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -76,6 +96,12 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
+  });
+
+  mainWindow.on('close', (event) => {
+    if (!hasUnsafeShutdownState()) return;
+    event.preventDefault();
+    showUnsafeShutdownWarning();
   });
 
   if (isDev) {
@@ -177,7 +203,12 @@ ipcMain.handle('app:startDownload', () => {
 });
 
 ipcMain.handle('app:installUpdate', () => {
+  if (hasUnsafeShutdownState()) {
+    showUnsafeShutdownWarning();
+    return false;
+  }
   autoUpdater.quitAndInstall(false, true);
+  return true;
 });
 
 ipcMain.handle('app:openExternal', (_, url: string) => {
@@ -189,7 +220,12 @@ ipcMain.handle('app:openExternal', (_, url: string) => {
 });
 
 ipcMain.handle('app:quit', () => {
+  if (hasUnsafeShutdownState()) {
+    showUnsafeShutdownWarning();
+    return false;
+  }
   app.quit();
+  return true;
 });
 
 // Prevent multiple instances of the app
@@ -284,11 +320,20 @@ ipcMain.on('internal:save-url', (_, profileId, url) => {
 // Handle internal cookie save event — save to synced_cookies.json for cloud sync
 ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
   try {
+    if (typeof profileId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
+      throw new Error('Invalid profile ID');
+    }
+    if (!Array.isArray(cookies)) {
+      throw new Error('Invalid cookie payload');
+    }
     const userDataDir = process.platform === 'win32'
       ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
       : path.join(os.homedir(), '.antidetect-browser', 'profiles');
     const syncedPath = path.join(userDataDir, profileId, 'synced_cookies.json');
-    fs.writeFileSync(syncedPath, JSON.stringify(cookies));
+    const tempPath = `${syncedPath}.${process.pid}.tmp`;
+    fs.mkdirSync(path.dirname(syncedPath), { recursive: true });
+    fs.writeFileSync(tempPath, JSON.stringify(cookies));
+    fs.renameSync(tempPath, syncedPath);
     console.log(`[CookieSync] Saved ${cookies.length} cookies for profile ${profileId}`);
   } catch (e: any) {
     console.error('[CookieSync] Error saving cookies:', e.message);
@@ -347,6 +392,15 @@ ipcMain.handle('profile:close', async (_, profileId) => {
 
 ipcMain.handle('profiles:getActive', () => {
   return PuppeteerLauncher.getActiveProfiles();
+});
+
+ipcMain.handle('profiles:getRunning', async (_, profileIds: string[]) => {
+  return PuppeteerLauncher.getRunningProfiles(Array.isArray(profileIds) ? profileIds : []);
+});
+
+ipcMain.handle('profileSync:setBusy', (_, busy: boolean) => {
+  profileSyncBusy = busy === true;
+  return true;
 });
 
 // Legacy local handlers - kept for migration support

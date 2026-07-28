@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Legacy: used only for one-time migration to Firestore
     getAll: () => ipcRenderer.invoke('profiles:getAll'),
     getActive: () => ipcRenderer.invoke('profiles:getActive'),
+    getRunning: (profileIds: string[]) => ipcRenderer.invoke('profiles:getRunning', profileIds),
     // Launch/close still go through main process (Puppeteer is local)
     launch: (profileId: string, profileData: any) => ipcRenderer.invoke('profile:launch', profileId, profileData),
     close: (profileId: string) => ipcRenderer.invoke('profile:close', profileId),
@@ -70,6 +71,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     setLocalSyncVersion: (profileId: string, version: number) => ipcRenderer.invoke('profile:setLocalSyncVersion', profileId, version),
     getLocalSyncRevision: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncRevision', profileId),
     setLocalSyncRevision: (profileId: string, revision: string) => ipcRenderer.invoke('profile:setLocalSyncRevision', profileId, revision),
+    setBusy: (busy: boolean) => ipcRenderer.invoke('profileSync:setBusy', busy),
     getHostname: () => ipcRenderer.invoke('system:hostname'),
     getInstallationId: () => ipcRenderer.invoke('system:installationId'),
     onProfileClosed: (callback: (profileId: string) => void) => {

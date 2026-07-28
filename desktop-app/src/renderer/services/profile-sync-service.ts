@@ -1,10 +1,19 @@
 import { ref, uploadBytes, uploadBytesResumable, getDownloadURL, getBlob } from 'firebase/storage';
-import { doc, runTransaction } from 'firebase/firestore';
+import { doc, runTransaction, serverTimestamp } from 'firebase/firestore';
 import { storage } from './firebase';
 import { db } from './firebase';
 import { Profile } from '../../types';
 
 const STALE_LOCK_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+function getLockTimeMillis(value: unknown): number | null {
+  if (!value) return null;
+  if (typeof value === 'object' && typeof (value as { toMillis?: unknown }).toMillis === 'function') {
+    return (value as { toMillis: () => number }).toMillis();
+  }
+  const parsed = new Date(value as string | number | Date).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const bytes = Uint8Array.from(data);
@@ -177,8 +186,8 @@ export function isLockedByOther(
 
   // Check if lock is stale
   if (profile.lockedAt) {
-    const lockAge = Date.now() - new Date(profile.lockedAt).getTime();
-    if (lockAge > STALE_LOCK_MS) return false; // Stale lock, can override
+    const lockTime = getLockTimeMillis(profile.lockedAt);
+    if (lockTime !== null && Date.now() - lockTime > STALE_LOCK_MS) return false;
   }
 
   if (profile.lockedBy !== currentUserId) return true;
@@ -213,13 +222,16 @@ export async function acquireProfileLock(
     if (!snapshot.exists()) throw new Error('Profile no longer exists');
 
     const profile = snapshot.data() as Profile;
-    const lockAge = profile.lockedAt
-      ? Date.now() - new Date(profile.lockedAt).getTime()
-      : Number.POSITIVE_INFINITY;
-    const lockIsFresh = Boolean(profile.lockedBy && lockAge <= STALE_LOCK_MS);
-    const belongsToThisDevice =
-      profile.lockedBy === user.uid &&
-      (!profile.lockedByDevice || profile.lockedByDevice === deviceName);
+    const lockTime = getLockTimeMillis(profile.lockedAt);
+    const lockIsFresh = Boolean(
+      profile.lockedBy &&
+      (lockTime === null || Date.now() - lockTime <= STALE_LOCK_MS)
+    );
+    const belongsToThisDevice = profile.lockedBy === user.uid && (
+      profile.lockedByInstallationId
+        ? Boolean(installationId && profile.lockedByInstallationId === installationId)
+        : (!profile.lockedByDevice || profile.lockedByDevice === deviceName)
+    );
 
     if (lockIsFresh && !belongsToThisDevice) {
       throw new Error(`Profile in use by ${profile.lockedByEmail || 'another user'} on ${profile.lockedByDevice || 'another PC'}`);
@@ -230,7 +242,7 @@ export async function acquireProfileLock(
       lockedByEmail: user.email,
       lockedByDevice: deviceName,
       lockedByInstallationId: installationId || null,
-      lockedAt: new Date().toISOString(),
+      lockedAt: serverTimestamp(),
     });
   });
 
@@ -254,7 +266,7 @@ export async function refreshProfileLock(
     if (owner?.deviceName && data.lockedByDevice && data.lockedByDevice !== owner.deviceName) return;
 
     transaction.update(profileRef, {
-      lockedAt: new Date().toISOString(),
+      lockedAt: serverTimestamp(),
     });
   });
 }

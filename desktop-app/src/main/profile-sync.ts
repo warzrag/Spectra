@@ -62,6 +62,16 @@ function getProfilePath(profileId: string): string {
   return path.join(getProfilesBaseDir(), profileId);
 }
 
+function addFile(zip: AdmZip, sourcePath: string, zipPath: string): void {
+  try {
+    zip.addFile(zipPath, fs.readFileSync(sourcePath));
+  } catch (error: any) {
+    // Journal files can disappear between existsSync and readFileSync.
+    if (error?.code === 'ENOENT') return;
+    throw new Error(`Unable to read profile data "${zipPath}": ${error?.message || error}`);
+  }
+}
+
 function addDirRecursive(zip: AdmZip, dirPath: string, zipPrefix: string): void {
   if (!fs.existsSync(dirPath)) return;
 
@@ -73,14 +83,20 @@ function addDirRecursive(zip: AdmZip, dirPath: string, zipPrefix: string): void 
     if (entry.isDirectory()) {
       addDirRecursive(zip, fullPath, zipPath);
     } else if (entry.isFile()) {
-      try {
-        const content = fs.readFileSync(fullPath);
-        zip.addFile(zipPath, content);
-      } catch {
-        // Skip locked files
-      }
+      addFile(zip, fullPath, zipPath);
     }
   }
+}
+
+function isAllowedArchivePath(entryName: string): boolean {
+  const normalized = entryName.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!normalized || normalized.startsWith('/') || normalized.includes('../')) return false;
+  if (ROOT_FILES.has(normalized)) return true;
+  if (!normalized.startsWith('Default/')) return false;
+
+  const relative = normalized.slice('Default/'.length);
+  if (ESSENTIAL_FILES.has(relative)) return true;
+  return Array.from(ESSENTIAL_DIRS).some(dir => relative === dir || relative.startsWith(`${dir}/`));
 }
 
 /**
@@ -103,9 +119,7 @@ export async function zipProfileDir(profileId: string): Promise<{ buffer: Buffer
   for (const file of ROOT_FILES) {
     const fullPath = path.join(profilePath, file);
     if (fs.existsSync(fullPath)) {
-      try {
-        zip.addFile(file, fs.readFileSync(fullPath));
-      } catch {}
+      addFile(zip, fullPath, file);
     }
   }
 
@@ -114,9 +128,7 @@ export async function zipProfileDir(profileId: string): Promise<{ buffer: Buffer
     for (const file of ESSENTIAL_FILES) {
       const fullPath = path.join(defaultPath, file);
       if (fs.existsSync(fullPath)) {
-        try {
-          zip.addFile(`Default/${file}`, fs.readFileSync(fullPath));
-        } catch {}
+        addFile(zip, fullPath, `Default/${file}`);
       }
     }
 
@@ -144,45 +156,88 @@ export async function unzipProfileDir(profileId: string, zipBuffer: Buffer): Pro
 
   console.log(`[ProfileSync] Unzipping profile: ${profileId}`);
 
-  // Create profile dir if it doesn't exist
-  fs.mkdirSync(profilePath, { recursive: true });
-
   const zip = new AdmZip(zipBuffer);
-  const entries = zip.getEntries();
-  const profileRoot = path.resolve(profilePath);
-
-  // LevelDB-backed directories cannot be merged file by file. Stale MANIFEST,
-  // LOG or table files can win over the downloaded state and lose extension
-  // keys. Replace every managed directory represented by this snapshot.
-  for (const dir of ESSENTIAL_DIRS) {
-    const zipPrefix = `Default/${dir}/`;
-    const isIncluded = entries.some(entry =>
-      entry.entryName.replace(/\\/g, '/').startsWith(zipPrefix)
-    );
-    if (!isIncluded) continue;
-
-    const targetDir = path.resolve(profilePath, 'Default', dir);
-    if (targetDir.startsWith(`${profileRoot}${path.sep}`) && fs.existsSync(targetDir)) {
-      fs.rmSync(targetDir, { recursive: true, force: true });
+  const entries = zip.getEntries().filter(entry => !entry.isDirectory);
+  if (entries.length === 0) {
+    throw new Error('Cloud profile archive is empty');
+  }
+  if (!entries.some(entry => entry.entryName.replace(/\\/g, '/') === 'Default/Preferences')) {
+    throw new Error('Cloud profile archive is incomplete (missing Default/Preferences)');
+  }
+  for (const entry of entries) {
+    if (!isAllowedArchivePath(entry.entryName)) {
+      throw new Error(`Cloud profile archive contains an invalid path: ${entry.entryName}`);
     }
   }
 
-  for (const entry of entries) {
-    if (entry.isDirectory) continue;
+  const transactionId = `${process.pid}-${Date.now()}`;
+  const stagingPath = `${profilePath}.restore-${transactionId}`;
+  const backupPath = `${profilePath}.backup-${transactionId}`;
+  fs.mkdirSync(stagingPath, { recursive: true });
 
-    const targetPath = path.resolve(profilePath, entry.entryName);
-    if (!targetPath.startsWith(`${profileRoot}${path.sep}`)) {
-      console.warn(`[ProfileSync] Skipped unsafe archive path: ${entry.entryName}`);
-      continue;
-    }
-    const targetDir = path.dirname(targetPath);
+  const stagedRoot = path.resolve(stagingPath);
+  const representedPaths = new Set<string>();
 
-    try {
-      fs.mkdirSync(targetDir, { recursive: true });
+  try {
+    for (const entry of entries) {
+      const normalized = entry.entryName.replace(/\\/g, '/');
+      const targetPath = path.resolve(stagingPath, ...normalized.split('/'));
+      if (!targetPath.startsWith(`${stagedRoot}${path.sep}`)) {
+        throw new Error(`Cloud profile archive path escapes staging: ${entry.entryName}`);
+      }
+
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
       fs.writeFileSync(targetPath, entry.getData());
-    } catch (err) {
-      console.warn(`[ProfileSync] Failed to extract: ${entry.entryName}`, err);
+
+      if (ROOT_FILES.has(normalized)) {
+        representedPaths.add(normalized);
+      } else {
+        const relative = normalized.slice('Default/'.length);
+        const managedDir = Array.from(ESSENTIAL_DIRS).find(dir =>
+          relative === dir || relative.startsWith(`${dir}/`)
+        );
+        representedPaths.add(managedDir ? `Default/${managedDir}` : normalized);
+      }
     }
+
+    fs.mkdirSync(profilePath, { recursive: true });
+    fs.mkdirSync(backupPath, { recursive: true });
+
+    const installedPaths: string[] = [];
+    const backedUpPaths: string[] = [];
+    try {
+      for (const relativePath of representedPaths) {
+        const currentPath = path.join(profilePath, ...relativePath.split('/'));
+        const stagedPath = path.join(stagingPath, ...relativePath.split('/'));
+        const savedPath = path.join(backupPath, ...relativePath.split('/'));
+
+        if (fs.existsSync(currentPath)) {
+          fs.mkdirSync(path.dirname(savedPath), { recursive: true });
+          fs.renameSync(currentPath, savedPath);
+          backedUpPaths.push(relativePath);
+        }
+
+        fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+        fs.renameSync(stagedPath, currentPath);
+        installedPaths.push(relativePath);
+      }
+    } catch (error) {
+      for (const relativePath of installedPaths.reverse()) {
+        fs.rmSync(path.join(profilePath, ...relativePath.split('/')), { recursive: true, force: true });
+      }
+      for (const relativePath of backedUpPaths.reverse()) {
+        const savedPath = path.join(backupPath, ...relativePath.split('/'));
+        const currentPath = path.join(profilePath, ...relativePath.split('/'));
+        if (fs.existsSync(savedPath)) {
+          fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+          fs.renameSync(savedPath, currentPath);
+        }
+      }
+      throw error;
+    }
+  } finally {
+    fs.rmSync(stagingPath, { recursive: true, force: true });
+    fs.rmSync(backupPath, { recursive: true, force: true });
   }
 
   console.log(`[ProfileSync] Profile extracted successfully (${entries.length} files)`);
