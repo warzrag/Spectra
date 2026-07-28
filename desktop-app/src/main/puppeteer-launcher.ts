@@ -24,6 +24,7 @@ export interface PuppeteerLaunchOptions {
 
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
+  private static browserVersions = new Map<string, Promise<string | null>>();
   private static mainWindow: any = null;
   private static localServerConfig: { port: number; token: string } | null = null;
   private static readonly compactWindow = { width: 480, height: 500, margin: 0, gap: 0 };
@@ -52,22 +53,41 @@ export class PuppeteerLauncher {
   }
 
   private static async getBrowserVersion(executablePath: string): Promise<string | null> {
-    const pathVersion = executablePath.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
+    const normalizedPath = path.resolve(executablePath);
+    const managedBrowserRoot = path.join(
+      os.homedir(),
+      '.antidetect-browser',
+      'browser',
+      'chrome'
+    );
+    const pathVersion = normalizedPath.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
 
-    if (process.platform === 'win32') {
-      const escapedPath = executablePath.replace(/'/g, "''");
-      try {
-        const version = await this.runPowerShell(
-          `(Get-Item -LiteralPath '${escapedPath}').VersionInfo.FileVersion`
-        );
-        const normalized = version.match(/\d+\.\d+\.\d+\.\d+/)?.[0];
-        if (normalized) return normalized;
-      } catch (error) {
-        console.warn('[Browser] Could not inspect executable version:', error);
-      }
+    if (pathVersion && normalizedPath.startsWith(`${managedBrowserRoot}${path.sep}`)) {
+      return pathVersion;
     }
 
-    return pathVersion || null;
+    const cached = this.browserVersions.get(normalizedPath);
+    if (cached) return cached;
+
+    const versionPromise = (async () => {
+      if (process.platform === 'win32') {
+        const escapedPath = normalizedPath.replace(/'/g, "''");
+        try {
+          const version = await this.runPowerShell(
+            `(Get-Item -LiteralPath '${escapedPath}').VersionInfo.FileVersion`
+          );
+          const normalized = version.match(/\d+\.\d+\.\d+\.\d+/)?.[0];
+          if (normalized) return normalized;
+        } catch (error) {
+          console.warn('[Browser] Could not inspect executable version:', error);
+        }
+      }
+
+      return pathVersion || null;
+    })();
+
+    this.browserVersions.set(normalizedPath, versionPromise);
+    return versionPromise;
   }
 
   private static alignUserAgentToBrowser(userAgent: string, browserVersion: string | null): string {

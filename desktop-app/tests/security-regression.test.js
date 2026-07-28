@@ -81,5 +81,7 @@ test('managed Chrome and the advertised user-agent stay version-aligned', () => 
   assert.match(launcher, /cachedVersion === MANAGED_CHROME_VERSION/);
   assert.match(launcher, /alignUserAgentToBrowser/);
   assert.match(launcher, /Correcting Chrome User-Agent mismatch/);
+  assert.match(launcher, /normalizedPath\.startsWith\(`\$\{managedBrowserRoot\}\$\{path\.sep\}`\)/);
+  assert.match(launcher, /browserVersions\.get\(normalizedPath\)/);
   assert.match(launcher, /const fp = \{ \.\.\.\(options\.fingerprint \|\| \{\}\), userAgent, platform \}/);
 });
