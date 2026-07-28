@@ -428,6 +428,59 @@ public class Win32 {
     return destination;
   }
 
+  private static suppressExtensionInstallTabs(runtimePath: string): boolean {
+    const manifestPath = path.join(runtimePath, 'manifest.json');
+    if (!fs.existsSync(manifestPath)) return false;
+
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      const extensionName = String(manifest.name || '').toLowerCase();
+      const serviceWorker = manifest.background?.service_worker;
+      if (
+        !extensionName.includes('shadowban scanner') ||
+        typeof serviceWorker !== 'string' ||
+        manifest.background?.type === 'module'
+      ) {
+        return false;
+      }
+
+      const workerPath = path.join(runtimePath, serviceWorker);
+      if (!fs.existsSync(workerPath)) return false;
+
+      const workerSource = fs.readFileSync(workerPath, 'utf8');
+      if (!workerSource.includes('html/initialSetup.html')) return false;
+
+      const workerDirectory = path.dirname(workerPath);
+      const workerExtension = path.extname(workerPath);
+      const workerBaseName = path.basename(workerPath, workerExtension);
+      const originalWorkerName = `${workerBaseName}.spectra-original${workerExtension}`;
+      const originalWorkerPath = path.join(workerDirectory, originalWorkerName);
+      fs.renameSync(workerPath, originalWorkerPath);
+
+      fs.writeFileSync(workerPath, `
+const spectraTabsCreate = chrome.tabs.create.bind(chrome.tabs);
+chrome.tabs.create = (createProperties, callback) => {
+  const url = String(createProperties?.url || '');
+  if (/\\/html\\/initialSetup\\.html(?:[?#]|$)/i.test(url)) {
+    if (typeof callback === 'function') {
+      queueMicrotask(() => callback());
+      return;
+    }
+    return Promise.resolve();
+  }
+  return spectraTabsCreate(createProperties, callback);
+};
+
+importScripts(${JSON.stringify(originalWorkerName)});
+`);
+      console.log(`[Extensions] Suppressed automatic setup tab for ${manifest.name}`);
+      return true;
+    } catch (error) {
+      console.warn('[Extensions] Could not suppress automatic setup tab:', error);
+      return false;
+    }
+  }
+
   private static createStartupTabCleanerExtension(profilePath: string, startUrl: string): string {
     const cleanerPath = path.join(profilePath, '__startup_tab_cleaner_ext');
     if (fs.existsSync(cleanerPath)) {
@@ -447,27 +500,33 @@ public class Win32 {
 const START_URL = ${JSON.stringify(startUrl)};
 const isTargetTab = (url) => /^https?:\\/\\/(www\\.)?(x\\.com|twitter\\.com)\\//i.test(url || '');
 const normalizeUrl = (url) => String(url || '').replace(/\\/+$/, '');
+const cleanupStartedAt = Date.now();
 let cleanupUntil = Date.now() + 20000;
 let cleanupTimer = null;
 
 async function cleanTabs() {
   try {
     const tabs = await chrome.tabs.query({});
-    const targetTabs = tabs.filter((tab) => tab.id && isTargetTab(tab.url));
+    const targetTabs = tabs.filter((tab) =>
+      tab.id && isTargetTab(tab.pendingUrl || tab.url)
+    );
 
     if (targetTabs.length === 0) {
+      if (Date.now() - cleanupStartedAt >= 3000) {
+        await chrome.tabs.create({ url: START_URL, active: true }).catch(() => {});
+      }
       scheduleCleanTabs(1000);
       return;
     }
 
     const exactTarget = targetTabs.find((tab) =>
-      normalizeUrl(tab.url) === normalizeUrl(START_URL)
+      normalizeUrl(tab.pendingUrl || tab.url) === normalizeUrl(START_URL)
     );
     const target = exactTarget || targetTabs[0];
     if (!target?.id) return;
 
     const update = { active: true };
-    if (normalizeUrl(target.url) !== normalizeUrl(START_URL)) {
+    if (normalizeUrl(target.pendingUrl || target.url) !== normalizeUrl(START_URL)) {
       update.url = START_URL;
     }
     await chrome.tabs.update(target.id, update).catch(() => {});
@@ -959,19 +1018,43 @@ async function openStartUrl() {
   try {
     const response = await fetch(chrome.runtime.getURL('start_url.json'));
     if (!response.ok) return;
-    const { startUrl } = await response.json();
+    const { startUrl, closeOtherTabs } = await response.json();
     if (!/^https?:\\/\\//i.test(startUrl || '')) return;
 
     for (let attempt = 0; attempt < 40; attempt++) {
       const tabs = await chrome.tabs.query({});
-      const target = tabs.find((tab) =>
-        tab.id && !/^chrome-extension:|^chrome:\\/\\//i.test(tab.url || '')
+      let target = tabs.find((tab) =>
+        tab.id && String(tab.pendingUrl || tab.url || '').startsWith(startUrl)
       );
+      if (!target) {
+        target = tabs.find((tab) =>
+          tab.id && !/^chrome-extension:|^chrome:\\/\\//i.test(tab.pendingUrl || tab.url || '')
+        );
+      }
       if (target?.id) {
         await chrome.tabs.update(target.id, { url: startUrl, active: true });
+        if (closeOtherTabs) {
+          const otherTabIds = tabs
+            .filter((tab) => tab.id && tab.id !== target.id)
+            .map((tab) => tab.id);
+          if (otherTabIds.length > 0) {
+            await chrome.tabs.remove(otherTabIds).catch(() => {});
+          }
+        }
         return;
       }
       await wait(250);
+    }
+
+    const target = await chrome.tabs.create({ url: startUrl, active: true });
+    if (closeOtherTabs && target?.id) {
+      const tabs = await chrome.tabs.query({});
+      const otherTabIds = tabs
+        .filter((tab) => tab.id && tab.id !== target.id)
+        .map((tab) => tab.id);
+      if (otherTabIds.length > 0) {
+        await chrome.tabs.remove(otherTabIds).catch(() => {});
+      }
     }
   } catch (e) {}
 }
@@ -1031,6 +1114,7 @@ setTimeout(exportCookies, 5000);
           console.log(`[Extensions] ${p} — manifest exists: ${exists}`);
           if (!exists) return [];
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, p, index);
+          this.suppressExtensionInstallTabs(runtimePath);
           if (this.configureTwitterAutoReplyAutostart(runtimePath, options.autoStartTwitterBot === true)) {
             shouldAutoStartTwitterBot = options.autoStartTwitterBot === true;
           }
@@ -1042,6 +1126,7 @@ setTimeout(exportCookies, 5000);
         const twitterAutoReplyPath = this.findTwitterAutoReplyExtensionPath();
         if (twitterAutoReplyPath) {
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, twitterAutoReplyPath, extPaths.length);
+          this.suppressExtensionInstallTabs(runtimePath);
           this.configureTwitterAutoReplyAutostart(runtimePath, true);
           shouldAutoStartTwitterBot = true;
           extPaths.push(runtimePath);
@@ -1065,7 +1150,10 @@ setTimeout(exportCookies, 5000);
       }
       fs.writeFileSync(
         path.join(cookieSyncPath, 'start_url.json'),
-        JSON.stringify({ startUrl })
+        JSON.stringify({
+          startUrl,
+          closeOtherTabs: options.autoStartTwitterBot === true,
+        })
       );
 
       if (options.autoStartTwitterBot) {
@@ -1081,7 +1169,9 @@ setTimeout(exportCookies, 5000);
 
       // Native Chrome cookies are encrypted for their source Windows account.
       // On another PC, import the portable JSON cookies before navigating to X.
-      const launchUrl = hasStagedCookies ? 'about:blank' : startUrl;
+      const launchUrl = options.autoStartTwitterBot
+        ? startUrl
+        : (hasStagedCookies ? 'about:blank' : startUrl);
       args.push(launchUrl);
 
       console.log(`Launching Chrome: ${chromePath}`);
