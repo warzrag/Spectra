@@ -92,6 +92,7 @@ export interface Profile {
   cloudSyncVersion?: number;
   cloudSyncRevision?: string;
   cloudSyncChecksum?: string;
+  cloudSyncChecksumRevision?: string;
   cloudSyncedBy?: string;
 
   // Profile lock

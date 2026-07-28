@@ -701,7 +701,13 @@ function App() {
         console.error('Cloud download failed:', dlError);
         setSyncProgress(null);
         // Never upload a stale local copy over a newer cloud revision.
-        showToast('Échec du téléchargement du profil - lancement annulé', 'error');
+        const downloadErrorMessage = dlError instanceof Error
+          ? dlError.message
+          : 'erreur inconnue';
+        showToast(
+          `Échec du téléchargement du profil - ${downloadErrorMessage}`,
+          'error'
+        );
         if (user) {
           await releaseProfileLock(profile.id, {
             uid: user.uid,

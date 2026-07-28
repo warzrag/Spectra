@@ -48,9 +48,12 @@ test('cookie import targets the file consumed by the runtime importer', () => {
 
 test('cross-device cookies are restored before navigation and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
   assert.match(launcher, /options\.autoStartTwitterBot\s+\? startUrl\s+:\s+\(hasStagedCookies \? 'about:blank' : startUrl\)/);
   assert.match(launcher, /await importCookies\(\);\s+await openStartUrl\(\)/);
   assert.match(launcher, /CloseMainWindow\(\)/);
+  assert.match(profileSync, /cloudSyncChecksumRevision:\s*revisionId/);
+  assert.match(profileSync, /profile\.cloudSyncChecksumRevision === expectedRevision/);
 });
 
 test('bulk launch persists the complete bot state without a startup reload', () => {

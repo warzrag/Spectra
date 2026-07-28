@@ -68,6 +68,7 @@ export async function uploadProfileToCloud(
       cloudSyncVersion: newVersion,
       cloudSyncRevision: revisionId,
       cloudSyncChecksum: checksum,
+      cloudSyncChecksumRevision: revisionId,
       cloudSyncedBy: currentUser.uid,
     });
   });
@@ -97,11 +98,22 @@ export async function downloadProfileFromCloud(
   const blob = await getBlob(storageRef);
   const arrayBuffer = await blob.arrayBuffer();
   const zipData = new Uint8Array(arrayBuffer);
-  if (profile.cloudSyncChecksum) {
+  const expectedRevision = getExpectedCloudRevision(profile);
+  const checksumMatchesRevision = Boolean(
+    profile.cloudSyncChecksum &&
+    profile.cloudSyncChecksumRevision &&
+    profile.cloudSyncChecksumRevision === expectedRevision
+  );
+  if (checksumMatchesRevision) {
     const actualChecksum = await sha256Hex(zipData);
     if (actualChecksum !== profile.cloudSyncChecksum) {
       throw new Error('Cloud profile integrity check failed');
     }
+  } else if (profile.cloudSyncChecksum) {
+    console.warn(
+      `[ProfileSync] Ignoring stale checksum for ${profileId}: ` +
+      `${profile.cloudSyncChecksumRevision || 'unversioned'} != ${expectedRevision || 'legacy'}`
+    );
   }
   console.log(`[ProfileSync] Downloaded: ${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
   onProgress?.(60);
@@ -112,7 +124,6 @@ export async function downloadProfileFromCloud(
 
   // 3. Update local sync version
   await (window as any).electronAPI.profileSync.setLocalSyncVersion(profileId, cloudSyncVersion);
-  const expectedRevision = getExpectedCloudRevision(profile);
   if (expectedRevision) {
     await (window as any).electronAPI.profileSync.setLocalSyncRevision(profileId, expectedRevision);
   }
