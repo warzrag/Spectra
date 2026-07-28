@@ -25,6 +25,11 @@ export interface PuppeteerLaunchOptions {
 
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
+  private static pendingProfiles = new Set<string>();
+  private static launchConfirmationWaiters = new Map<
+    string,
+    { resolve: (status: string) => void; timeout: NodeJS.Timeout }
+  >();
   private static browserVersions = new Map<string, Promise<string | null>>();
   private static mainWindow: any = null;
   private static localServerConfig: { port: number; token: string } | null = null;
@@ -192,6 +197,52 @@ export class PuppeteerLauncher {
 
   static isProfileActive(profileId: string): boolean {
     return this.activeProfiles.has(profileId);
+  }
+
+  static reportLaunchStatus(payload: {
+    profileId?: string;
+    launchId?: string;
+    status?: string;
+    details?: Record<string, unknown>;
+  }): void {
+    const profileId = String(payload?.profileId || '');
+    const launchId = String(payload?.launchId || '');
+    const status = String(payload?.status || '');
+    if (!profileId || !launchId || !status) return;
+
+    const key = `${profileId}:${launchId}`;
+    console.log(`[Spectra AutoStart] ${profileId} status: ${status}`, payload.details || {});
+    const waiter = this.launchConfirmationWaiters.get(key);
+    if (!waiter) return;
+    if (status !== 'venus-confirmed' && status !== 'manual-pause-preserved') return;
+
+    clearTimeout(waiter.timeout);
+    this.launchConfirmationWaiters.delete(key);
+    waiter.resolve(status);
+  }
+
+  private static waitForLaunchConfirmation(
+    profileId: string,
+    launchId: string,
+    timeoutMs = 90000
+  ): Promise<string> {
+    const key = `${profileId}:${launchId}`;
+    return new Promise(resolve => {
+      const timeout = setTimeout(() => {
+        this.launchConfirmationWaiters.delete(key);
+        resolve('timeout');
+      }, timeoutMs);
+      this.launchConfirmationWaiters.set(key, { resolve, timeout });
+    });
+  }
+
+  private static cancelLaunchConfirmation(profileId: string, launchId: string): void {
+    const key = `${profileId}:${launchId}`;
+    const waiter = this.launchConfirmationWaiters.get(key);
+    if (!waiter) return;
+    clearTimeout(waiter.timeout);
+    this.launchConfirmationWaiters.delete(key);
+    waiter.resolve('process-exited');
   }
 
   static async diagnoseEnvironment() {
@@ -411,6 +462,8 @@ public class Win32 {
   const PROFILE_NAME = ${JSON.stringify(launchContext.profileName)};
   const LAUNCH_ID = ${JSON.stringify(launchContext.launchId)};
   const VENUS_VERSION = ${JSON.stringify(venusVersion)};
+  const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
+  const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
   const READY_MARKER = 'spectra:startup-tabs-ready:' + LAUNCH_ID;
   const INIT_MARKER = 'spectra:autostart-initializing:' + LAUNCH_ID;
   const COMMAND_MARKER = 'spectra:autostart-command-sent:' + LAUNCH_ID;
@@ -418,6 +471,25 @@ public class Win32 {
   const resolveVenusAutostartState = ${stateResolverSource};
   let activationInFlight = false;
   sessionStorage.setItem(INIT_MARKER, '1');
+
+  const reportStatus = (status, details = {}, attempt = 1) => {
+    fetch(SERVER + '/api/launch-status', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + SERVER_TOKEN
+      },
+      body: JSON.stringify({ profileId: PROFILE_ID, launchId: LAUNCH_ID, status, details })
+    }).then((response) => {
+      if (!response.ok) throw new Error('Status server returned ' + response.status);
+    }).catch((error) => {
+      if (attempt < 5) {
+        window.setTimeout(() => reportStatus(status, details, attempt + 1), attempt * 500);
+      } else {
+        console.warn('[Spectra AutoStart] Status report failed:', error);
+      }
+    });
+  };
 
   const isRequestsPage = () =>
     /^\\/(?:i\\/chat|messages)\\/requests\\/?$/i.test(window.location.pathname);
@@ -450,6 +522,11 @@ public class Win32 {
             sessionStorage.removeItem(INIT_MARKER);
             chrome.storage.local.remove('spectraPendingLaunchId');
             console.log('[Spectra AutoStart] VenusBot confirmed running');
+            reportStatus('venus-confirmed', {
+              phase: state.autonomousPhase,
+              phaseStartTime: state.autonomousPhaseStartTime,
+              tabId: sessionStorage.getItem(READY_MARKER)
+            });
             return;
           }
           if (Date.now() < deadline) {
@@ -499,8 +576,10 @@ public class Win32 {
         chrome.storage.local.remove(
           ['pendingAutoStart', 'pendingMode', 'spectraPendingLaunchId'],
           () => {
+            sessionStorage.setItem('spectra:autostart-manual-pause:' + LAUNCH_ID, '1');
             sessionStorage.removeItem(INIT_MARKER);
             console.log('[Spectra AutoStart] Manual pause preserved; autostart skipped');
+            reportStatus('manual-pause-preserved');
           }
         );
         return;
@@ -714,30 +793,16 @@ public class Win32 {
       const workerSource = fs.readFileSync(workerPath, 'utf8');
       if (!workerSource.includes('html/initialSetup.html')) return false;
 
-      const workerDirectory = path.dirname(workerPath);
-      const workerExtension = path.extname(workerPath);
-      const workerBaseName = path.basename(workerPath, workerExtension);
-      const originalWorkerName = `${workerBaseName}.spectra-original${workerExtension}`;
-      const originalWorkerPath = path.join(workerDirectory, originalWorkerName);
-      fs.renameSync(workerPath, originalWorkerPath);
+      const patchedWorkerSource = workerSource.replace(
+        /([A-Za-z_$][\w$]*=function\(\)\{)var ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.runtime\.getURL\(["']html\/initialSetup\.html["']\);\3\.tabs\.create\(\{url:\2\}\)(\})/,
+        '$1console.log("[Spectra] Shadowban initial setup suppressed")$4'
+      );
+      if (patchedWorkerSource === workerSource) {
+        throw new Error('Shadowban initialSetup handler was not recognized');
+      }
 
-      fs.writeFileSync(workerPath, `
-const spectraTabsCreate = chrome.tabs.create.bind(chrome.tabs);
-chrome.tabs.create = (createProperties, callback) => {
-  const url = String(createProperties?.url || '');
-  if (/\\/html\\/initialSetup\\.html(?:[?#]|$)/i.test(url)) {
-    if (typeof callback === 'function') {
-      queueMicrotask(() => callback());
-      return;
-    }
-    return Promise.resolve();
-  }
-  return spectraTabsCreate(createProperties, callback);
-};
-
-importScripts(${JSON.stringify(originalWorkerName)});
-`);
-      console.log(`[Extensions] Suppressed automatic setup tab for ${manifest.name}`);
+      fs.writeFileSync(workerPath, patchedWorkerSource);
+      console.log(`[Extensions] Disabled Shadowban onInstalled initialSetup for ${manifest.name}`);
       return true;
     } catch (error) {
       console.warn('[Extensions] Could not suppress automatic setup tab:', error);
@@ -861,6 +926,7 @@ public class Win32 {
   }
 
   static async launch(options: PuppeteerLaunchOptions) {
+    let autoStartLaunchId = '';
     try {
       this.assertSafeId(options.profileId, 'profile ID');
 
@@ -1118,10 +1184,11 @@ public class Win32 {
         console.log(`[Fingerprint] Runtime applied for ${platform}`);
       }
 
-      const autoStartLaunchId = options.autoStartTwitterBot
+      autoStartLaunchId = options.autoStartTwitterBot
         ? require('crypto').randomUUID()
         : '';
       if (autoStartLaunchId) {
+        this.pendingProfiles.add(options.profileId);
         console.log(`[Spectra AutoStart] Profile ${options.profileId} (${options.profileName})`);
         console.log(`[Spectra AutoStart] Launch ID: ${autoStartLaunchId}`);
       }
@@ -1137,7 +1204,7 @@ public class Win32 {
         manifest_version: 3,
         name: 'Cookie Sync',
         version: '1.0',
-        permissions: ['cookies', 'tabs', 'scripting'],
+        permissions: ['cookies', 'tabs', 'scripting', 'alarms'],
         host_permissions: ['<all_urls>'],
         background: { service_worker: 'background.js' },
       }));
@@ -1168,8 +1235,34 @@ let bootstrapComplete = false;
 let exportInProgress = false;
 let exportAgain = false;
 let exportTimer = null;
+let retainedTabId = null;
+let cookiesImported = false;
+let venusConfirmationReported = false;
+const BOOTSTRAP_ATTEMPTS = 5;
+const RETRY_DELAYS = [1000, 2000, 4000, 8000, 12000];
+const WATCHDOG_DEADLINE = Date.now() + 60000;
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const tabUrl = (tab) => String(tab?.pendingUrl || tab?.url || '');
+const isXTab = (tab) => /^https:\\/\\/(?:www\\.)?(?:x|twitter)\\.com\\//i.test(tabUrl(tab));
+const isStartupJunkTab = (tab) => {
+  const url = tabUrl(tab);
+  return url === 'about:blank' ||
+    /^chrome-extension:\\/\\/[^/]+\\/html\\/initialSetup\\.html(?:[?#]|$)/i.test(url);
+};
+
+async function reportLaunchStatus(status, details = {}) {
+  const response = await fetch(SERVER + '/api/launch-status', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + SERVER_TOKEN
+    },
+    body: JSON.stringify({ profileId: PROFILE_ID, launchId: LAUNCH_ID, status, details }),
+  });
+  if (!response.ok) throw new Error('Launch status server returned ' + response.status);
+}
 
 // Import cookies from cookies.json at startup
 async function importCookies() {
@@ -1204,130 +1297,210 @@ async function importCookies() {
 async function openStartUrl() {
   try {
     const response = await fetch(chrome.runtime.getURL('start_url.json'));
-    if (!response.ok) return;
+    if (!response.ok) throw new Error('start_url.json returned ' + response.status);
     const { startUrl, closeOtherTabs } = await response.json();
-    if (!/^https?:\\/\\//i.test(startUrl || '')) return;
+    if (!/^https?:\\/\\//i.test(startUrl || '')) throw new Error('Invalid startup URL');
 
-    if (closeOtherTabs && LAUNCH_ID) {
-      const target = await chrome.tabs.create({ url: startUrl, active: true });
-      const retainedTabId = target?.id;
-      if (!retainedTabId) throw new Error('Dedicated startup tab was not created');
-      console.log('[Spectra AutoStart] Profile ' + PROFILE_ID + ' (' + PROFILE_NAME + ')');
-      console.log('[Spectra AutoStart] Created tab: ' + retainedTabId);
+    const initialTabs = await chrome.tabs.query({});
+    let target = closeOtherTabs && LAUNCH_ID
+      ? initialTabs.find((tab) => tab.id && isXTab(tab))
+      : initialTabs.find((tab) => tab.id && tabUrl(tab).startsWith(startUrl));
 
-      const guardDeadline = Date.now() + 15000;
-      const closeUnexpectedTab = (tab) => {
-        if (
-          tab?.id &&
-          tab.id !== retainedTabId &&
-          Date.now() <= guardDeadline
-        ) {
-          console.log('[Spectra AutoStart] Closing extra tab: ' + tab.id);
-          chrome.tabs.remove(tab.id).catch(() => {});
-        }
-      };
-      chrome.tabs.onCreated.addListener(closeUnexpectedTab);
-      chrome.tabs.onRemoved.addListener((tabId) => {
-        if (tabId === retainedTabId && Date.now() <= guardDeadline) {
-          console.warn('[Spectra AutoStart] Retained tab was closed or substituted: ' + tabId);
-        }
-      });
-
-      const closeOtherProfileTabs = async () => {
-        const tabs = await chrome.tabs.query({});
-        const otherTabIds = tabs
-          .filter((tab) => tab.id && tab.id !== retainedTabId)
-          .map((tab) => tab.id);
-        if (otherTabIds.length > 0) {
-          await chrome.tabs.remove(otherTabIds).catch(() => {});
-        }
-      };
-
-      await closeOtherProfileTabs();
-      const loadDeadline = Date.now() + 30000;
-      let retainedTabLoaded = false;
-      while (Date.now() < loadDeadline) {
-        const retained = await chrome.tabs.get(retainedTabId).catch(() => null);
-        if (!retained) throw new Error('Retained startup tab disappeared');
-        if (retained.status === 'complete') {
-          retainedTabLoaded = true;
-          break;
-        }
-        await wait(250);
-      }
-      if (!retainedTabLoaded) throw new Error('Retained startup tab did not finish loading');
-      await wait(750);
-      await closeOtherProfileTabs();
-
-      const finalTabs = await chrome.tabs.query({});
-      if (!finalTabs.some((tab) => tab.id === retainedTabId)) {
-        throw new Error('Retained startup tab was replaced during cleanup');
-      }
-      console.log('[Spectra AutoStart] Retained tab: ' + retainedTabId);
-
-      await chrome.scripting.executeScript({
-        target: { tabId: retainedTabId },
-        world: 'MAIN',
-        func: (launchId) => {
-          sessionStorage.setItem('spectra:startup-tabs-ready:' + launchId, '1');
-        },
-        args: [LAUNCH_ID],
-      });
-      console.log('[Spectra AutoStart] Tab cleanup complete');
-      return;
+    if (!target?.id) {
+      target = await chrome.tabs.create({ url: startUrl, active: true });
+      if (!target?.id) throw new Error('Dedicated startup tab was not created');
+      console.log('[Spectra AutoStart] X tab created: ' + target.id);
+    } else {
+      await chrome.tabs.update(target.id, { url: startUrl, active: true });
+      console.log('[Spectra AutoStart] Existing X tab retained: ' + target.id);
     }
 
-    for (let attempt = 0; attempt < 40; attempt++) {
+    retainedTabId = target.id;
+    console.log('[Spectra AutoStart] Profile ' + PROFILE_ID + ' (' + PROFILE_NAME + ')');
+
+    const closeOtherProfileTabs = async () => {
       const tabs = await chrome.tabs.query({});
-      let target = tabs.find((tab) =>
-        tab.id && String(tab.pendingUrl || tab.url || '').startsWith(startUrl)
-      );
-      if (!target) {
-        target = tabs.find((tab) =>
-          tab.id && !/^chrome-extension:|^chrome:\\/\\//i.test(tab.pendingUrl || tab.url || '')
-        );
-      }
-      if (target?.id) {
-        await chrome.tabs.update(target.id, { url: startUrl, active: true });
-        if (closeOtherTabs) {
-          const otherTabIds = tabs
-            .filter((tab) => tab.id && tab.id !== target.id)
-            .map((tab) => tab.id);
-          if (otherTabIds.length > 0) {
-            await chrome.tabs.remove(otherTabIds).catch(() => {});
-          }
+      for (const tab of tabs) {
+        if (!tab.id || tab.id === retainedTabId) continue;
+        try {
+          await chrome.tabs.remove(tab.id);
+          console.log('[Spectra AutoStart] Extra tab closed: ' + tab.id + ' ' + tabUrl(tab));
+        } catch (error) {
+          const stillExists = await chrome.tabs.get(tab.id).catch(() => null);
+          if (stillExists) throw error;
         }
-        return;
       }
+      const remaining = await chrome.tabs.query({});
+      const extras = remaining.filter((tab) => tab.id && tab.id !== retainedTabId);
+      if (extras.length > 0) {
+        throw new Error('Extra tabs remain after cleanup: ' + extras.map((tab) => tab.id).join(','));
+      }
+    };
+
+    if (closeOtherTabs) await closeOtherProfileTabs();
+
+    const loadDeadline = Date.now() + 30000;
+    let retained = null;
+    while (Date.now() < loadDeadline) {
+      retained = await chrome.tabs.get(retainedTabId).catch(() => null);
+      if (!retained) throw new Error('Retained startup tab disappeared');
+      if (retained.status === 'complete' && isXTab(retained)) break;
       await wait(250);
     }
-
-    const target = await chrome.tabs.create({ url: startUrl, active: true });
-    if (closeOtherTabs && target?.id) {
-      const tabs = await chrome.tabs.query({});
-      const otherTabIds = tabs
-        .filter((tab) => tab.id && tab.id !== target.id)
-        .map((tab) => tab.id);
-      if (otherTabIds.length > 0) {
-        await chrome.tabs.remove(otherTabIds).catch(() => {});
-      }
+    if (!retained || retained.status !== 'complete' || !isXTab(retained)) {
+      throw new Error('Retained X tab did not finish loading');
     }
-  } catch (e) {}
+    console.log('[Spectra AutoStart] X tab loaded: ' + retainedTabId);
+
+    await wait(500);
+    if (closeOtherTabs) await closeOtherProfileTabs();
+
+    await chrome.scripting.executeScript({
+      target: { tabId: retainedTabId },
+      world: 'MAIN',
+      func: (launchId, tabId) => {
+        sessionStorage.setItem('spectra:startup-tabs-ready:' + launchId, String(tabId));
+      },
+      args: [LAUNCH_ID, retainedTabId],
+    });
+    console.log('[Spectra AutoStart] startup-tabs-ready written for tab: ' + retainedTabId);
+
+    const confirmedTab = await chrome.tabs.get(retainedTabId).catch(() => null);
+    const finalTabs = await chrome.tabs.query({});
+    if (
+      !confirmedTab ||
+      confirmedTab.status !== 'complete' ||
+      !isXTab(confirmedTab) ||
+      (closeOtherTabs && finalTabs.some((tab) => tab.id !== retainedTabId))
+    ) {
+      throw new Error('Startup tab confirmation failed');
+    }
+
+    return retainedTabId;
+  } catch (error) {
+    console.error('[Spectra AutoStart] Bootstrap failed: ' + (error?.message || error));
+    throw error;
+  }
 }
 
 function bootstrap() {
-  if (bootstrapComplete) return Promise.resolve();
+  if (bootstrapComplete && retainedTabId) return Promise.resolve(retainedTabId);
   if (!bootstrapPromise) {
     bootstrapPromise = (async () => {
-      await importCookies();
-      await openStartUrl();
-      bootstrapComplete = true;
+      let lastError = null;
+      for (let attempt = 1; attempt <= BOOTSTRAP_ATTEMPTS; attempt++) {
+        console.log('[Spectra AutoStart] Bootstrap attempt ' + attempt + '/' + BOOTSTRAP_ATTEMPTS);
+        try {
+          if (!cookiesImported) {
+            await importCookies();
+            cookiesImported = true;
+          }
+          const tabId = await openStartUrl();
+          if (!tabId) throw new Error('openStartUrl returned no retainedTabId');
+          retainedTabId = tabId;
+          await reportLaunchStatus('bootstrap-confirmed', { tabId });
+          bootstrapComplete = true;
+          console.log('[Spectra AutoStart] Bootstrap confirmed: ' + tabId);
+          return tabId;
+        } catch (error) {
+          bootstrapComplete = false;
+          lastError = error;
+          console.error('[Spectra AutoStart] Bootstrap failed: ' + (error?.message || error));
+          if (attempt < BOOTSTRAP_ATTEMPTS || Date.now() <= WATCHDOG_DEADLINE) {
+            const delay = RETRY_DELAYS[attempt - 1] || RETRY_DELAYS[RETRY_DELAYS.length - 1];
+            console.log('[Spectra AutoStart] Bootstrap retry scheduled in ' + delay + 'ms');
+            await wait(delay);
+          }
+        }
+      }
+      throw lastError || new Error('Bootstrap exhausted');
     })().finally(() => {
       bootstrapPromise = null;
     });
   }
   return bootstrapPromise;
 }
+
+async function runStartupWatchdog() {
+  if (Date.now() > WATCHDOG_DEADLINE) {
+    chrome.alarms.clear('spectra-startup-watchdog').catch(() => {});
+    return;
+  }
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (
+        !retainedTabId ||
+        !tab.id ||
+        tab.id === retainedTabId ||
+        (!bootstrapComplete && !isStartupJunkTab(tab))
+      ) continue;
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      console.log('[Spectra AutoStart] Extra tab closed: ' + tab.id + ' ' + tabUrl(tab));
+    }
+
+    if (bootstrapComplete) {
+      const retained = retainedTabId
+        ? await chrome.tabs.get(retainedTabId).catch(() => null)
+        : null;
+      if (!retained || !isXTab(retained)) {
+        bootstrapComplete = false;
+        retainedTabId = null;
+        console.warn('[Spectra AutoStart] Watchdog found no retained X tab');
+      } else if (!venusConfirmationReported) {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: retainedTabId },
+          world: 'MAIN',
+          func: (launchId) => ({
+            confirmed: sessionStorage.getItem('spectra:autostart-confirmed:' + launchId) === '1',
+            manualPause: sessionStorage.getItem('spectra:autostart-manual-pause:' + launchId) === '1',
+          }),
+          args: [LAUNCH_ID],
+        }).catch(() => []);
+        const status = results[0]?.result;
+        if (status?.confirmed) {
+          await reportLaunchStatus('venus-confirmed', { tabId: retainedTabId });
+          venusConfirmationReported = true;
+          console.log('[Spectra AutoStart] VenusBot confirmation forwarded');
+        } else if (status?.manualPause) {
+          await reportLaunchStatus('manual-pause-preserved', { tabId: retainedTabId });
+          venusConfirmationReported = true;
+        }
+      }
+    }
+
+    if (!bootstrapComplete && !bootstrapPromise) {
+      bootstrap().catch((error) => {
+        console.error('[Spectra AutoStart] Watchdog bootstrap failed:', error);
+      });
+    }
+  } catch (error) {
+    console.warn('[Spectra AutoStart] Watchdog error:', error);
+  } finally {
+    if (Date.now() <= WATCHDOG_DEADLINE) setTimeout(runStartupWatchdog, 1000);
+  }
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (
+    Date.now() <= WATCHDOG_DEADLINE &&
+    retainedTabId &&
+    tab?.id &&
+    tab.id !== retainedTabId
+  ) {
+    chrome.tabs.remove(tab.id).then(() => {
+      console.log('[Spectra AutoStart] Extra tab closed: ' + tab.id + ' ' + tabUrl(tab));
+    }).catch(() => {});
+  }
+});
+
+chrome.alarms.create('spectra-startup-watchdog', {
+  delayInMinutes: 0.5,
+  periodInMinutes: 0.5,
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'spectra-startup-watchdog') runStartupWatchdog();
+});
 
 // Export all cookies to local server
 async function exportCookies() {
@@ -1364,9 +1537,16 @@ function scheduleExport(delay = 750) {
   }, delay);
 }
 
-bootstrap();
-chrome.runtime.onStartup.addListener(() => bootstrap());
-chrome.runtime.onInstalled.addListener(() => bootstrap());
+bootstrap().catch((error) => {
+  console.error('[Spectra AutoStart] Initial bootstrap exhausted:', error);
+});
+runStartupWatchdog();
+chrome.runtime.onStartup.addListener(() => {
+  bootstrap().catch((error) => console.error('[Spectra AutoStart] Startup bootstrap exhausted:', error));
+});
+chrome.runtime.onInstalled.addListener(() => {
+  bootstrap().catch((error) => console.error('[Spectra AutoStart] Install bootstrap exhausted:', error));
+});
 chrome.cookies.onChanged.addListener(() => scheduleExport());
 chrome.runtime.onSuspend.addListener(() => exportCookies());
 
@@ -1464,6 +1644,9 @@ setTimeout(exportCookies, 5000);
         ? 'about:blank'
         : (hasStagedCookies ? 'about:blank' : startUrl);
       args.push(launchUrl);
+      const launchConfirmationPromise = autoStartLaunchId
+        ? this.waitForLaunchConfirmation(options.profileId, autoStartLaunchId)
+        : null;
 
       console.log(`Launching Chrome: ${chromePath}`);
       console.log(`Start URL: ${startUrl}${hasStagedCookies ? ' (after cookie import)' : ''}`);
@@ -1497,13 +1680,12 @@ setTimeout(exportCookies, 5000);
 
       console.log(`[Chrome] Process spawned (PID: ${chromeProcess.pid}) — CDP-free`);
 
-      // Store profile instance
-      this.activeProfiles.set(options.profileId, {
+      const profileInstance = {
         chromeProcess,
         profilePath,
         profileId: options.profileId,
         localProxyServer,
-      });
+      };
 
       let processCleanedUp = false;
       const cleanupChromeProcess = () => {
@@ -1515,6 +1697,10 @@ setTimeout(exportCookies, 5000);
           console.log(`[Proxy] Local relay closed for profile: ${options.profileId}`);
         }
 
+        this.pendingProfiles.delete(options.profileId);
+        if (autoStartLaunchId) {
+          this.cancelLaunchConfirmation(options.profileId, autoStartLaunchId);
+        }
         this.activeProfiles.delete(options.profileId);
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('profiles:activeUpdate', Array.from(this.activeProfiles.keys()));
@@ -1537,10 +1723,38 @@ setTimeout(exportCookies, 5000);
         cleanupChromeProcess();
       });
 
+      if (launchConfirmationPromise) {
+        const launchStatus = await launchConfirmationPromise;
+        if (launchStatus !== 'venus-confirmed') {
+          console.error(`[Spectra AutoStart] Launch not confirmed: ${launchStatus}`);
+          await this.terminateProfileProcesses(profilePath);
+          cleanupChromeProcess();
+          throw new Error(
+            launchStatus === 'manual-pause-preserved'
+              ? 'VenusBot is manually paused; profile was not marked Running'
+              : `VenusBot launch confirmation failed: ${launchStatus}`
+          );
+        }
+      }
+
+      if (
+        processCleanedUp ||
+        chromeProcess.exitCode !== null ||
+        chromeProcess.signalCode !== null
+      ) {
+        throw new Error('Chrome exited before the launch could be marked Running');
+      }
+
+      this.pendingProfiles.delete(options.profileId);
+      this.activeProfiles.set(options.profileId, profileInstance);
       console.log(`Chrome launched successfully for profile: ${options.profileId}`);
       return { success: true };
 
     } catch (error: any) {
+      this.pendingProfiles.delete(options.profileId);
+      if (autoStartLaunchId) {
+        this.cancelLaunchConfirmation(options.profileId, autoStartLaunchId);
+      }
       console.error('Error launching browser:', error);
       return { success: false, error: error.message };
     }
@@ -1774,7 +1988,7 @@ setTimeout(exportCookies, 5000);
     });
     const running = new Set(this.getActiveProfiles());
     if (process.platform !== 'win32' || safeIds.length === 0) {
-      return safeIds.filter(id => running.has(id));
+      return safeIds.filter(id => running.has(id) && !this.pendingProfiles.has(id));
     }
 
     const profilesRoot = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles');
@@ -1798,7 +2012,7 @@ setTimeout(exportCookies, 5000);
       console.warn('[Chrome] Could not discover running profiles:', error);
       throw new Error('Unable to inspect running Chrome profiles');
     }
-    return safeIds.filter(id => running.has(id));
+    return safeIds.filter(id => running.has(id) && !this.pendingProfiles.has(id));
   }
 
   static async getCookies(profileId: string): Promise<any[]> {

@@ -340,6 +340,10 @@ ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
   }
 });
 
+ipcMain.on('internal:launch-status', (_, payload) => {
+  PuppeteerLauncher.reportLaunchStatus(payload);
+});
+
 ipcMain.handle('app:getVersion', () => {
   return app.getVersion();
 });

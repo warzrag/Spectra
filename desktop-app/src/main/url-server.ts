@@ -18,7 +18,14 @@ export class UrlTrackingServer {
           return;
         }
 
-        if (req.method === 'POST' && (req.url === '/api/save-url' || req.url === '/api/save-cookies')) {
+        if (
+          req.method === 'POST' &&
+          (
+            req.url === '/api/save-url' ||
+            req.url === '/api/save-cookies' ||
+            req.url === '/api/launch-status'
+          )
+        ) {
           let body = '';
           let bodyBytes = 0;
 
@@ -57,6 +64,21 @@ export class UrlTrackingServer {
                 } else {
                   res.writeHead(400);
                   res.end(JSON.stringify({ error: 'Missing profileId or cookies' }));
+                }
+              } else if (req.url === '/api/launch-status') {
+                const { profileId, launchId, status, details } = data;
+                if (profileId && launchId && status) {
+                  ipcMain.emit('internal:launch-status', null, {
+                    profileId,
+                    launchId,
+                    status,
+                    details: details || {},
+                  });
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end(JSON.stringify({ error: 'Missing launch status fields' }));
                 }
               }
             } catch {
