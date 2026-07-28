@@ -6,15 +6,8 @@ import * as net from 'net';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
 
-// Get the Chrome version this Puppeteer version supports
-const COMPATIBLE_CHROME_VERSION = (() => {
-  try {
-    const { PUPPETEER_REVISIONS } = require('puppeteer');
-    return PUPPETEER_REVISIONS?.chrome || '140.0.7339.82';
-  } catch {
-    return '140.0.7339.82';
-  }
-})();
+// Keep the managed browser aligned with the Chrome version advertised by new profiles.
+const MANAGED_CHROME_VERSION = '151.0.7922.47';
 
 export interface PuppeteerLaunchOptions {
   profileId: string;
@@ -56,6 +49,40 @@ export class PuppeteerLauncher {
         }
       );
     });
+  }
+
+  private static async getBrowserVersion(executablePath: string): Promise<string | null> {
+    const pathVersion = executablePath.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
+
+    if (process.platform === 'win32') {
+      const escapedPath = executablePath.replace(/'/g, "''");
+      try {
+        const version = await this.runPowerShell(
+          `(Get-Item -LiteralPath '${escapedPath}').VersionInfo.FileVersion`
+        );
+        const normalized = version.match(/\d+\.\d+\.\d+\.\d+/)?.[0];
+        if (normalized) return normalized;
+      } catch (error) {
+        console.warn('[Browser] Could not inspect executable version:', error);
+      }
+    }
+
+    return pathVersion || null;
+  }
+
+  private static alignUserAgentToBrowser(userAgent: string, browserVersion: string | null): string {
+    if (!userAgent || !browserVersion) return userAgent;
+
+    const advertisedVersion = userAgent.match(/\bChrome\/(\d+\.\d+\.\d+\.\d+)/)?.[1];
+    if (!advertisedVersion || advertisedVersion === browserVersion) return userAgent;
+
+    console.warn(
+      `[Browser] Correcting Chrome User-Agent mismatch: ${advertisedVersion} -> ${browserVersion}`
+    );
+    return userAgent.replace(
+      /\bChrome\/\d+\.\d+\.\d+\.\d+\b/,
+      `Chrome/${browserVersion}`
+    );
   }
 
   private static async getProfileProcessIds(profilePath: string): Promise<number[]> {
@@ -813,7 +840,10 @@ public class Win32 {
       // Build Chrome args — MINIMAL flags only
       const compactWindowSize = `${placement.width},${placement.height}`;
       const compactWindowPosition = `${placement.left},${placement.top}`;
-      const userAgent = options.userAgent || options.fingerprint?.userAgent || '';
+      const browserVersion = await this.getBrowserVersion(chromePath);
+      const configuredUserAgent = options.userAgent || options.fingerprint?.userAgent || '';
+      const userAgent = this.alignUserAgentToBrowser(configuredUserAgent, browserVersion);
+      console.log(`[Browser] Executable version: ${browserVersion || 'unknown'}`);
       const args = [
         `--user-data-dir=${profilePath}`,
         '--no-first-run',
@@ -884,7 +914,7 @@ public class Win32 {
           }],
         }));
 
-        const fp = { ...(options.fingerprint || {}), platform };
+        const fp = { ...(options.fingerprint || {}), userAgent, platform };
         fs.writeFileSync(path.join(platformFixPath, 'fingerprint.js'), `
 (() => {
   const fp = ${JSON.stringify(fp)};
@@ -1321,10 +1351,15 @@ setTimeout(exportCookies, 5000);
     const markerPath = path.join(cacheDir, '.installed');
     if (fs.existsSync(markerPath)) {
       const savedPath = fs.readFileSync(markerPath, 'utf8').trim();
-      if (fs.existsSync(savedPath)) {
+      const cachedVersion = await this.getBrowserVersion(savedPath);
+      if (fs.existsSync(savedPath) && cachedVersion === MANAGED_CHROME_VERSION) {
         console.log(`[Browser] Using cached Chrome: ${savedPath}`);
         return savedPath;
       }
+      console.warn(
+        `[Browser] Cached Chrome is stale (${cachedVersion || 'unknown'}); ` +
+        `installing ${MANAGED_CHROME_VERSION}`
+      );
     }
 
     console.log('[Browser] Downloading Chrome for Testing...');
@@ -1333,7 +1368,7 @@ setTimeout(exportCookies, 5000);
       fs.mkdirSync(cacheDir, { recursive: true });
     }
 
-    const buildId = COMPATIBLE_CHROME_VERSION;
+    const buildId = MANAGED_CHROME_VERSION;
     console.log(`[Browser] Using Chrome version: ${buildId}`);
 
     let lastPercent = 0;

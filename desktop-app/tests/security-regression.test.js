@@ -74,3 +74,12 @@ test('bulk launch persists the complete bot state without a startup reload', () 
   assert.match(launcher, /suppressExtensionInstallTabs\(runtimePath\)/);
   assert.match(launcher, /workerSource\.includes\('html\/initialSetup\.html'\)/);
 });
+
+test('managed Chrome and the advertised user-agent stay version-aligned', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.match(launcher, /const MANAGED_CHROME_VERSION = '151\.0\.7922\.47'/);
+  assert.match(launcher, /cachedVersion === MANAGED_CHROME_VERSION/);
+  assert.match(launcher, /alignUserAgentToBrowser/);
+  assert.match(launcher, /Correcting Chrome User-Agent mismatch/);
+  assert.match(launcher, /const fp = \{ \.\.\.\(options\.fingerprint \|\| \{\}\), userAgent, platform \}/);
+});
