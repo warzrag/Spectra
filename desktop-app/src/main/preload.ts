@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Launch/close still go through main process (Puppeteer is local)
     launch: (profileId: string, profileData: any) => ipcRenderer.invoke('profile:launch', profileId, profileData),
     close: (profileId: string) => ipcRenderer.invoke('profile:close', profileId),
+    forceClose: (profileId: string) => ipcRenderer.invoke('profile:forceClose', profileId),
     // Clean up local Chrome profile directory
     cleanupLocal: (profileId: string) => ipcRenderer.invoke('profile:cleanupLocal', profileId),
     // Listen for active profiles updates
@@ -72,6 +73,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getLocalSyncRevision: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncRevision', profileId),
     setLocalSyncRevision: (profileId: string, revision: string) => ipcRenderer.invoke('profile:setLocalSyncRevision', profileId, revision),
     setBusy: (busy: boolean) => ipcRenderer.invoke('profileSync:setBusy', busy),
+    downloadFromCloud: (profileId: string, url: string, idToken: string) =>
+      ipcRenderer.invoke('profileSync:downloadFromCloud', profileId, url, idToken),
+    onDownloadProgress: (callback: (profileId: string, percent: number) => void) => {
+      const listener = (_event: any, profileId: string, percent: number) =>
+        callback(profileId, percent);
+      ipcRenderer.on('profileSync:downloadProgress', listener);
+      return () => ipcRenderer.removeListener('profileSync:downloadProgress', listener);
+    },
     getHostname: () => ipcRenderer.invoke('system:hostname'),
     getInstallationId: () => ipcRenderer.invoke('system:installationId'),
     onProfileClosed: (callback: (profileId: string) => void) => {

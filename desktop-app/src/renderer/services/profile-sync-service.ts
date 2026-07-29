@@ -1,7 +1,6 @@
-import { ref, uploadBytes, uploadBytesResumable, getDownloadURL, getBlob } from 'firebase/storage';
+import { ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { doc, runTransaction, serverTimestamp } from 'firebase/firestore';
-import { storage } from './firebase';
-import { db } from './firebase';
+import { auth, storage, db } from './firebase';
 import { Profile } from '../../types';
 
 const STALE_LOCK_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -101,12 +100,28 @@ export async function downloadProfileFromCloud(
   onProgress?.(10);
 
   // 1. Download zip from Firebase Storage
-  const storageRef = profile.cloudStorageUrl
-    ? ref(storage, profile.cloudStorageUrl)
-    : ref(storage, `profiles/${profileId}/profile.zip`);
-  const blob = await getBlob(storageRef);
-  const arrayBuffer = await blob.arrayBuffer();
-  const zipData = new Uint8Array(arrayBuffer);
+  const downloadUrl = profile.cloudStorageUrl ||
+    await getDownloadURL(ref(storage, `profiles/${profileId}/profile.zip`));
+  const idToken = await auth.currentUser?.getIdToken();
+  if (!idToken) throw new Error('Firebase session expired');
+
+  const unsubscribeProgress = (window as any).electronAPI.profileSync.onDownloadProgress(
+    (progressProfileId: string, percent: number) => {
+      if (progressProfileId === profileId) onProgress?.(percent);
+    }
+  );
+  let zipData: Uint8Array;
+  try {
+    const downloaded = await (window as any).electronAPI.profileSync.downloadFromCloud(
+      profileId,
+      downloadUrl,
+      idToken
+    );
+    zipData = new Uint8Array(downloaded);
+  } finally {
+    unsubscribeProgress();
+  }
+  const arrayBuffer = zipData.buffer;
   const expectedRevision = getExpectedCloudRevision(profile);
   const checksumMatchesRevision = Boolean(
     profile.cloudSyncChecksum &&

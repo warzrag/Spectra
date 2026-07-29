@@ -6,6 +6,7 @@ import * as net from 'net';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
 import { resolveVenusAutostartState } from './venus-autostart-state';
+import { normalizeTweetUrl } from '../shared/twitter-url';
 
 // Keep the managed browser aligned with the Chrome version advertised by new profiles.
 const MANAGED_CHROME_VERSION = '151.0.7922.47';
@@ -21,11 +22,13 @@ export interface PuppeteerLaunchOptions {
   extensionPaths?: string[];
   windowLayout?: { index: number; total: number };
   autoStartTwitterBot?: boolean;
+  targetTweetUrl?: string;
 }
 
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
   private static pendingProfiles = new Set<string>();
+  private static cancelledProfiles = new Set<string>();
   private static launchConfirmationWaiters = new Map<
     string,
     { resolve: (status: string) => void; timeout: NodeJS.Timeout }
@@ -121,7 +124,10 @@ export class PuppeteerLauncher {
           Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) } |
           ForEach-Object { $_.ProcessId }
       `);
-      return output.split(/\r?\n/).map(Number).filter(Number.isFinite);
+      return output
+        .split(/\r?\n/)
+        .map(Number)
+        .filter(processId => Number.isFinite(processId) && processId > 0);
     } catch (error) {
       console.warn('[Chrome] Could not inspect existing profile processes:', error);
       return [];
@@ -775,6 +781,13 @@ public class Win32 {
       }
 
       fs.writeFileSync(workerPath, patchedWorkerSource);
+      const versionParts = String(manifest.version || '1.0.0')
+        .split('.')
+        .slice(0, 3)
+        .map((part: string) => String(Math.min(65535, Math.max(0, Number(part) || 0))));
+      while (versionParts.length < 3) versionParts.push('0');
+      manifest.version = [...versionParts, '65000'].join('.');
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
       console.log(`[Extensions] Disabled Shadowban onInstalled initialSetup for ${manifest.name}`);
       return true;
     } catch (error) {
@@ -804,7 +817,11 @@ public class Win32 {
           $p.Refresh()
         }
         if ($p.MainWindowHandle -ne 0) {
-          [Win32]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, ${placement.left}, ${placement.top}, ${placement.width}, ${placement.height}, 0x0040) | Out-Null
+          for ($attempt = 0; $attempt -lt 3; $attempt++) {
+            [Win32]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, ${placement.left}, ${placement.top}, ${placement.width}, ${placement.height}, 0x0040) | Out-Null
+            Start-Sleep -Milliseconds 250
+            $p.Refresh()
+          }
         }
       }
     `;
@@ -902,6 +919,13 @@ public class Win32 {
     let autoStartLaunchId = '';
     try {
       this.assertSafeId(options.profileId, 'profile ID');
+      this.cancelledProfiles.delete(options.profileId);
+      const targetTweetUrl = options.targetTweetUrl
+        ? normalizeTweetUrl(options.targetTweetUrl)
+        : null;
+      if (options.targetTweetUrl && !targetTweetUrl) {
+        throw new Error('Invalid X post URL');
+      }
 
       // Get user data directory path
       const userDataDir = process.platform === 'win32'
@@ -1180,7 +1204,324 @@ public class Win32 {
         permissions: ['cookies', 'tabs', 'scripting', 'alarms'],
         host_permissions: ['<all_urls>'],
         background: { service_worker: 'background.js' },
+        ...(targetTweetUrl ? {
+          content_scripts: [{
+            matches: [
+              'https://x.com/*',
+              'https://www.x.com/*',
+              'https://twitter.com/*',
+              'https://www.twitter.com/*',
+            ],
+            js: ['open-post-actions.js'],
+            run_at: 'document_idle',
+          }],
+        } : {}),
       }));
+
+      if (targetTweetUrl) {
+        const targetStatusId = new URL(targetTweetUrl).pathname.match(/\/status\/(\d+)/)?.[1] || '';
+        const closeFallbackUrl =
+          `http://127.0.0.1:${this.localServerConfig?.port || 0}/api/close-profile` +
+          `?profileId=${encodeURIComponent(options.profileId)}` +
+          `&token=${encodeURIComponent(this.localServerConfig?.token || '')}`;
+        fs.writeFileSync(path.join(cookieSyncPath, 'open-post-actions.js'),
+`(() => {
+  if (window.__spectraOpenPostActionsStarted) return;
+  window.__spectraOpenPostActionsStarted = true;
+
+  const TARGET_STATUS_ID = ${JSON.stringify(targetStatusId)};
+  const CLOSE_FALLBACK_URL = ${JSON.stringify(closeFallbackUrl)};
+  const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+  function findTargetArticle() {
+    const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+    const exactArticle = articles.find((article) =>
+      Array.from(article.querySelectorAll('a[href]')).some((link) => {
+        try {
+          return new URL(link.href).pathname.includes('/status/' + TARGET_STATUS_ID);
+        } catch {
+          return false;
+        }
+      })
+    );
+    if (exactArticle) return exactArticle;
+    return location.pathname.includes('/status/' + TARGET_STATUS_ID) ? articles[0] || null : null;
+  }
+
+  async function waitForTargetArticle(timeout = 45000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const article = findTargetArticle();
+      if (article) return article;
+      await wait(100);
+    }
+    return null;
+  }
+
+  async function waitForElement(selector, root = document, timeout = 2000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const element = root.querySelector(selector);
+      if (element instanceof HTMLElement) return element;
+      await wait(50);
+    }
+    return null;
+  }
+
+  async function showResultOverlay(success, likeConfirmed, repostConfirmed) {
+    document.getElementById('spectra-open-post-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'spectra-open-post-overlay';
+    overlay.setAttribute('role', 'status');
+    overlay.setAttribute('aria-live', 'polite');
+    Object.assign(overlay.style, {
+      position: 'fixed',
+      zIndex: '2147483647',
+      top: '18px',
+      left: '50%',
+      width: 'min(340px, calc(100vw - 28px))',
+      padding: '16px',
+      borderRadius: '18px',
+      border: '1px solid rgba(255,255,255,0.14)',
+      background: 'linear-gradient(145deg, rgba(17,24,39,0.97), rgba(8,12,20,0.96))',
+      boxShadow: '0 18px 55px rgba(0,0,0,0.48), inset 0 1px 0 rgba(255,255,255,0.08)',
+      backdropFilter: 'blur(18px)',
+      color: '#f8fafc',
+      fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      opacity: '0',
+      transform: 'translate(-50%, -12px) scale(0.96)',
+      transition: 'opacity 220ms ease, transform 220ms cubic-bezier(.2,.8,.2,1)',
+      pointerEvents: 'none',
+    });
+
+    const header = document.createElement('div');
+    Object.assign(header.style, { display: 'flex', alignItems: 'center', gap: '12px' });
+
+    const check = document.createElement('div');
+    check.textContent = success ? '✓' : '!';
+    Object.assign(check.style, {
+      display: 'grid',
+      placeItems: 'center',
+      width: '38px',
+      height: '38px',
+      flex: '0 0 38px',
+      borderRadius: '12px',
+      background: success
+        ? 'linear-gradient(135deg, #34d399, #10b981)'
+        : 'linear-gradient(135deg, #fbbf24, #f97316)',
+      boxShadow: success
+        ? '0 8px 24px rgba(16,185,129,0.32)'
+        : '0 8px 24px rgba(249,115,22,0.32)',
+      color: success ? '#03291d' : '#431407',
+      fontSize: '23px',
+      fontWeight: '900',
+    });
+
+    const titles = document.createElement('div');
+    const title = document.createElement('div');
+    title.textContent = success ? 'Actions terminées' : 'Instance ignorée';
+    Object.assign(title.style, { fontSize: '15px', fontWeight: '800', letterSpacing: '-0.01em' });
+    const subtitle = document.createElement('div');
+    subtitle.textContent = success
+      ? 'Le post a bien été traité'
+      : 'Une action n’a pas pu être confirmée';
+    Object.assign(subtitle.style, { marginTop: '2px', color: '#94a3b8', fontSize: '12px' });
+    titles.append(title, subtitle);
+    header.append(check, titles);
+
+    const actions = document.createElement('div');
+    Object.assign(actions.style, {
+      display: 'grid',
+      gridTemplateColumns: '1fr 1fr',
+      gap: '8px',
+      marginTop: '14px',
+    });
+
+    const createAction = (icon, label, color, background) => {
+      const item = document.createElement('div');
+      Object.assign(item.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '8px',
+        padding: '9px 10px',
+        borderRadius: '11px',
+        background,
+        border: '1px solid rgba(255,255,255,0.07)',
+        fontSize: '12px',
+        fontWeight: '700',
+      });
+      const glyph = document.createElement('span');
+      glyph.textContent = icon;
+      Object.assign(glyph.style, { color, fontSize: '16px', lineHeight: '1' });
+      const text = document.createElement('span');
+      text.textContent = label;
+      item.append(glyph, text);
+      return item;
+    };
+
+    actions.append(
+      createAction(
+        likeConfirmed ? '♥' : '!',
+        likeConfirmed ? 'Like confirmé' : 'Like non confirmé',
+        likeConfirmed ? '#fb7185' : '#fbbf24',
+        likeConfirmed ? 'rgba(244,63,94,0.10)' : 'rgba(245,158,11,0.10)'
+      ),
+      createAction(
+        repostConfirmed ? '↻' : '!',
+        repostConfirmed ? 'Repost confirmé' : 'Repost non confirmé',
+        repostConfirmed ? '#34d399' : '#fbbf24',
+        repostConfirmed ? 'rgba(16,185,129,0.10)' : 'rgba(245,158,11,0.10)'
+      )
+    );
+
+    const footer = document.createElement('div');
+    Object.assign(footer.style, { marginTop: '13px' });
+    const closingText = document.createElement('div');
+    closingText.id = 'spectra-open-post-closing-status';
+    closingText.textContent = success
+      ? 'Fermeture de l’instance…'
+      : 'Passage à l’instance suivante…';
+    Object.assign(closingText.style, {
+      marginBottom: '7px',
+      color: '#cbd5e1',
+      fontSize: '11px',
+      fontWeight: '600',
+    });
+    const track = document.createElement('div');
+    Object.assign(track.style, {
+      height: '3px',
+      overflow: 'hidden',
+      borderRadius: '999px',
+      background: 'rgba(148,163,184,0.18)',
+    });
+    const progress = document.createElement('div');
+    Object.assign(progress.style, {
+      width: '0%',
+      height: '100%',
+      borderRadius: '999px',
+      background: 'linear-gradient(90deg, #38bdf8, #34d399)',
+      boxShadow: '0 0 12px rgba(52,211,153,0.55)',
+      transition: 'width 800ms linear',
+    });
+    track.append(progress);
+    footer.append(closingText, track);
+    overlay.append(header, actions, footer);
+    document.body.append(overlay);
+
+    requestAnimationFrame(() => {
+      overlay.style.opacity = '1';
+      overlay.style.transform = 'translate(-50%, 0) scale(1)';
+      progress.style.width = '100%';
+    });
+    await wait(800);
+  }
+
+  async function finishInstance(success, likeConfirmed, repostConfirmed) {
+    await showResultOverlay(success, likeConfirmed, repostConfirmed);
+    document.documentElement.dataset.spectraOpenPostComplete = '1';
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const accepted = await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'spectra:open-post-actions-complete',
+            success,
+          }, (response) => {
+            const failed = Boolean(chrome.runtime.lastError);
+            resolve(!failed && response?.accepted === true);
+          });
+        } catch {
+          resolve(false);
+        }
+      });
+      if (accepted) {
+        const status = document.getElementById('spectra-open-post-closing-status');
+        if (status) status.textContent = 'Signal de fermeture reçu…';
+        window.setTimeout(() => window.location.replace(CLOSE_FALLBACK_URL), 600);
+        return;
+      }
+      await wait(200);
+    }
+    const status = document.getElementById('spectra-open-post-closing-status');
+    if (status) {
+      status.textContent = 'Fermeture forcée…';
+      status.style.color = '#fbbf24';
+    }
+    console.warn('[Spectra OpenPost] Completion signal was not acknowledged');
+    window.location.replace(CLOSE_FALLBACK_URL);
+  }
+
+  async function run() {
+    const article = await waitForTargetArticle();
+    if (!article) {
+      console.warn('[Spectra OpenPost] Target post was not found');
+      await finishInstance(false, false, false);
+      return;
+    }
+
+    article.scrollIntoView({ block: 'center', inline: 'nearest' });
+    await wait(100);
+
+    let likeStatus = 'already-liked';
+    if (!article.querySelector('[data-testid="unlike"]')) {
+      const likeButton = await waitForElement('[data-testid="like"]', article);
+      if (likeButton) {
+        const hasPhoto = Boolean(
+          article.querySelector('[data-testid="tweetPhoto"], img[src*="/media/"]')
+        );
+        const likeBounds = likeButton.getBoundingClientRect();
+        const actionBarOutsideViewport =
+          likeBounds.top < 0 || likeBounds.bottom > window.innerHeight;
+        if (hasPhoto || actionBarOutsideViewport) {
+          console.log('[Spectra OpenPost] Media post detected; scrolling to actions');
+          likeButton.scrollIntoView({ block: 'center', inline: 'nearest' });
+          await wait(300);
+        }
+        likeButton.click();
+        likeStatus = await waitForElement('[data-testid="unlike"]', article, 4000)
+          ? 'liked'
+          : 'unconfirmed';
+      } else {
+        likeStatus = 'button-not-found';
+      }
+    }
+    console.log('[Spectra OpenPost] like: ' + likeStatus);
+
+    await wait(200);
+
+    let repostStatus = 'already-reposted';
+    if (!article.querySelector('[data-testid="unretweet"]')) {
+      const repostButton = await waitForElement('[data-testid="retweet"]', article);
+      if (repostButton) {
+        repostButton.click();
+        const confirmButton = await waitForElement('[data-testid="retweetConfirm"]');
+        if (confirmButton) {
+          confirmButton.click();
+          repostStatus = await waitForElement('[data-testid="unretweet"]', article, 4000)
+            ? 'reposted'
+            : 'unconfirmed';
+        } else {
+          repostStatus = 'confirmation-not-found';
+        }
+      } else {
+        repostStatus = 'button-not-found';
+      }
+    }
+    console.log('[Spectra OpenPost] repost: ' + repostStatus);
+
+    const likeConfirmed = likeStatus === 'liked' || likeStatus === 'already-liked';
+    const repostConfirmed = repostStatus === 'reposted' || repostStatus === 'already-reposted';
+    const success = likeConfirmed && repostConfirmed;
+    await finishInstance(success, likeConfirmed, repostConfirmed);
+  }
+
+  run().catch(async (error) => {
+    console.error('[Spectra OpenPost] Actions failed:', error);
+    await finishInstance(false, false, false);
+  });
+})();`
+        );
+      }
 
       // Write synced cookies as cookies.json for import
       const syncedCookiesPath = path.join(profilePath, 'synced_cookies.json');
@@ -1201,6 +1542,7 @@ public class Win32 {
 `const PROFILE_ID = ${JSON.stringify(options.profileId)};
 const PROFILE_NAME = ${JSON.stringify(options.profileName)};
 const LAUNCH_ID = ${JSON.stringify(autoStartLaunchId)};
+const OPEN_POST_MODE = ${JSON.stringify(Boolean(targetTweetUrl))};
 const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
 const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
 let bootstrapPromise = null;
@@ -1211,9 +1553,10 @@ let exportTimer = null;
 let retainedTabId = null;
 let cookiesImported = false;
 let venusConfirmationReported = false;
+let openPostCompleted = false;
 const BOOTSTRAP_ATTEMPTS = 5;
 const RETRY_DELAYS = [1000, 2000, 4000, 8000, 12000];
-const WATCHDOG_DEADLINE = Date.now() + 60000;
+const WATCHDOG_DEADLINE = Date.now() + (OPEN_POST_MODE ? 120000 : 60000);
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -1235,6 +1578,21 @@ async function reportLaunchStatus(status, details = {}) {
     body: JSON.stringify({ profileId: PROFILE_ID, launchId: LAUNCH_ID, status, details }),
   });
   if (!response.ok) throw new Error('Launch status server returned ' + response.status);
+}
+
+async function requestProfileClose(source) {
+  const response = await fetch(SERVER + '/api/close-profile', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + SERVER_TOKEN
+    },
+    body: JSON.stringify({ profileId: PROFILE_ID }),
+  });
+  if (!response.ok) throw new Error('Close-profile server returned ' + response.status);
+  openPostCompleted = true;
+  chrome.alarms.clear('spectra-startup-watchdog').catch(() => {});
+  console.log('[Spectra OpenPost] Main-process close requested via ' + source);
 }
 
 // Import cookies from cookies.json at startup
@@ -1271,7 +1629,7 @@ async function openStartUrl() {
   try {
     const response = await fetch(chrome.runtime.getURL('start_url.json'));
     if (!response.ok) throw new Error('start_url.json returned ' + response.status);
-    const { startUrl, closeOtherTabs } = await response.json();
+    const { startUrl, closeOtherTabs, likeTargetPost } = await response.json();
     if (!/^https?:\\/\\//i.test(startUrl || '')) throw new Error('Invalid startup URL');
 
     const initialTabs = await chrome.tabs.query({});
@@ -1371,7 +1729,7 @@ function bootstrap() {
           const tabId = await openStartUrl();
           if (!tabId) throw new Error('openStartUrl returned no retainedTabId');
           retainedTabId = tabId;
-          await reportLaunchStatus('bootstrap-confirmed', { tabId });
+          if (LAUNCH_ID) await reportLaunchStatus('bootstrap-confirmed', { tabId });
           bootstrapComplete = true;
           console.log('[Spectra AutoStart] Bootstrap confirmed: ' + tabId);
           return tabId;
@@ -1395,7 +1753,7 @@ function bootstrap() {
 }
 
 async function runStartupWatchdog() {
-  if (Date.now() > WATCHDOG_DEADLINE) {
+  if (openPostCompleted || Date.now() > WATCHDOG_DEADLINE) {
     chrome.alarms.clear('spectra-startup-watchdog').catch(() => {});
     return;
   }
@@ -1420,7 +1778,17 @@ async function runStartupWatchdog() {
         bootstrapComplete = false;
         retainedTabId = null;
         console.warn('[Spectra AutoStart] Watchdog found no retained X tab');
-      } else if (!venusConfirmationReported) {
+      } else if (OPEN_POST_MODE) {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: retainedTabId },
+          func: () => document.documentElement.dataset.spectraOpenPostComplete === '1',
+        }).catch(() => []);
+        if (results[0]?.result === true) {
+          console.log('[Spectra OpenPost] Completion marker detected');
+          await requestProfileClose('watchdog');
+          return;
+        }
+      } else if (LAUNCH_ID && !venusConfirmationReported) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: retainedTabId },
           world: 'MAIN',
@@ -1442,7 +1810,7 @@ async function runStartupWatchdog() {
       }
     }
 
-    if (!bootstrapComplete && !bootstrapPromise) {
+    if (!openPostCompleted && !bootstrapComplete && !bootstrapPromise) {
       bootstrap().catch((error) => {
         console.error('[Spectra AutoStart] Watchdog bootstrap failed:', error);
       });
@@ -1465,6 +1833,26 @@ chrome.tabs.onCreated.addListener((tab) => {
       console.log('[Spectra AutoStart] Extra tab closed: ' + tab.id + ' ' + tabUrl(tab));
     }).catch(() => {});
   }
+});
+
+chrome.runtime.onMessage?.addListener((message, sender, sendResponse) => {
+  if (message?.type !== 'spectra:open-post-actions-complete' || !sender.tab?.id) return;
+  sendResponse({ accepted: true });
+  (async () => {
+    openPostCompleted = true;
+    chrome.alarms.clear('spectra-startup-watchdog').catch(() => {});
+    console.log('[Spectra OpenPost] Actions finished; closing instance through both channels');
+    const closeRequests = [requestProfileClose('message')];
+    if (typeof sender.tab.windowId === 'number') {
+      closeRequests.push(chrome.windows.remove(sender.tab.windowId));
+    }
+    const results = await Promise.allSettled(closeRequests);
+    if (results.every((result) => result.status === 'rejected')) {
+      throw new Error('All close channels failed');
+    }
+  })().catch((error) => {
+    console.warn('[Spectra OpenPost] Could not close completed instance:', error);
+  });
 });
 
 chrome.alarms.create('spectra-startup-watchdog', {
@@ -1548,6 +1936,20 @@ setTimeout(exportCookies, 5000);
           const exists = fs.existsSync(manifestPath);
           console.log(`[Extensions] ${p} — manifest exists: ${exists}`);
           if (!exists) return [];
+          if (targetTweetUrl) {
+            try {
+              const extensionManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+              const extensionName = String(extensionManifest.name || '').toLowerCase();
+              if (extensionName.includes('shadowban scanner')) {
+                console.log(
+                  `[Extensions] Shadowban Scanner skipped for Open post: ${extensionManifest.name}`
+                );
+                return [];
+              }
+            } catch (error) {
+              console.warn(`[Extensions] Could not inspect extension for Open post: ${p}`, error);
+            }
+          }
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, p, index);
           this.suppressExtensionInstallTabs(runtimePath);
           if (this.configureTwitterAutoReplyAutostart(
@@ -1582,9 +1984,10 @@ setTimeout(exportCookies, 5000);
       }
       // Determine start URL
       const isValidUrl = (url: string) => url && (url.startsWith('https://') || url.startsWith('http://'));
-      let startUrl = isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com';
+      let startUrl = targetTweetUrl ||
+        (isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com');
       const lastUrlPath = path.join(profilePath, 'last_url.txt');
-      if (!options.autoStartTwitterBot && fs.existsSync(lastUrlPath)) {
+      if (!options.autoStartTwitterBot && !targetTweetUrl && fs.existsSync(lastUrlPath)) {
         try {
           const savedUrl = fs.readFileSync(lastUrlPath, 'utf8').trim();
           if (isValidUrl(savedUrl)) {
@@ -1599,7 +2002,8 @@ setTimeout(exportCookies, 5000);
         path.join(cookieSyncPath, 'start_url.json'),
         JSON.stringify({
           startUrl,
-          closeOtherTabs: options.autoStartTwitterBot === true,
+          closeOtherTabs: options.autoStartTwitterBot === true || Boolean(targetTweetUrl),
+          likeTargetPost: Boolean(targetTweetUrl),
           launchId: autoStartLaunchId,
         })
       );
@@ -1615,7 +2019,7 @@ setTimeout(exportCookies, 5000);
       // On another PC, import the portable JSON cookies before navigating to X.
       const launchUrl = options.autoStartTwitterBot
         ? 'about:blank'
-        : (hasStagedCookies ? 'about:blank' : startUrl);
+        : (targetTweetUrl || (hasStagedCookies ? 'about:blank' : startUrl));
       args.push(launchUrl);
       const launchConfirmationPromise = autoStartLaunchId
         ? this.waitForLaunchConfirmation(options.profileId, autoStartLaunchId)
@@ -1648,6 +2052,10 @@ setTimeout(exportCookies, 5000);
         if (process.platform !== 'win32') throw firstError;
         console.warn(`[Chrome] Standard startup failed, retrying in VPS compatibility mode: ${firstError.message}`);
         chromeProcess = await this.spawnChromeAndVerify(chromePath, [...args, '--disable-gpu'], cleanEnv, profilePath);
+      }
+      if (this.cancelledProfiles.has(options.profileId)) {
+        await this.terminateProfileProcesses(profilePath);
+        throw new Error('Launch cancelled');
       }
       this.enforceWindowPlacement(chromeProcess.pid, placement);
 
@@ -1898,8 +2306,15 @@ setTimeout(exportCookies, 5000);
 
   static async closeProfile(profileId: string) {
     this.assertSafeId(profileId, 'profile ID');
+    this.cancelledProfiles.add(profileId);
     const instance = this.activeProfiles.get(profileId);
-    if (!instance) return;
+    if (!instance) {
+      const profilesRoot = process.platform === 'win32'
+        ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+        : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+      await this.terminateProfileProcesses(path.join(profilesRoot, profileId));
+      return;
+    }
 
     try {
       if (process.platform === 'win32') {
@@ -1937,6 +2352,35 @@ setTimeout(exportCookies, 5000);
           instance.chromeProcess.kill();
         }
       } catch {}
+    }
+  }
+
+  static async forceCloseProfile(profileId: string) {
+    this.assertSafeId(profileId, 'profile ID');
+    this.cancelledProfiles.add(profileId);
+    const instance = this.activeProfiles.get(profileId);
+    const profilesRoot = process.platform === 'win32'
+      ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+      : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+    const profilePath = instance?.profilePath || path.join(profilesRoot, profileId);
+
+    const beforeProcessIds = await this.getProfileProcessIds(profilePath);
+    console.log(
+      `[Spectra OpenPost] Force close ${profileId}; Chrome PIDs before: ${beforeProcessIds.join(',') || 'none'}`
+    );
+    await this.terminateProfileProcesses(profilePath);
+    const afterProcessIds = await this.getProfileProcessIds(profilePath);
+    console.log(
+      `[Spectra OpenPost] Force close ${profileId}; Chrome PIDs after: ${afterProcessIds.join(',') || 'none'}`
+    );
+    this.pendingProfiles.delete(profileId);
+    this.activeProfiles.delete(profileId);
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send(
+        'profiles:activeUpdate',
+        Array.from(this.activeProfiles.keys())
+      );
+      this.mainWindow.webContents.send('profile:closed', profileId);
     }
   }
 

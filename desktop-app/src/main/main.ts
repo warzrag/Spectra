@@ -139,6 +139,7 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
       extensionPaths: extensionPaths,
       windowLayout: profileData.windowLayout,
       autoStartTwitterBot: profileData.autoStartTwitterBot === true,
+      targetTweetUrl: profileData.targetTweetUrl,
     });
 
     // Check if Chrome returned an error because profile is already running
@@ -344,6 +345,17 @@ ipcMain.on('internal:launch-status', (_, payload) => {
   PuppeteerLauncher.reportLaunchStatus(payload);
 });
 
+ipcMain.on('internal:close-profile', (_, profileId) => {
+  if (typeof profileId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
+    console.warn('[Spectra OpenPost] Ignored invalid close-profile request');
+    return;
+  }
+  console.log(`[Spectra OpenPost] Forwarding forced close for ${profileId}`);
+  PuppeteerLauncher.forceCloseProfile(profileId).catch(error => {
+    console.error(`[Spectra OpenPost] Failed to close profile ${profileId}:`, error);
+  });
+});
+
 ipcMain.handle('app:getVersion', () => {
   return app.getVersion();
 });
@@ -398,6 +410,11 @@ ipcMain.handle('profiles:getActive', () => {
   return PuppeteerLauncher.getActiveProfiles();
 });
 
+ipcMain.handle('profile:forceClose', async (_, profileId) => {
+  await PuppeteerLauncher.forceCloseProfile(profileId);
+  return true;
+});
+
 ipcMain.handle('profiles:getRunning', async (_, profileIds: string[]) => {
   return PuppeteerLauncher.getRunningProfiles(Array.isArray(profileIds) ? profileIds : []);
 });
@@ -406,6 +423,79 @@ ipcMain.handle('profileSync:setBusy', (_, busy: boolean) => {
   profileSyncBusy = busy === true;
   return true;
 });
+
+ipcMain.handle(
+  'profileSync:downloadFromCloud',
+  async (_, profileId: string, rawUrl: string, idToken: string) => {
+    if (typeof profileId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
+      throw new Error('Invalid profile ID');
+    }
+    if (typeof idToken !== 'string' || idToken.length < 100 || idToken.length > 8192) {
+      throw new Error('Invalid Firebase authentication token');
+    }
+
+    const url = new URL(rawUrl);
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'firebasestorage.googleapis.com' ||
+      !url.pathname.startsWith('/v0/b/spectra-59160.firebasestorage.app/o/')
+    ) {
+      throw new Error('Invalid Firebase Storage URL');
+    }
+
+    const encodedObjectPath = url.pathname.split('/o/')[1] || '';
+    const objectPath = decodeURIComponent(encodedObjectPath);
+    if (
+      !objectPath.startsWith(`profiles/${profileId}/`) ||
+      !objectPath.toLowerCase().endsWith('.zip')
+    ) {
+      throw new Error('Cloud profile URL does not match the requested profile');
+    }
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${idToken}` },
+      redirect: 'error',
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`Firebase Storage download failed (${response.status})`);
+    }
+
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    const maxBytes = 2 * 1024 * 1024 * 1024;
+    if (contentLength > maxBytes) {
+      throw new Error('Cloud profile archive is too large');
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let downloadedBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      downloadedBytes += value.byteLength;
+      if (downloadedBytes > maxBytes) {
+        await reader.cancel();
+        throw new Error('Cloud profile archive exceeded the size limit');
+      }
+      chunks.push(value);
+      if (contentLength > 0 && mainWindow && !mainWindow.isDestroyed()) {
+        const percent = 10 + Math.round((downloadedBytes / contentLength) * 50);
+        mainWindow.webContents.send(
+          'profileSync:downloadProgress',
+          profileId,
+          Math.min(60, percent)
+        );
+      }
+    }
+
+    const archive = Buffer.concat(chunks.map(chunk => Buffer.from(chunk)));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('profileSync:downloadProgress', profileId, 60);
+    }
+    return new Uint8Array(archive);
+  }
+);
 
 // Legacy local handlers - kept for migration support
 ipcMain.handle('profiles:getAll', () => {

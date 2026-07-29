@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket, GripVertical } from 'lucide-react';
+import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket, GripVertical, Square } from 'lucide-react';
 import MoveFolderModal from '../components/MoveFolderModal';
 import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -7,6 +7,7 @@ import { useToast } from '../contexts/ToastContext';
 import { logActivity } from '../services/firestore-service';
 import { Profile, Folder, Team, AppSettings, Platform, ProfileStatus } from '../../types';
 import { isLockedByOther } from '../services/profile-sync-service';
+import { normalizeTweetUrl } from '../../shared/twitter-url';
 
 interface DashboardProps {
   profiles: Profile[];
@@ -21,7 +22,10 @@ interface DashboardProps {
   onDeleteProfile: (profileId: string) => void;
   onLaunchProfile: (profile: any) => void;
   onBulkLaunch: (profileIds: string[]) => void;
+  onOpenTweetInFolder: (profileIds: string[], tweetUrl: string) => void;
   bulkLaunching: { total: number; current: number; name: string } | null;
+  isOpenPostRunning: boolean;
+  onStopOpenPost: () => void;
   onMoveProfile: (profileId: string, folderId: string | null) => void;
   onShowCreateModal: () => void;
   onEditProfile: (profile: Profile) => void;
@@ -42,7 +46,10 @@ const Dashboard: React.FC<DashboardProps> = ({
   onDeleteProfile,
   onLaunchProfile,
   onBulkLaunch,
+  onOpenTweetInFolder,
   bulkLaunching,
+  isOpenPostRunning,
+  onStopOpenPost,
   onMoveProfile,
   onShowCreateModal,
   onEditProfile,
@@ -71,6 +78,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [localOrder, setLocalOrder] = useState<string[] | null>(null);
+  const [tweetUrl, setTweetUrl] = useState('');
 
   const statusOptions: { id: ProfileStatus; label: string; color: string; bg: string }[] = [
     { id: 'active', label: 'Active', color: '#22c55e', bg: 'rgba(34,197,94,0.1)' },
@@ -377,6 +385,18 @@ const Dashboard: React.FC<DashboardProps> = ({
   const currentFolder = selectedFolderId && selectedFolderId !== '__none__'
     ? folders.find(f => f.id === selectedFolderId)
     : null;
+  const currentFolderProfileIds = currentFolder
+    ? profiles
+      .filter(profile =>
+        profile.folderId === currentFolder.id ||
+        getChildFolderIds(currentFolder.id).includes(profile.folderId || '')
+      )
+      .map(profile => profile.id)
+    : [];
+  const selectedFolderProfileIds = selectedProfiles.filter(profileId =>
+    currentFolderProfileIds.includes(profileId)
+  );
+  const normalizedTweetUrl = normalizeTweetUrl(tweetUrl);
 
   // ============================================================
   // VIEW 1: Model Grid (when no folder selected)
@@ -774,6 +794,59 @@ const Dashboard: React.FC<DashboardProps> = ({
           </span>
         </div>
       </header>
+
+      {currentFolder && (
+        <form
+          className="px-5 py-2.5 flex items-center gap-2"
+          style={{ borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!normalizedTweetUrl || selectedFolderProfileIds.length === 0 || bulkLaunching) return;
+            onOpenTweetInFolder(selectedFolderProfileIds, normalizedTweetUrl);
+          }}
+        >
+          <ExternalLink size={15} className="shrink-0" style={{ color: 'var(--accent-light)' }} />
+          <input
+            type="url"
+            value={tweetUrl}
+            onChange={(event) => setTweetUrl(event.target.value)}
+            placeholder="https://x.com/account/status/..."
+            aria-label="X post URL"
+            className="flex-1 min-w-0 px-3 py-1.5 rounded-lg text-[13px]"
+            style={{
+              background: 'var(--bg-elevated)',
+              border: `1px solid ${tweetUrl && !normalizedTweetUrl ? 'var(--danger)' : 'var(--border-default)'}`,
+              color: 'var(--text-primary)',
+            }}
+          />
+          <button
+            type="submit"
+            disabled={!normalizedTweetUrl || selectedFolderProfileIds.length === 0 || !!bulkLaunching}
+            className="h-8 px-3 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+            style={{ background: 'var(--accent)', color: '#fff' }}
+            title={`Open this X post in ${selectedFolderProfileIds.length} selected instance${selectedFolderProfileIds.length !== 1 ? 's' : ''}`}
+          >
+            {bulkLaunching ? <Loader2 size={14} className="animate-spin" /> : <ExternalLink size={14} />}
+            Open post ({selectedFolderProfileIds.length})
+          </button>
+          {isOpenPostRunning && (
+            <button
+              type="button"
+              onClick={onStopOpenPost}
+              className="h-8 px-3 rounded-lg flex items-center gap-1.5 text-[13px] font-semibold transition-colors shrink-0"
+              style={{
+                background: 'var(--danger-subtle)',
+                border: '1px solid var(--danger)',
+                color: 'var(--danger)',
+              }}
+              title="Stop all Open post actions and close the current instance"
+            >
+              <Square size={13} fill="currentColor" />
+              Arrêter tout
+            </button>
+          )}
+        </form>
+      )}
 
       {/* Subfolder tabs when viewing a parent folder */}
       {currentFolder && (() => {

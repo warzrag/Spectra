@@ -12,6 +12,28 @@ export class UrlTrackingServer {
 
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => {
+        const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+        if (
+          req.method === 'GET' &&
+          requestUrl.pathname === '/api/close-profile' &&
+          requestUrl.searchParams.get('token') === this.token
+        ) {
+          const profileId = requestUrl.searchParams.get('profileId');
+          if (profileId && /^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
+            console.log(`[Spectra OpenPost] Navigation fallback received for ${profileId}`);
+            ipcMain.emit('internal:close-profile', null, profileId);
+            res.writeHead(202, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+            });
+            res.end('<!doctype html><title>Spectra</title><p>Closing instance…</p>');
+          } else {
+            res.writeHead(400);
+            res.end('Invalid profile ID');
+          }
+          return;
+        }
+
         if (req.headers.authorization !== `Bearer ${this.token}`) {
           res.writeHead(401);
           res.end();
@@ -23,7 +45,8 @@ export class UrlTrackingServer {
           (
             req.url === '/api/save-url' ||
             req.url === '/api/save-cookies' ||
-            req.url === '/api/launch-status'
+            req.url === '/api/launch-status' ||
+            req.url === '/api/close-profile'
           )
         ) {
           let body = '';
@@ -79,6 +102,17 @@ export class UrlTrackingServer {
                 } else {
                   res.writeHead(400);
                   res.end(JSON.stringify({ error: 'Missing launch status fields' }));
+                }
+              } else if (req.url === '/api/close-profile') {
+                const { profileId } = data;
+                if (typeof profileId === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
+                  console.log(`[Spectra OpenPost] Close request received for ${profileId}`);
+                  ipcMain.emit('internal:close-profile', null, profileId);
+                  res.writeHead(202, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end(JSON.stringify({ error: 'Invalid profile ID' }));
                 }
               }
             } catch {

@@ -45,6 +45,7 @@ import {
   refreshProfileLock,
   releaseProfileLock,
 } from './services/profile-sync-service';
+import { normalizeTweetUrl } from '../shared/twitter-url';
 
 declare global {
   interface Window {
@@ -67,6 +68,7 @@ declare global {
         delete: (profileId: string) => Promise<boolean>;
         launch: (profileId: string, profileData: any) => Promise<{ success: boolean; error?: string; alreadyRunning?: boolean }>;
         close: (profileId: string) => Promise<boolean>;
+        forceClose: (profileId: string) => Promise<boolean>;
         moveToFolder: (profileId: string, folderId: string | null) => Promise<Profile>;
         cleanupLocal: (profileId: string) => Promise<boolean>;
         onActiveUpdate: (callback: (activeProfiles: string[]) => void) => () => void;
@@ -140,6 +142,8 @@ declare global {
         getLocalSyncRevision: (profileId: string) => Promise<string | null>;
         setLocalSyncRevision: (profileId: string, revision: string) => Promise<boolean>;
         setBusy: (busy: boolean) => Promise<boolean>;
+        downloadFromCloud: (profileId: string, url: string, idToken: string) => Promise<Uint8Array>;
+        onDownloadProgress: (callback: (profileId: string, percent: number) => void) => () => void;
         getHostname: () => Promise<string>;
         getInstallationId: () => Promise<string>;
         onProfileClosed: (callback: (profileId: string) => void) => () => void;
@@ -770,7 +774,24 @@ function App() {
         extensionPaths = await window.electronAPI.extensions.getPaths(enabledExtIds);
       }
 
-      const result = await window.electronAPI.profiles.launch(profile.id, { ...profile, extensionPaths });
+      const shouldCancelLaunch = typeof profile.__shouldCancel === 'function'
+        ? profile.__shouldCancel
+        : () => false;
+      if (shouldCancelLaunch()) {
+        if (user) {
+          await releaseProfileLock(profile.id, {
+            uid: user.uid,
+            deviceName: currentDeviceName,
+            installationId: currentInstallationId,
+          }).catch(() => {});
+        }
+        return false;
+      }
+      const { __shouldCancel, ...serializableProfile } = profile;
+      const result = await window.electronAPI.profiles.launch(
+        profile.id,
+        { ...serializableProfile, extensionPaths }
+      );
       if (result.success) {
         await firestoreUpdateProfile(profile.id, { lastUsed: new Date().toISOString() });
         showToast(`"${profile.name}" launched successfully`, 'success');
@@ -815,6 +836,32 @@ function App() {
   };
 
   const [bulkLaunching, setBulkLaunching] = useState<{ total: number; current: number; name: string } | null>(null);
+  const [isOpenPostRunning, setIsOpenPostRunning] = useState(false);
+  const openPostRunRef = useRef<{
+    cancelled: boolean;
+    activeProfileIds: Set<string>;
+    candidateProfileIds: string[];
+  } | null>(null);
+
+  const handleStopOpenPost = async () => {
+    const run = openPostRunRef.current;
+    if (!run || run.cancelled) return;
+
+    run.cancelled = true;
+    setBulkLaunching(null);
+    setIsOpenPostRunning(false);
+    const detectedRunningIds = window.electronAPI.profiles.getRunning
+      ? await window.electronAPI.profiles.getRunning(run.candidateProfileIds).catch(() => [])
+      : [];
+    const profileIds = Array.from(new Set([
+      ...run.activeProfileIds,
+      ...detectedRunningIds,
+    ]));
+    await Promise.allSettled(
+      profileIds.map(profileId => window.electronAPI.profiles.forceClose(profileId))
+    );
+    showToast('Open post stopped — current instance closed', 'warning');
+  };
 
   const handleBulkLaunch = async (profileIds: string[]) => {
     const profilesToLaunch = visibleProfiles.filter(p =>
@@ -857,6 +904,148 @@ function App() {
         : `${launchedCount} launched, ${failedCount} failed`,
       failedCount === 0 ? 'success' : 'warning'
     );
+  };
+
+  const handleOpenTweetInFolder = async (profileIds: string[], tweetUrl: string) => {
+    const normalizedUrl = normalizeTweetUrl(tweetUrl);
+    if (!normalizedUrl) {
+      showToast('Enter a valid X post URL', 'warning');
+      return;
+    }
+
+    const profilesToLaunch = visibleProfiles.filter(p =>
+      profileIds.includes(p.id) &&
+      !activeProfiles.includes(p.id) &&
+      !(user && isLockedByOther(p, user.uid, currentDeviceName, currentInstallationId))
+    );
+    const skippedCount = profileIds.length - profilesToLaunch.length;
+
+    if (profilesToLaunch.length === 0) {
+      showToast('No available instance in this folder', 'info');
+      return;
+    }
+
+    const runState = {
+      cancelled: false,
+      activeProfileIds: new Set<string>(),
+      candidateProfileIds: profilesToLaunch.map(profile => profile.id),
+    };
+    openPostRunRef.current = runState;
+    setIsOpenPostRunning(true);
+    setBulkLaunching({ total: profilesToLaunch.length, current: 0, name: '' });
+    let launchedCount = 0;
+    let completedCount = 0;
+    let timedOutCount = 0;
+    const launchBatchSize = 1;
+    const launchStaggerMs = 0;
+
+    const waitForBatchToClose = async (profileIds: string[], timeoutMs = 60000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const runningIds = window.electronAPI.profiles.getRunning
+          ? await window.electronAPI.profiles.getRunning(profileIds)
+          : (await window.electronAPI.profiles.getActive()).filter(id => profileIds.includes(id));
+        if (runningIds.length === 0) return true;
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+      return false;
+    };
+
+    for (let batchStart = 0; batchStart < profilesToLaunch.length; batchStart += launchBatchSize) {
+      if (runState.cancelled) break;
+      const batch = profilesToLaunch.slice(batchStart, batchStart + launchBatchSize);
+      const batchResults = await Promise.all(
+        batch.map(async (profile, batchIndex) => {
+          if (runState.cancelled) return false;
+          runState.activeProfileIds.add(profile.id);
+          if (batchIndex > 0) {
+            await new Promise(resolve => setTimeout(resolve, batchIndex * launchStaggerMs));
+          }
+          if (runState.cancelled) {
+            runState.activeProfileIds.delete(profile.id);
+            return false;
+          }
+          setBulkLaunching({
+            total: profilesToLaunch.length,
+            current: completedCount,
+            name: profile.name,
+          });
+          const launched = await handleLaunchProfile({
+            ...profile,
+            lastUrl: normalizedUrl,
+            targetTweetUrl: normalizedUrl,
+            autoStartTwitterBot: false,
+            __shouldCancel: () => runState.cancelled,
+            windowLayout: { index: batchIndex, total: batch.length },
+          });
+          if (launched) {
+            launchedCount++;
+            if (runState.cancelled) {
+              await window.electronAPI.profiles.forceClose(profile.id);
+            }
+          } else {
+            runState.activeProfileIds.delete(profile.id);
+          }
+          completedCount++;
+          setBulkLaunching({
+            total: profilesToLaunch.length,
+            current: completedCount,
+            name: profile.name,
+          });
+          return launched;
+        })
+      );
+
+      const launchedBatchIds = batch
+        .filter((_, index) => batchResults[index])
+        .map(profile => profile.id);
+      if (runState.cancelled) {
+        await Promise.allSettled(
+          launchedBatchIds.map(profileId => window.electronAPI.profiles.forceClose(profileId))
+        );
+        break;
+      }
+      if (launchedBatchIds.length === 0) continue;
+
+      setBulkLaunching({
+        total: profilesToLaunch.length,
+        current: completedCount,
+        name: `Waiting for batch ${Math.floor(batchStart / launchBatchSize) + 1}`,
+      });
+      const batchClosed = await waitForBatchToClose(launchedBatchIds);
+      launchedBatchIds.forEach(profileId => runState.activeProfileIds.delete(profileId));
+      if (runState.cancelled) break;
+      if (!batchClosed) {
+        timedOutCount += launchedBatchIds.length;
+        const timedOutProfile = batch.find(profile => launchedBatchIds.includes(profile.id));
+        setBulkLaunching({
+          total: profilesToLaunch.length,
+          current: completedCount,
+          name: `${timedOutProfile?.name || 'Instance'} — proxy too slow`,
+        });
+        showToast(
+          `"${timedOutProfile?.name || 'Instance'}" ignored: proxy too slow`,
+          'warning'
+        );
+        await Promise.allSettled(
+          launchedBatchIds.map(profileId => window.electronAPI.profiles.forceClose(profileId))
+        );
+      }
+    }
+
+    const wasCancelled = runState.cancelled;
+    if (openPostRunRef.current === runState) openPostRunRef.current = null;
+    setIsOpenPostRunning(false);
+    setBulkLaunching(null);
+    if (wasCancelled) return;
+    const failedCount = profilesToLaunch.length - launchedCount;
+    const summary = [
+      `${launchedCount} opened`,
+      timedOutCount > 0 ? `${timedOutCount} ignored (timeout)` : '',
+      failedCount > 0 ? `${failedCount} failed` : '',
+      skippedCount > 0 ? `${skippedCount} already open or unavailable` : '',
+    ].filter(Boolean).join(', ');
+    showToast(summary, failedCount === 0 ? 'success' : 'warning');
   };
 
   const handleCreateFolder = async (folderData: any) => {
@@ -971,7 +1160,10 @@ function App() {
             onDeleteProfile={handleDeleteProfile}
             onLaunchProfile={handleLaunchProfile}
             onBulkLaunch={handleBulkLaunch}
+            onOpenTweetInFolder={handleOpenTweetInFolder}
             bulkLaunching={bulkLaunching}
+            isOpenPostRunning={isOpenPostRunning}
+            onStopOpenPost={handleStopOpenPost}
             onMoveProfile={handleMoveProfile}
             onShowCreateModal={() => setShowCreateModal(true)}
             onEditProfile={(profile) => { setEditingProfile(profile); setShowCreateModal(true); }}

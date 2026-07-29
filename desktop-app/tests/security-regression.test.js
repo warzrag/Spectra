@@ -33,10 +33,138 @@ const getCookieSyncBackgroundSource = ({ profileId, profileName, launchId }) => 
     .replaceAll('${JSON.stringify(options.profileId)}', JSON.stringify(profileId))
     .replaceAll('${JSON.stringify(options.profileName)}', JSON.stringify(profileName))
     .replaceAll('${JSON.stringify(autoStartLaunchId)}', JSON.stringify(launchId))
+    .replaceAll('${JSON.stringify(Boolean(targetTweetUrl))}', 'false')
     .replaceAll('${this.localServerConfig?.port || 0}', '45678')
     .replaceAll("${JSON.stringify(this.localServerConfig?.token || '')}", JSON.stringify('test-token'))
     .replaceAll('\\\\', '\\');
 };
+
+test('X post links are normalized and non-post URLs are rejected', () => {
+  const { normalizeTweetUrl } = loadTypeScriptModule(
+    'desktop-app/src/shared/twitter-url.ts'
+  );
+
+  assert.equal(
+    normalizeTweetUrl(' https://twitter.com/Spectra_Test/status/123456789?ref_src=twsrc '),
+    'https://x.com/Spectra_Test/status/123456789'
+  );
+  assert.equal(
+    normalizeTweetUrl('https://www.x.com/user/status/42/'),
+    'https://x.com/user/status/42'
+  );
+  assert.equal(normalizeTweetUrl('https://x.com/home'), null);
+  assert.equal(normalizeTweetUrl('http://x.com/user/status/42'), null);
+  assert.equal(normalizeTweetUrl('https://example.com/user/status/42'), null);
+  assert.equal(normalizeTweetUrl('javascript:alert(1)'), null);
+});
+
+test('folder post launch is isolated from Open Selected and retains one target tab', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const main = read('desktop-app/src/main/main.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+  const urlServer = read('desktop-app/src/main/url-server.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const dashboard = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+
+  assert.match(main, /targetTweetUrl:\s*profileData\.targetTweetUrl/);
+  assert.match(launcher, /normalizeTweetUrl\(options\.targetTweetUrl\)/);
+  assert.match(launcher, /throw new Error\('Invalid X post URL'\)/);
+  assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true \|\| Boolean\(targetTweetUrl\)/);
+  assert.match(launcher, /likeTargetPost:\s*Boolean\(targetTweetUrl\)/);
+  assert.match(launcher, /targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)/);
+  assert.match(launcher, /!options\.autoStartTwitterBot && !targetTweetUrl/);
+  assert.match(launcher, /js:\s*\['open-post-actions\.js'\]/);
+  assert.match(launcher, /run_at:\s*'document_idle'/);
+  assert.match(launcher, /window\.__spectraOpenPostActionsStarted/);
+  assert.match(launcher, /article\[data-testid="tweet"\]/);
+  assert.match(launcher, /\[data-testid="unlike"\]/);
+  assert.match(launcher, /\[data-testid="like"\]/);
+  assert.match(launcher, /\[data-testid="tweetPhoto"\]/);
+  assert.match(launcher, /actionBarOutsideViewport/);
+  assert.match(launcher, /likeButton\.scrollIntoView\(\{ block: 'center'/);
+  assert.match(launcher, /\[data-testid="unretweet"\]/);
+  assert.match(launcher, /\[data-testid="retweet"\]/);
+  assert.match(launcher, /\[data-testid="retweetConfirm"\]/);
+  assert.match(launcher, /spectra:open-post-actions-complete/);
+  assert.match(launcher, /spectra-open-post-overlay/);
+  assert.match(launcher, /Actions terminées/);
+  assert.match(launcher, /Instance ignorée/);
+  assert.match(launcher, /Like confirmé/);
+  assert.match(launcher, /Like non confirmé/);
+  assert.match(launcher, /Repost confirmé/);
+  assert.match(launcher, /Repost non confirmé/);
+  assert.match(launcher, /Fermeture de l’instance/);
+  assert.match(launcher, /Passage à l’instance suivante/);
+  assert.match(launcher, /spectraOpenPostComplete = '1'/);
+  assert.match(launcher, /const OPEN_POST_MODE =/);
+  assert.match(launcher, /let openPostCompleted = false/);
+  assert.match(launcher, /Completion marker detected/);
+  assert.match(launcher, /if \(!openPostCompleted && !bootstrapComplete && !bootstrapPromise\)/);
+  assert.match(launcher, /Actions finished; closing instance through both channels/);
+  assert.match(launcher, /chrome\.windows\.remove\(sender\.tab\.windowId\)/);
+  assert.match(launcher, /sendResponse\(\{ accepted: true \}\)/);
+  assert.match(launcher, /for \(let attempt = 0; attempt < 5; attempt\+\+\)/);
+  assert.match(launcher, /window\.location\.replace\(CLOSE_FALLBACK_URL\)/);
+  assert.match(launcher, /requestProfileClose\('message'\)/);
+  assert.match(launcher, /requestProfileClose\('watchdog'\)/);
+  assert.match(launcher, /fetch\(SERVER \+ '\/api\/close-profile'/);
+  assert.match(urlServer, /req\.url === '\/api\/close-profile'/);
+  assert.match(urlServer, /requestUrl\.pathname === '\/api\/close-profile'/);
+  assert.match(urlServer, /Navigation fallback received/);
+  assert.match(urlServer, /internal:close-profile/);
+  assert.match(main, /ipcMain\.on\('internal:close-profile'/);
+  assert.match(main, /PuppeteerLauncher\.forceCloseProfile\(profileId\)/);
+  assert.match(preload, /forceClose: \(profileId: string\)/);
+  assert.match(launcher, /private static cancelledProfiles = new Set<string>\(\)/);
+  assert.match(launcher, /this\.cancelledProfiles\.has\(options\.profileId\)/);
+  assert.match(launcher, /showResultOverlay\(success, likeConfirmed, repostConfirmed\)/);
+  assert.match(launcher, /if \(targetTweetUrl\)[\s\S]*extensionName\.includes\('shadowban scanner'\)/);
+  assert.match(launcher, /Shadowban Scanner skipped for Open post/);
+  assert.match(launcher, /if \(LAUNCH_ID\) await reportLaunchStatus\('bootstrap-confirmed'/);
+  assert.match(app, /targetTweetUrl:\s*normalizedUrl/);
+  assert.match(app, /autoStartTwitterBot:\s*false/);
+  assert.match(app, /const launchBatchSize = 1/);
+  assert.match(app, /const launchStaggerMs = 0/);
+  assert.match(launcher, /await wait\(800\)/);
+  assert.match(app, /waitForBatchToClose = async \(profileIds: string\[\], timeoutMs = 60000\)/);
+  assert.match(app, /waitForBatchToClose/);
+  assert.match(app, /getRunning\(profileIds\)/);
+  assert.match(app, /ignored: proxy too slow/);
+  assert.match(app, /window\.electronAPI\.profiles\.forceClose\(profileId\)/);
+  assert.match(app, /ignored \(timeout\)/);
+  assert.match(app, /const handleStopOpenPost = async/);
+  assert.match(app, /run\.cancelled = true/);
+  assert.match(app, /__shouldCancel: \(\) => runState\.cancelled/);
+  assert.match(app, /candidateProfileIds: profilesToLaunch\.map/);
+  assert.match(app, /getRunning\(run\.candidateProfileIds\)/);
+  assert.match(app, /Open post stopped — current instance closed/);
+  assert.match(app, /batchStart \+= launchBatchSize/);
+  assert.match(app, /await Promise\.all\(/);
+  assert.match(app, /windowLayout:\s*\{\s*index:\s*batchIndex,\s*total:\s*batch\.length\s*\}/);
+  assert.match(launcher, /compactWindow = \{ width: 480, height: 500/);
+  assert.match(launcher, /for \(\$attempt = 0; \$attempt -lt 3; \$attempt\+\+\)/);
+  assert.match(dashboard, /selectedFolderProfileIds = selectedProfiles\.filter/);
+  assert.match(dashboard, /Open post \(\{selectedFolderProfileIds\.length\}\)/);
+  assert.match(dashboard, /onOpenTweetInFolder\(selectedFolderProfileIds, normalizedTweetUrl\)/);
+  assert.match(dashboard, /Arrêter tout/);
+  assert.match(dashboard, /onClick=\{onStopOpenPost\}/);
+});
+
+test('cloud profile downloads use authenticated Electron transport instead of renderer XHR', () => {
+  const main = read('desktop-app/src/main/main.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+  const sync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
+
+  assert.doesNotMatch(sync, /\bgetBlob\b/);
+  assert.match(sync, /auth\.currentUser\?\.getIdToken\(\)/);
+  assert.match(sync, /profileSync\.downloadFromCloud/);
+  assert.match(preload, /profileSync:downloadFromCloud/);
+  assert.match(preload, /profileSync:downloadProgress/);
+  assert.match(main, /ipcMain\.handle\(\s*'profileSync:downloadFromCloud'/);
+  assert.match(main, /url\.hostname !== 'firebasestorage\.googleapis\.com'/);
+  assert.match(main, /objectPath\.startsWith\(`profiles\/\$\{profileId\}\/`\)/);
+  assert.match(main, /Authorization: `Bearer \$\{idToken\}`/);
+});
 
 test('Electron renderer security remains enabled and updater has no embedded token', () => {
   const main = read('desktop-app/src/main/main.ts');
@@ -80,7 +208,7 @@ test('cookie import targets the file consumed by the runtime importer', () => {
 test('cross-device cookies are restored before navigation and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*'about:blank'\s*:\s*\(hasStagedCookies \? 'about:blank' : startUrl\)/);
+  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*'about:blank'\s*:\s*\(targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)\)/);
   assert.match(launcher, /await importCookies\(\);\s+cookiesImported = true/);
   assert.match(launcher, /const tabId = await openStartUrl\(\)/);
   assert.match(launcher, /await reportLaunchStatus\('bootstrap-confirmed'[\s\S]*bootstrapComplete = true/);
@@ -189,7 +317,7 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(launcher, /let bootstrapComplete = false/);
   assert.match(launcher, /BOOTSTRAP_ATTEMPTS = 5/);
   assert.match(launcher, /RETRY_DELAYS = \[1000, 2000, 4000, 8000, 12000\]/);
-  assert.match(launcher, /WATCHDOG_DEADLINE = Date\.now\(\) \+ 60000/);
+  assert.match(launcher, /WATCHDOG_DEADLINE = Date\.now\(\) \+ \(OPEN_POST_MODE \? 120000 : 60000\)/);
   assert.match(launcher, /permissions: \['cookies', 'tabs', 'scripting', 'alarms'\]/);
   assert.match(launcher, /chrome\.alarms\.create\('spectra-startup-watchdog'/);
   assert.match(launcher, /Bootstrap attempt/);
@@ -204,10 +332,11 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.doesNotMatch(openStartUrl, /catch\s*\([^)]*\)\s*\{\s*\}/);
   assert.match(openStartUrl, /throw error/);
   assert.match(openStartUrl, /startup-tabs-ready written/);
-  assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true/);
+  assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true \|\| Boolean\(targetTweetUrl\)/);
   assert.match(launcher, /suppressExtensionInstallTabs\(runtimePath\)/);
   assert.match(launcher, /workerSource\.includes\('html\/initialSetup\.html'\)/);
   assert.match(launcher, /Shadowban initial setup suppressed/);
+  assert.match(launcher, /manifest\.version = \[\.\.\.versionParts, '65000'\]\.join\('\.'\)/);
   assert.doesNotMatch(launcher, /const spectraTabsCreate = chrome\.tabs\.create/);
   assert.match(launcher, /autonomousPhaseStartTime\|manualPause\|spectraPendingLaunchId/);
   assert.match(launcher, /e\.spectraPendingLaunchId===/);
