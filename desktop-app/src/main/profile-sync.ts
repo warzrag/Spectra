@@ -45,6 +45,8 @@ const ROOT_FILES = new Set([
   'First Run',
   '.sync_version',
   'synced_cookies.json',
+  'authenticated_cookies.json',
+  'fingerprint_override.json',
   'open_tabs.json',
   'last_url.txt',
 ]);

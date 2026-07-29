@@ -27,9 +27,19 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
  */
 export async function uploadProfileToCloud(
   profileId: string,
-  currentUser: { uid: string; email: string },
+  currentUser: {
+    uid: string;
+    email: string;
+    deviceName?: string | null;
+    installationId?: string | null;
+  },
   onProgress?: (percent: number) => void
 ): Promise<void> {
+  const baseVersion = Number(
+    await (window as any).electronAPI.profileSync.getLocalSyncVersion(profileId) || 0
+  );
+  const baseRevision = await (window as any).electronAPI.profileSync.getLocalSyncRevision(profileId);
+
   // 1. Zip profile via main process
   console.log(`[ProfileSync] Starting upload for ${profileId}`);
   const result = await (window as any).electronAPI.profileSync.zipForSync(profileId);
@@ -57,10 +67,6 @@ export async function uploadProfileToCloud(
   // 3. Get download URL
   const downloadUrl = await getDownloadURL(storageRef);
 
-  // Keep a transition mirror for clients older than the revision protocol.
-  // New clients never use this mutable object when a valid revision URL exists.
-  await uploadBytes(ref(storage, `profiles/${profileId}/profile.zip`), zipData);
-
   // Allocate the next cloud version atomically from the server value.
   const profileRef = doc(db, 'profiles', profileId);
   let newVersion = 0;
@@ -68,18 +74,58 @@ export async function uploadProfileToCloud(
     const snapshot = await transaction.get(profileRef);
     if (!snapshot.exists()) throw new Error('Profile no longer exists');
 
-    newVersion = Number(snapshot.data().cloudSyncVersion || 0) + 1;
+    const cloudProfile = snapshot.data() as Profile;
+    const cloudVersion = Number(cloudProfile.cloudSyncVersion || 0);
+    const cloudRevision = cloudProfile.cloudSyncRevision || null;
+    const revisionConflict = Boolean(
+      baseRevision &&
+      !baseRevision.startsWith('legacy:') &&
+      cloudRevision &&
+      cloudRevision !== baseRevision
+    );
+    if (cloudVersion !== baseVersion || revisionConflict) {
+      const conflictError = new Error(
+        'Cloud profile changed on another device; local upload was cancelled'
+      ) as Error & { code?: string };
+      conflictError.code = 'profile-sync/conflict';
+      throw conflictError;
+    }
+    if (cloudProfile.lockedBy !== currentUser.uid) {
+      throw new Error('Profile lock is no longer owned by this account');
+    }
+    if (
+      currentUser.installationId &&
+      cloudProfile.lockedByInstallationId &&
+      cloudProfile.lockedByInstallationId !== currentUser.installationId
+    ) {
+      throw new Error('Profile lock moved to another installation');
+    }
+    if (
+      currentUser.deviceName &&
+      cloudProfile.lockedByDevice &&
+      cloudProfile.lockedByDevice !== currentUser.deviceName
+    ) {
+      throw new Error('Profile lock moved to another device');
+    }
+
+    newVersion = cloudVersion + 1;
     transaction.update(profileRef, {
       cloudStorageUrl: downloadUrl,
       cloudSyncedAt: new Date().toISOString(),
       cloudSyncSize: result.size,
       cloudSyncVersion: newVersion,
       cloudSyncRevision: revisionId,
+      cloudSyncProtocolVersion: 2,
       cloudSyncChecksum: checksum,
       cloudSyncChecksumRevision: revisionId,
       cloudSyncedBy: currentUser.uid,
     });
   });
+
+  // Compatibility mirror for older Spectra clients. It is updated only after
+  // the revision transaction succeeds, so a rejected stale client cannot
+  // overwrite the shared mutable object.
+  await uploadBytes(ref(storage, `profiles/${profileId}/profile.zip`), zipData);
 
   // 5. Update local sync version
   await (window as any).electronAPI.profileSync.setLocalSyncVersion(profileId, newVersion);

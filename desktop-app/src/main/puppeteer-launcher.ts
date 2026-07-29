@@ -3,10 +3,20 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as http from 'http';
 import * as net from 'net';
+import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
 import { resolveVenusAutostartState } from './venus-autostart-state';
 import { normalizeTweetUrl } from '../shared/twitter-url';
+import { hasAuthenticatedXSession } from '../shared/x-auth-snapshot';
+import {
+  isManagedLaunch,
+  fitWindowToWorkArea,
+  resolveLaunchMode,
+  shouldAppendLaunchUrl,
+  shouldOpenSetupTab,
+  SpectraLaunchMode,
+} from '../shared/launch-policy';
 
 // Keep the managed browser aligned with the Chrome version advertised by new profiles.
 const MANAGED_CHROME_VERSION = '151.0.7922.47';
@@ -14,6 +24,8 @@ const MANAGED_CHROME_VERSION = '151.0.7922.47';
 export interface PuppeteerLaunchOptions {
   profileId: string;
   profileName: string;
+  launchMode?: SpectraLaunchMode;
+  platform?: string;
   userAgent?: string;
   proxy?: any;
   fingerprint?: any;
@@ -23,6 +35,7 @@ export interface PuppeteerLaunchOptions {
   windowLayout?: { index: number; total: number };
   autoStartTwitterBot?: boolean;
   targetTweetUrl?: string;
+  sessionImport?: { attemptId: string };
 }
 
 export class PuppeteerLauncher {
@@ -36,7 +49,7 @@ export class PuppeteerLauncher {
   private static browserVersions = new Map<string, Promise<string | null>>();
   private static mainWindow: any = null;
   private static localServerConfig: { port: number; token: string } | null = null;
-  private static readonly compactWindow = { width: 480, height: 500, margin: 0, gap: 0 };
+  private static readonly compactWindow = { width: 900, height: 720, margin: 0, gap: 0 };
 
   private static assertSafeId(value: string, label: string): void {
     if (!/^[A-Za-z0-9_-]{1,160}$/.test(value)) {
@@ -385,6 +398,91 @@ public class Win32 {
       };
       fs.writeFileSync(localStatePath, JSON.stringify(localState));
     } catch {}
+  }
+
+  private static applyManualLaunchState(profilePath: string, prefs: any) {
+    prefs.profile = {
+      ...(prefs.profile || {}),
+      exit_type: 'Normal',
+      exited_cleanly: true,
+    };
+    prefs.session = {
+      ...(prefs.session || {}),
+      restore_on_startup: 1,
+    };
+
+    const localStatePath = path.join(profilePath, 'Local State');
+    try {
+      const localState = fs.existsSync(localStatePath) ? JSON.parse(fs.readFileSync(localStatePath, 'utf8')) : {};
+      localState.profile = {
+        ...(localState.profile || {}),
+        exit_type: 'Normal',
+        exited_cleanly: true,
+      };
+      fs.writeFileSync(localStatePath, JSON.stringify(localState));
+    } catch {}
+  }
+
+  private static hasChromeSessionRestore(profilePath: string): boolean {
+    const defaultDir = path.join(profilePath, 'Default');
+    const sessionTargets = [
+      path.join(defaultDir, 'Current Session'),
+      path.join(defaultDir, 'Current Tabs'),
+      path.join(defaultDir, 'Last Session'),
+      path.join(defaultDir, 'Last Tabs'),
+      path.join(defaultDir, 'Sessions'),
+    ];
+
+    return sessionTargets.some(target => {
+      try {
+        if (!fs.existsSync(target)) return false;
+        const stat = fs.statSync(target);
+        if (stat.isDirectory()) return fs.readdirSync(target).length > 0;
+        return stat.size > 0;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private static fileHasAuthenticatedXSession(filePath: string): boolean {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      return hasAuthenticatedXSession(parsed);
+    } catch {
+      return false;
+    }
+  }
+
+  static hasAuthenticatedXSnapshot(profileId: string): boolean {
+    this.assertSafeId(profileId, 'profile ID');
+    const profilesRoot = process.platform === 'win32'
+      ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+      : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+    return this.ensureAuthenticatedXSnapshot(path.join(profilesRoot, profileId));
+  }
+
+  private static ensureAuthenticatedXSnapshot(profilePath: string): boolean {
+    const protectedPath = path.join(profilePath, 'authenticated_cookies.json');
+    if (fs.existsSync(protectedPath) && this.fileHasAuthenticatedXSession(protectedPath)) {
+      return true;
+    }
+
+    const syncedPath = path.join(profilePath, 'synced_cookies.json');
+    if (!fs.existsSync(syncedPath) || !this.fileHasAuthenticatedXSession(syncedPath)) {
+      return false;
+    }
+
+    try {
+      const tempPath = `${protectedPath}.${process.pid}.${Date.now()}.tmp`;
+      fs.copyFileSync(syncedPath, tempPath);
+      fs.renameSync(tempPath, protectedPath);
+      console.log('[CookieSync] Promoted current authenticated cookies to protected snapshot');
+      return true;
+    } catch (error) {
+      console.warn('[CookieSync] Could not protect authenticated snapshot:', error);
+      return false;
+    }
   }
 
   private static clearChromeSessionRestore(profilePath: string) {
@@ -750,49 +848,27 @@ public class Win32 {
     return destination;
   }
 
-  private static suppressExtensionInstallTabs(runtimePath: string): boolean {
+  private static getChromeExtensionId(runtimePath: string): string | null {
     const manifestPath = path.join(runtimePath, 'manifest.json');
-    if (!fs.existsSync(manifestPath)) return false;
+    if (!fs.existsSync(manifestPath)) return null;
 
     try {
       const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-      const extensionName = String(manifest.name || '').toLowerCase();
-      const serviceWorker = manifest.background?.service_worker;
-      if (
-        !extensionName.includes('shadowban scanner') ||
-        typeof serviceWorker !== 'string' ||
-        manifest.background?.type === 'module'
-      ) {
-        return false;
-      }
-
-      const workerPath = path.join(runtimePath, serviceWorker);
-      if (!fs.existsSync(workerPath)) return false;
-
-      const workerSource = fs.readFileSync(workerPath, 'utf8');
-      if (!workerSource.includes('html/initialSetup.html')) return false;
-
-      const patchedWorkerSource = workerSource.replace(
-        /([A-Za-z_$][\w$]*=function\(\)\{)var ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.runtime\.getURL\(["']html\/initialSetup\.html["']\);\3\.tabs\.create\(\{url:\2\}\)(\})/,
-        '$1console.log("[Spectra] Shadowban initial setup suppressed")$4'
-      );
-      if (patchedWorkerSource === workerSource) {
-        throw new Error('Shadowban initialSetup handler was not recognized');
-      }
-
-      fs.writeFileSync(workerPath, patchedWorkerSource);
-      const versionParts = String(manifest.version || '1.0.0')
-        .split('.')
-        .slice(0, 3)
-        .map((part: string) => String(Math.min(65535, Math.max(0, Number(part) || 0))));
-      while (versionParts.length < 3) versionParts.push('0');
-      manifest.version = [...versionParts, '65000'].join('.');
-      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-      console.log(`[Extensions] Disabled Shadowban onInstalled initialSetup for ${manifest.name}`);
-      return true;
+      if (typeof manifest.key !== 'string' || !manifest.key.trim()) return null;
+      const digest = crypto
+        .createHash('sha256')
+        .update(Buffer.from(manifest.key, 'base64'))
+        .digest()
+        .subarray(0, 16);
+      return Array.from(digest)
+        .map((byte) =>
+          String.fromCharCode(97 + (byte >> 4)) +
+          String.fromCharCode(97 + (byte & 15))
+        )
+        .join('');
     } catch (error) {
-      console.warn('[Extensions] Could not suppress automatic setup tab:', error);
-      return false;
+      console.warn('[Extensions] Could not derive extension ID:', error);
+      return null;
     }
   }
 
@@ -891,7 +967,8 @@ public class Win32 {
    */
   private static cleanProfileState(profilePath: string) {
     const keepFiles = new Set([
-      'pending_cookies.json', 'synced_cookies.json', 'open_tabs.json',
+      'pending_cookies.json', 'synced_cookies.json', 'authenticated_cookies.json',
+      'fingerprint_override.json', 'open_tabs.json',
       'last_url.txt', '__proxy_auth_ext', '__brand_fix_ext',
       '__cookie_sync_ext', '__platform_fix_ext', '__startup_tab_cleaner_ext',
     ]);
@@ -926,6 +1003,17 @@ public class Win32 {
       if (options.targetTweetUrl && !targetTweetUrl) {
         throw new Error('Invalid X post URL');
       }
+      const sessionImportAttemptId = options.sessionImport?.attemptId || '';
+      if (sessionImportAttemptId && !/^[A-Fa-f0-9-]{16,64}$/.test(sessionImportAttemptId)) {
+        throw new Error('Invalid session import attempt');
+      }
+      const launchMode = resolveLaunchMode({
+        launchMode: options.launchMode,
+        sessionImportAttemptId,
+        targetTweetUrl,
+        autoStartTwitterBot: options.autoStartTwitterBot,
+      });
+      const managedLaunch = isManagedLaunch(launchMode);
 
       // Get user data directory path
       const userDataDir = process.platform === 'win32'
@@ -972,25 +1060,57 @@ public class Win32 {
         try { prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf8')); } catch {}
       }
       const placement = this.getWindowPlacement(options.windowLayout);
-      this.applyCleanLaunchState(profilePath, prefs);
-      // Always discard Chrome's stale tab/session files. The URL Spectra should
-      // reopen is tracked separately, and stale sessions can make Chrome exit
-      // before showing a window on an individual launch.
-      this.clearChromeSessionRestore(profilePath);
-      prefs.browser = {
-        ...(prefs.browser || {}),
-        window_placement: {
-          left: placement.left,
-          top: placement.top,
-          right: placement.right,
-          bottom: placement.bottom,
-          maximized: false,
-          work_area_left: placement.workArea.x,
-          work_area_top: placement.workArea.y,
-          work_area_right: placement.workArea.x + placement.workArea.width,
-          work_area_bottom: placement.workArea.y + placement.workArea.height,
-        },
-      };
+      const hasRestorableSession = this.hasChromeSessionRestore(profilePath);
+      let manualPlacementCorrection: ReturnType<typeof fitWindowToWorkArea> = null;
+      if (managedLaunch) {
+        this.applyCleanLaunchState(profilePath, prefs);
+        this.clearChromeSessionRestore(profilePath);
+        prefs.browser = {
+          ...(prefs.browser || {}),
+          window_placement: {
+            left: placement.left,
+            top: placement.top,
+            right: placement.right,
+            bottom: placement.bottom,
+            maximized: false,
+            work_area_left: placement.workArea.x,
+            work_area_top: placement.workArea.y,
+            work_area_right: placement.workArea.x + placement.workArea.width,
+            work_area_bottom: placement.workArea.y + placement.workArea.height,
+          },
+        };
+      } else {
+        // A normal launch must retain Chrome's tabs and the user's own window
+        // placement. OpenPost and other managed workflows stay deterministic.
+        this.applyManualLaunchState(profilePath, prefs);
+        const storedPlacement = prefs.browser?.window_placement;
+        if (storedPlacement) {
+          manualPlacementCorrection = fitWindowToWorkArea(
+            {
+              left: Number(storedPlacement.left),
+              top: Number(storedPlacement.top),
+              right: Number(storedPlacement.right),
+              bottom: Number(storedPlacement.bottom),
+            },
+            placement.workArea
+          );
+          if (manualPlacementCorrection) {
+            prefs.browser = {
+              ...(prefs.browser || {}),
+              window_placement: {
+                ...storedPlacement,
+                ...manualPlacementCorrection,
+                maximized: false,
+                work_area_left: placement.workArea.x,
+                work_area_top: placement.workArea.y,
+                work_area_right: placement.workArea.x + placement.workArea.width,
+                work_area_bottom: placement.workArea.y + placement.workArea.height,
+              },
+            };
+            console.log('[Chrome] Manual window fitted to the active display');
+          }
+        }
+      }
       // Enable developer mode for extensions loading
       if (!prefs.extensions) prefs.extensions = {};
       prefs.extensions.developer_mode = true;
@@ -1027,7 +1147,23 @@ public class Win32 {
       const compactWindowSize = `${placement.width},${placement.height}`;
       const compactWindowPosition = `${placement.left},${placement.top}`;
       const browserVersion = await this.getBrowserVersion(chromePath);
-      const configuredUserAgent = options.userAgent || options.fingerprint?.userAgent || '';
+      let effectiveFingerprint = { ...(options.fingerprint || {}) };
+      const fingerprintOverridePath = path.join(profilePath, 'fingerprint_override.json');
+      if (fs.existsSync(fingerprintOverridePath)) {
+        try {
+          const stat = fs.statSync(fingerprintOverridePath);
+          if (stat.size > 64 * 1024) throw new Error('override is too large');
+          const override = JSON.parse(fs.readFileSync(fingerprintOverridePath, 'utf8'));
+          if (!override || typeof override !== 'object' || Array.isArray(override)) {
+            throw new Error('override must be an object');
+          }
+          effectiveFingerprint = { ...effectiveFingerprint, ...override };
+          console.log(`[Fingerprint] Applied profile override for ${options.profileId}`);
+        } catch (error: any) {
+          console.warn(`[Fingerprint] Invalid profile override ignored: ${error.message}`);
+        }
+      }
+      const configuredUserAgent = options.userAgent || effectiveFingerprint.userAgent || '';
       const userAgent = this.alignUserAgentToBrowser(configuredUserAgent, browserVersion);
       console.log(`[Browser] Executable version: ${browserVersion || 'unknown'}`);
       const args = [
@@ -1038,12 +1174,31 @@ public class Win32 {
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
         '--disable-background-timer-throttling',
-        `--window-size=${compactWindowSize}`,
-        `--window-position=${compactWindowPosition}`,
-        `--lang=${options.fingerprint?.language || options.fingerprint?.languages?.[0] || 'en-US'}`,
+        `--lang=${effectiveFingerprint.language || effectiveFingerprint.languages?.[0] || 'en-US'}`,
         '--disable-features=CalculateNativeWinOcclusion',
       ];
-
+      if (managedLaunch) {
+        args.push(`--window-size=${compactWindowSize}`);
+        args.push(`--window-position=${compactWindowPosition}`);
+      } else if (manualPlacementCorrection) {
+        args.push(
+          `--window-size=${manualPlacementCorrection.right - manualPlacementCorrection.left},` +
+          `${manualPlacementCorrection.bottom - manualPlacementCorrection.top}`
+        );
+        args.push(
+          `--window-position=${manualPlacementCorrection.left},${manualPlacementCorrection.top}`
+        );
+      }
+      const deviceScaleFactor = Number(effectiveFingerprint.devicePixelRatio);
+      if (
+        Number.isFinite(deviceScaleFactor) &&
+        deviceScaleFactor >= 0.5 &&
+        deviceScaleFactor <= 4
+      ) {
+        // Align Chrome's native hit-testing coordinates with the scale exposed
+        // to page scripts by the fingerprint runtime.
+        args.push(`--force-device-scale-factor=${deviceScaleFactor}`);
+      }
       // Force User-Agent to match fingerprint (consistent across Mac/Windows)
       if (userAgent) {
         args.push(`--user-agent=${userAgent}`);
@@ -1090,17 +1245,29 @@ public class Win32 {
         fs.writeFileSync(path.join(platformFixPath, 'manifest.json'), JSON.stringify({
           manifest_version: 3,
           name: 'Spectra Fingerprint Runtime',
-          version: '2.0',
-          content_scripts: [{
-            matches: ['<all_urls>'],
-            js: ['fingerprint.js'],
-            run_at: 'document_start',
-            all_frames: true,
-            world: 'MAIN',
-          }],
+          version: '2.1',
+          content_scripts: [
+            {
+              matches: ['<all_urls>'],
+              js: ['fingerprint.js'],
+              run_at: 'document_start',
+              all_frames: true,
+              world: 'MAIN',
+            },
+            ...(managedLaunch ? [{
+              matches: [
+                'https://x.com/*',
+                'https://www.x.com/*',
+                'https://twitter.com/*',
+                'https://www.twitter.com/*',
+              ],
+              js: ['x-cookie-consent.js'],
+              run_at: 'document_idle',
+            }] : []),
+          ],
         }));
 
-        const fp = { ...(options.fingerprint || {}), userAgent, platform };
+        const fp = { ...effectiveFingerprint, userAgent, platform };
         fs.writeFileSync(path.join(platformFixPath, 'fingerprint.js'), `
 (() => {
   const fp = ${JSON.stringify(fp)};
@@ -1178,6 +1345,36 @@ public class Win32 {
   }
 })();
 `);
+        fs.writeFileSync(path.join(platformFixPath, 'x-cookie-consent.js'), `
+(() => {
+  const rejectPattern =
+    /refuse|reject|non[- ]?essential|non n[eé]cessaires|rechazar|recusar|rifiuta|ablehnen/i;
+  let observer = null;
+
+  const dismissBlockingConsent = () => {
+    const bottomBar = document.querySelector('[data-testid="BottomBar"]');
+    if (!bottomBar) return false;
+
+    const controls = Array.from(
+      bottomBar.querySelectorAll('button, [role="button"]')
+    );
+    const rejectButton = controls.find((control) =>
+      rejectPattern.test(String(control.innerText || control.textContent || '').trim())
+    );
+    if (!rejectButton) return false;
+
+    rejectButton.click();
+    observer?.disconnect();
+    return true;
+  };
+
+  if (!dismissBlockingConsent()) {
+    observer = new MutationObserver(() => dismissBlockingConsent());
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.setTimeout(() => observer?.disconnect(), 30000);
+  }
+})();
+`);
         console.log(`[Fingerprint] Runtime applied for ${platform}`);
       }
 
@@ -1200,7 +1397,9 @@ public class Win32 {
       fs.writeFileSync(path.join(cookieSyncPath, 'manifest.json'), JSON.stringify({
         manifest_version: 3,
         name: 'Cookie Sync',
-        version: '1.0',
+        // Bump whenever the generated worker changes so Chrome does not keep
+        // executing a stale MV3 service worker from a previous Spectra build.
+        version: '1.1',
         permissions: ['cookies', 'tabs', 'scripting', 'alarms'],
         host_permissions: ['<all_urls>'],
         background: { service_worker: 'background.js' },
@@ -1213,6 +1412,17 @@ public class Win32 {
               'https://www.twitter.com/*',
             ],
             js: ['open-post-actions.js'],
+            run_at: 'document_idle',
+          }],
+        } : sessionImportAttemptId ? {
+          content_scripts: [{
+            matches: [
+              'https://x.com/*',
+              'https://www.x.com/*',
+              'https://twitter.com/*',
+              'https://www.twitter.com/*',
+            ],
+            js: ['session-import-login.js'],
             run_at: 'document_idle',
           }],
         } : {}),
@@ -1523,16 +1733,215 @@ public class Win32 {
         );
       }
 
-      // Write synced cookies as cookies.json for import
+      if (sessionImportAttemptId) {
+        fs.writeFileSync(path.join(cookieSyncPath, 'session-import-login.js'),
+`(() => {
+  if (window.__spectraSessionImportInstalled) return;
+  window.__spectraSessionImportInstalled = true;
+  const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const visible = (element) => element instanceof HTMLElement &&
+    element.getBoundingClientRect().width > 0 && element.getBoundingClientRect().height > 0;
+  const findVisible = (selectors) => {
+    for (const selector of selectors) {
+      const match = Array.from(document.querySelectorAll(selector)).find(visible);
+      if (match) return match;
+    }
+    return null;
+  };
+  const pageText = () => String(document.body?.innerText || '').toLowerCase();
+  const isHome = () => /\\/(home|compose\\/post)(?:[/?#]|$)/.test(location.pathname) ||
+    Boolean(document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]'));
+  const isManualChallenge = () => {
+    const text = pageText();
+    return Boolean(
+      document.querySelector('iframe[src*="captcha"], [data-testid*="captcha"]') ||
+      /captcha|arkose|verify your identity|check your email|email address|phone number|text message|sms|security key|backup code/.test(text)
+    );
+  };
+  async function waitFor(predicate, timeout = 30000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const result = predicate();
+      if (result) return result;
+      await wait(150);
+    }
+    return null;
+  }
+  function setInputValue(input, value) {
+    input.focus();
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function clickButton(labels) {
+    const wanted = labels.map(label => label.toLowerCase());
+    const button = Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(visible)
+      .find(candidate => wanted.includes(String(candidate.textContent || '').trim().toLowerCase()));
+    if (!button) return false;
+    button.click();
+    return true;
+  }
+  function pressEnter(input) {
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+  }
+  function decodeBase32(secret) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = '';
+    for (const character of secret.replace(/=+$/g, '')) {
+      const value = alphabet.indexOf(character);
+      if (value < 0) throw new Error('invalid-totp-secret');
+      bits += value.toString(2).padStart(5, '0');
+    }
+    const bytes = [];
+    for (let index = 0; index + 8 <= bits.length; index += 8) {
+      bytes.push(parseInt(bits.slice(index, index + 8), 2));
+    }
+    return new Uint8Array(bytes);
+  }
+  async function totpCode(secret) {
+    const buffer = new ArrayBuffer(8);
+    new DataView(buffer).setUint32(4, Math.floor(Date.now() / 30000), false);
+    const key = await crypto.subtle.importKey(
+      'raw', decodeBase32(secret), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+    );
+    const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, buffer));
+    const offset = signature[signature.length - 1] & 15;
+    const value = (
+      ((signature[offset] & 127) << 24) |
+      ((signature[offset + 1] & 255) << 16) |
+      ((signature[offset + 2] & 255) << 8) |
+      (signature[offset + 3] & 255)
+    ) % 1000000;
+    return String(value).padStart(6, '0');
+  }
+  async function report(status, message = '') {
+    await chrome.runtime.sendMessage({ type: 'spectra:session-import-status', status, message })
+      .catch(() => {});
+  }
+  async function run(credentials) {
+    if (window.__spectraSessionImportRunning) return;
+    window.__spectraSessionImportRunning = true;
+    try {
+      if (isHome()) {
+        await report('success', 'Session X déjà connectée');
+        return;
+      }
+      await report('entering-username', 'Saisie de l’identifiant X');
+      const username = await waitFor(() => findVisible([
+        'input[autocomplete="username"]', 'input[name="text"]'
+      ]), 45000);
+      if (!username) {
+        await report(isManualChallenge() ? 'manual' : 'failed',
+          isManualChallenge() ? 'Vérification manuelle requise' : 'Champ identifiant introuvable');
+        return;
+      }
+      setInputValue(username, credentials.username);
+      if (!clickButton(['next', 'suivant'])) pressEnter(username);
+
+      await report('entering-password', 'Attente du champ mot de passe');
+      const passwordState = await waitFor(() => {
+        const password = findVisible(['input[name="password"]', 'input[autocomplete="current-password"]']);
+        if (password) return { password };
+        if (isManualChallenge()) return { manual: true };
+        return null;
+      }, 30000);
+      if (!passwordState || passwordState.manual) {
+        await report(passwordState?.manual ? 'manual' : 'failed',
+          passwordState?.manual ? 'Vérification manuelle requise' : 'Champ mot de passe introuvable');
+        return;
+      }
+      setInputValue(passwordState.password, credentials.password);
+      if (!clickButton(['log in', 'sign in', 'se connecter', 'connexion'])) {
+        pressEnter(passwordState.password);
+      }
+
+      await report('waiting', 'Vérification de la connexion');
+      const afterPassword = await waitFor(() => {
+        if (isHome()) return { success: true };
+        const otp = findVisible([
+          'input[data-testid="ocfEnterTextTextInput"]',
+          'input[autocomplete="one-time-code"]',
+          'input[inputmode="numeric"]'
+        ]);
+        if (otp && /authentication code|code generator|authentification|application d.authentification/.test(pageText())) {
+          return { otp };
+        }
+        if (isManualChallenge()) return { manual: true };
+        if (/wrong password|incorrect password|could not log you in|mot de passe incorrect/.test(pageText())) {
+          return { failed: true };
+        }
+        return null;
+      }, 45000);
+      if (afterPassword?.success) {
+        await report('success', 'Connexion X confirmée');
+        return;
+      }
+      if (!afterPassword || afterPassword.manual || afterPassword.failed || !afterPassword.otp) {
+        await report(afterPassword?.manual ? 'manual' : 'failed',
+          afterPassword?.manual ? 'Vérification manuelle requise' : 'Connexion X non confirmée');
+        return;
+      }
+
+      await report('entering-totp', 'Génération et saisie du code 2FA');
+      setInputValue(afterPassword.otp, await totpCode(credentials.totpSecret));
+      if (!clickButton(['next', 'suivant', 'verify', 'vérifier'])) pressEnter(afterPassword.otp);
+      const finalState = await waitFor(() => {
+        if (isHome()) return 'success';
+        if (isManualChallenge()) return 'manual';
+        if (/incorrect|invalid|expired|wrong code|code erroné/.test(pageText())) return 'failed';
+        return null;
+      }, 45000);
+      await report(
+        finalState || 'failed',
+        finalState === 'success'
+          ? 'Connexion X et cookies confirmés'
+          : finalState === 'manual'
+            ? 'Vérification manuelle requise'
+            : 'Code 2FA ou connexion non confirmé'
+      );
+    } catch {
+      await report('failed', 'Échec inattendu de la connexion X');
+    } finally {
+      credentials.password = '';
+      credentials.totpSecret = '';
+      window.__spectraSessionImportRunning = false;
+    }
+  }
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === 'spectra:session-import-credentials' && message.credentials) {
+      run(message.credentials);
+    }
+  });
+})();`
+        );
+      }
+
+      // Prefer the last positively authenticated X snapshot. A current snapshot
+      // without auth may come from a transient logout or another stale PC.
       const syncedCookiesPath = path.join(profilePath, 'synced_cookies.json');
+      const authenticatedCookiesPath = path.join(profilePath, 'authenticated_cookies.json');
       let hasStagedCookies = false;
-      if (fs.existsSync(syncedCookiesPath)) {
+      const syncedIsAuthenticated = fs.existsSync(syncedCookiesPath) &&
+        this.fileHasAuthenticatedXSession(syncedCookiesPath);
+      const protectedIsAuthenticated = fs.existsSync(authenticatedCookiesPath) &&
+        this.fileHasAuthenticatedXSession(authenticatedCookiesPath);
+      const syncedIsNewer = syncedIsAuthenticated && protectedIsAuthenticated &&
+        fs.statSync(syncedCookiesPath).mtimeMs >= fs.statSync(authenticatedCookiesPath).mtimeMs;
+      const cookieImportPath = syncedIsAuthenticated && (!protectedIsAuthenticated || syncedIsNewer)
+        ? syncedCookiesPath
+        : protectedIsAuthenticated
+          ? authenticatedCookiesPath
+          : syncedCookiesPath;
+      if (fs.existsSync(cookieImportPath)) {
         try {
-          const cookies = fs.readFileSync(syncedCookiesPath, 'utf8');
+          const cookies = fs.readFileSync(cookieImportPath, 'utf8');
           const parsedCookies = JSON.parse(cookies);
           hasStagedCookies = Array.isArray(parsedCookies) && parsedCookies.length > 0;
           fs.writeFileSync(path.join(cookieSyncPath, 'cookies.json'), cookies);
-          console.log(`[CookieSync] Loaded cookies for import`);
+          console.log(
+            `[CookieSync] Loaded ${cookieImportPath === authenticatedCookiesPath ? 'protected authenticated' : 'current'} cookies for import`
+          );
         } catch {}
       } else {
         fs.writeFileSync(path.join(cookieSyncPath, 'cookies.json'), '[]');
@@ -1543,6 +1952,10 @@ public class Win32 {
 const PROFILE_NAME = ${JSON.stringify(options.profileName)};
 const LAUNCH_ID = ${JSON.stringify(autoStartLaunchId)};
 const OPEN_POST_MODE = ${JSON.stringify(Boolean(targetTweetUrl))};
+const SESSION_IMPORT_ATTEMPT_ID = ${JSON.stringify(sessionImportAttemptId)};
+const SESSION_IMPORT_MODE = Boolean(SESSION_IMPORT_ATTEMPT_ID);
+const MANAGED_STARTUP_MODE = OPEN_POST_MODE || Boolean(LAUNCH_ID) || SESSION_IMPORT_MODE;
+const ENFORCE_SINGLE_TAB = OPEN_POST_MODE || Boolean(LAUNCH_ID);
 const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
 const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
 let bootstrapPromise = null;
@@ -1554,6 +1967,7 @@ let retainedTabId = null;
 let cookiesImported = false;
 let venusConfirmationReported = false;
 let openPostCompleted = false;
+let sessionImportStarted = false;
 const BOOTSTRAP_ATTEMPTS = 5;
 const RETRY_DELAYS = [1000, 2000, 4000, 8000, 12000];
 const WATCHDOG_DEADLINE = Date.now() + (OPEN_POST_MODE ? 120000 : 60000);
@@ -1580,7 +1994,56 @@ async function reportLaunchStatus(status, details = {}) {
   if (!response.ok) throw new Error('Launch status server returned ' + response.status);
 }
 
+async function reportSessionImportStatus(status, message = '') {
+  const response = await fetch(SERVER + '/api/session-import-status', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + SERVER_TOKEN
+    },
+    body: JSON.stringify({
+      profileId: PROFILE_ID,
+      attemptId: SESSION_IMPORT_ATTEMPT_ID,
+      status,
+      message,
+    }),
+  });
+  if (!response.ok) throw new Error('Session import status server returned ' + response.status);
+}
+
+async function startSessionImport(tabId) {
+  if (!SESSION_IMPORT_MODE || sessionImportStarted) return;
+  sessionImportStarted = true;
+  try {
+    const response = await fetch(
+      SERVER + '/api/session-import-credentials?attemptId=' +
+      encodeURIComponent(SESSION_IMPORT_ATTEMPT_ID) +
+      '&profileId=' + encodeURIComponent(PROFILE_ID),
+      { headers: { 'Authorization': 'Bearer ' + SERVER_TOKEN } }
+    );
+    if (!response.ok) throw new Error('Credentials are unavailable');
+    const credentials = await response.json();
+    for (let attempt = 0; attempt < 120; attempt++) {
+      try {
+        await chrome.tabs.sendMessage(tabId, {
+          type: 'spectra:session-import-credentials',
+          credentials,
+        });
+        credentials.password = '';
+        credentials.totpSecret = '';
+        return;
+      } catch {
+        await wait(500);
+      }
+    }
+    throw new Error('Login page did not accept credentials');
+  } catch {
+    await reportSessionImportStatus('failed', 'Impossible de démarrer la connexion X').catch(() => {});
+  }
+}
+
 async function requestProfileClose(source) {
+  await flushCookiesBeforeClose();
   const response = await fetch(SERVER + '/api/close-profile', {
     method: 'POST',
     headers: {
@@ -1758,16 +2221,18 @@ async function runStartupWatchdog() {
     return;
   }
   try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (
-        !retainedTabId ||
-        !tab.id ||
-        tab.id === retainedTabId ||
-        (!bootstrapComplete && !isStartupJunkTab(tab))
-      ) continue;
-      await chrome.tabs.remove(tab.id).catch(() => {});
-      console.log('[Spectra AutoStart] Extra tab closed: ' + tab.id + ' ' + tabUrl(tab));
+    if (ENFORCE_SINGLE_TAB) {
+      const tabs = await chrome.tabs.query({});
+      for (const tab of tabs) {
+        if (
+          !retainedTabId ||
+          !tab.id ||
+          tab.id === retainedTabId ||
+          (!bootstrapComplete && !isStartupJunkTab(tab))
+        ) continue;
+        await chrome.tabs.remove(tab.id).catch(() => {});
+        console.log('[Spectra AutoStart] Extra tab closed: ' + tab.id + ' ' + tabUrl(tab));
+      }
     }
 
     if (bootstrapComplete) {
@@ -1824,6 +2289,7 @@ async function runStartupWatchdog() {
 
 chrome.tabs.onCreated.addListener((tab) => {
   if (
+    ENFORCE_SINGLE_TAB &&
     Date.now() <= WATCHDOG_DEADLINE &&
     retainedTabId &&
     tab?.id &&
@@ -1836,31 +2302,34 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.runtime.onMessage?.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'spectra:session-import-status' && SESSION_IMPORT_MODE) {
+    reportSessionImportStatus(message.status, message.message)
+      .then(() => sendResponse({ accepted: true }))
+      .catch(() => sendResponse({ accepted: false }));
+    return true;
+  }
   if (message?.type !== 'spectra:open-post-actions-complete' || !sender.tab?.id) return;
   sendResponse({ accepted: true });
   (async () => {
     openPostCompleted = true;
     chrome.alarms.clear('spectra-startup-watchdog').catch(() => {});
-    console.log('[Spectra OpenPost] Actions finished; closing instance through both channels');
-    const closeRequests = [requestProfileClose('message')];
-    if (typeof sender.tab.windowId === 'number') {
-      closeRequests.push(chrome.windows.remove(sender.tab.windowId));
-    }
-    const results = await Promise.allSettled(closeRequests);
-    if (results.every((result) => result.status === 'rejected')) {
-      throw new Error('All close channels failed');
+    console.log('[Spectra OpenPost] Actions finished; saving session before closing instance');
+    try {
+      await requestProfileClose('message');
+    } catch (error) {
+      if (typeof sender.tab.windowId === 'number') {
+        await chrome.windows.remove(sender.tab.windowId);
+      } else {
+        throw error;
+      }
     }
   })().catch((error) => {
     console.warn('[Spectra OpenPost] Could not close completed instance:', error);
   });
 });
 
-chrome.alarms.create('spectra-startup-watchdog', {
-  delayInMinutes: 0.5,
-  periodInMinutes: 0.5,
-});
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'spectra-startup-watchdog') runStartupWatchdog();
+  if (MANAGED_STARTUP_MODE && alarm.name === 'spectra-startup-watchdog') runStartupWatchdog();
 });
 
 // Export all cookies to local server
@@ -1890,7 +2359,19 @@ async function exportCookies() {
   }
 }
 
-function scheduleExport(delay = 750) {
+async function flushCookiesBeforeClose() {
+  if (exportTimer) {
+    clearTimeout(exportTimer);
+    exportTimer = null;
+  }
+  const deadline = Date.now() + 2000;
+  while (exportInProgress && Date.now() < deadline) {
+    await wait(25);
+  }
+  await exportCookies();
+}
+
+function scheduleExport(delay = 150) {
   if (exportTimer) clearTimeout(exportTimer);
   exportTimer = setTimeout(() => {
     exportTimer = null;
@@ -1898,24 +2379,42 @@ function scheduleExport(delay = 750) {
   }, delay);
 }
 
-bootstrap().catch((error) => {
-  console.error('[Spectra AutoStart] Initial bootstrap exhausted:', error);
-});
-runStartupWatchdog();
+if (MANAGED_STARTUP_MODE) {
+  chrome.alarms.create('spectra-startup-watchdog', {
+    delayInMinutes: 0.5,
+    periodInMinutes: 0.5,
+  });
+  bootstrap().then((tabId) => startSessionImport(tabId)).catch((error) => {
+    console.error('[Spectra AutoStart] Initial bootstrap exhausted:', error);
+  });
+  runStartupWatchdog();
+} else {
+  importCookies()
+    .then(() => { cookiesImported = true; })
+    .catch(() => {});
+}
 chrome.runtime.onStartup.addListener(() => {
-  bootstrap().catch((error) => console.error('[Spectra AutoStart] Startup bootstrap exhausted:', error));
+  if (MANAGED_STARTUP_MODE) {
+    bootstrap().catch((error) => console.error('[Spectra AutoStart] Startup bootstrap exhausted:', error));
+  }
 });
 chrome.runtime.onInstalled.addListener(() => {
-  bootstrap().catch((error) => console.error('[Spectra AutoStart] Install bootstrap exhausted:', error));
+  if (MANAGED_STARTUP_MODE) {
+    bootstrap().catch((error) => console.error('[Spectra AutoStart] Install bootstrap exhausted:', error));
+  }
 });
-chrome.cookies.onChanged.addListener(() => scheduleExport());
+chrome.cookies.onChanged.addListener((changeInfo) => {
+  const authenticationCookieChanged =
+    changeInfo?.cookie?.name === 'auth_token' || changeInfo?.cookie?.name === 'ct0';
+  scheduleExport(authenticationCookieChanged ? 0 : 150);
+});
 chrome.runtime.onSuspend.addListener(() => exportCookies());
 
-// Safety snapshot in case Chrome does not emit a cookie change event.
-setInterval(exportCookies, 5000);
+// Frequent safety snapshot so every launch mode has a fresh portable session.
+setInterval(exportCookies, 1000);
 
-// Also export after 5 seconds (initial page load)
-setTimeout(exportCookies, 5000);
+// Capture the initial imported/native state immediately after startup settles.
+setTimeout(exportCookies, 1000);
 `
       );
       console.log(`[CookieSync] Created cookie sync extension`);
@@ -1929,6 +2428,7 @@ setTimeout(exportCookies, 5000);
       // Collect extensions
       const extPaths: string[] = [cookieSyncPath];
       let shouldAutoStartTwitterBot = false;
+      let shadowbanSetupUrl: string | null = null;
       if (platformFixPath) extPaths.push(platformFixPath);
       if (options.extensionPaths && options.extensionPaths.length > 0) {
         const validPaths = options.extensionPaths.flatMap((p, index) => {
@@ -1936,22 +2436,25 @@ setTimeout(exportCookies, 5000);
           const exists = fs.existsSync(manifestPath);
           console.log(`[Extensions] ${p} — manifest exists: ${exists}`);
           if (!exists) return [];
-          if (targetTweetUrl) {
-            try {
-              const extensionManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-              const extensionName = String(extensionManifest.name || '').toLowerCase();
-              if (extensionName.includes('shadowban scanner')) {
-                console.log(
-                  `[Extensions] Shadowban Scanner skipped for Open post: ${extensionManifest.name}`
-                );
-                return [];
-              }
-            } catch (error) {
-              console.warn(`[Extensions] Could not inspect extension for Open post: ${p}`, error);
-            }
+          let extensionName = '';
+          try {
+            const extensionManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            extensionName = String(extensionManifest.name || '').toLowerCase();
+          } catch (error) {
+            console.warn(`[Extensions] Could not inspect extension: ${p}`, error);
+          }
+          if (targetTweetUrl && extensionName.includes('shadowban scanner')) {
+            console.log('[Extensions] Shadowban Scanner skipped for Open post');
+            return [];
           }
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, p, index);
-          this.suppressExtensionInstallTabs(runtimePath);
+          if (extensionName.includes('shadowban scanner')) {
+            const extensionId = this.getChromeExtensionId(runtimePath);
+            if (extensionId) {
+              shadowbanSetupUrl =
+                `chrome-extension://${extensionId}/html/initialSetup.html`;
+            }
+          }
           if (this.configureTwitterAutoReplyAutostart(
             runtimePath,
             options.autoStartTwitterBot === true,
@@ -1971,7 +2474,6 @@ setTimeout(exportCookies, 5000);
         const twitterAutoReplyPath = this.findTwitterAutoReplyExtensionPath();
         if (twitterAutoReplyPath) {
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, twitterAutoReplyPath, extPaths.length);
-          this.suppressExtensionInstallTabs(runtimePath);
           this.configureTwitterAutoReplyAutostart(runtimePath, true, {
             launchId: autoStartLaunchId,
             profileId: options.profileId,
@@ -1984,10 +2486,12 @@ setTimeout(exportCookies, 5000);
       }
       // Determine start URL
       const isValidUrl = (url: string) => url && (url.startsWith('https://') || url.startsWith('http://'));
-      let startUrl = targetTweetUrl ||
-        (isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com');
+      let startUrl = sessionImportAttemptId
+        ? 'https://x.com/i/flow/login'
+        : targetTweetUrl ||
+          (isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com');
       const lastUrlPath = path.join(profilePath, 'last_url.txt');
-      if (!options.autoStartTwitterBot && !targetTweetUrl && fs.existsSync(lastUrlPath)) {
+      if (!options.autoStartTwitterBot && !targetTweetUrl && !sessionImportAttemptId && fs.existsSync(lastUrlPath)) {
         try {
           const savedUrl = fs.readFileSync(lastUrlPath, 'utf8').trim();
           if (isValidUrl(savedUrl)) {
@@ -2017,10 +2521,25 @@ setTimeout(exportCookies, 5000);
 
       // Native Chrome cookies are encrypted for their source Windows account.
       // On another PC, import the portable JSON cookies before navigating to X.
-      const launchUrl = options.autoStartTwitterBot
+      const regularLaunchUrl = options.autoStartTwitterBot
         ? 'about:blank'
         : (targetTweetUrl || (hasStagedCookies ? 'about:blank' : startUrl));
-      args.push(launchUrl);
+      const launchUrl = sessionImportAttemptId ? startUrl : regularLaunchUrl;
+      if (shouldAppendLaunchUrl(launchMode, hasRestorableSession)) {
+        args.push(launchUrl);
+      } else {
+        console.log('[Chrome] Manual launch: restoring the existing Chrome session');
+      }
+      if (
+        shadowbanSetupUrl &&
+        !options.autoStartTwitterBot &&
+        !targetTweetUrl &&
+        !sessionImportAttemptId &&
+        shouldOpenSetupTab(launchMode, hasRestorableSession)
+      ) {
+        args.push(shadowbanSetupUrl);
+        console.log('[Extensions] Opening the standard Shadowban setup tab');
+      }
       const launchConfirmationPromise = autoStartLaunchId
         ? this.waitForLaunchConfirmation(options.profileId, autoStartLaunchId)
         : null;
@@ -2037,9 +2556,9 @@ setTimeout(exportCookies, 5000);
         }
       }
       // Set timezone to match fingerprint/proxy location
-      if (options.fingerprint?.timezone) {
-        cleanEnv['TZ'] = options.fingerprint.timezone;
-        console.log(`[Timezone] Set to ${options.fingerprint.timezone}`);
+      if (effectiveFingerprint.timezone) {
+        cleanEnv['TZ'] = effectiveFingerprint.timezone;
+        console.log(`[Timezone] Set to ${effectiveFingerprint.timezone}`);
       }
 
       // === SPAWN Chrome — no Puppeteer, no CDP, no debug port ===
@@ -2057,7 +2576,16 @@ setTimeout(exportCookies, 5000);
         await this.terminateProfileProcesses(profilePath);
         throw new Error('Launch cancelled');
       }
-      this.enforceWindowPlacement(chromeProcess.pid, placement);
+      if (managedLaunch) {
+        this.enforceWindowPlacement(chromeProcess.pid, placement);
+      } else if (manualPlacementCorrection) {
+        this.enforceWindowPlacement(chromeProcess.pid, {
+          ...manualPlacementCorrection,
+          width: manualPlacementCorrection.right - manualPlacementCorrection.left,
+          height: manualPlacementCorrection.bottom - manualPlacementCorrection.top,
+          workArea: placement.workArea,
+        });
+      }
 
       console.log(`[Chrome] Process spawned (PID: ${chromeProcess.pid}) — CDP-free`);
 
@@ -2066,6 +2594,14 @@ setTimeout(exportCookies, 5000);
         profilePath,
         profileId: options.profileId,
         localProxyServer,
+        launchMode,
+        requiresPortableAuth: options.platform === 'twitter' ||
+          Boolean(targetTweetUrl) ||
+          options.autoStartTwitterBot === true ||
+          sessionImportAttemptId.length > 0 ||
+          /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\//i.test(options.lastUrl || ''),
+        syncEligible: false,
+        closeNotified: false,
       };
 
       let processCleanedUp = false;
@@ -2085,7 +2621,17 @@ setTimeout(exportCookies, 5000);
         this.activeProfiles.delete(options.profileId);
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('profiles:activeUpdate', Array.from(this.activeProfiles.keys()));
-          this.mainWindow.webContents.send('profile:closed', options.profileId);
+          if (profileInstance.syncEligible && !profileInstance.closeNotified) {
+            profileInstance.closeNotified = true;
+            const portableAuthReady = !profileInstance.requiresPortableAuth ||
+              this.ensureAuthenticatedXSnapshot(profileInstance.profilePath);
+            this.mainWindow.webContents.send('profile:closed', options.profileId, {
+              syncEligible: portableAuthReady,
+              launchMode: profileInstance.launchMode,
+              requiresPortableAuth: profileInstance.requiresPortableAuth,
+              reason: portableAuthReady ? 'chrome-exit' : 'missing-authenticated-x-snapshot',
+            });
+          }
         }
       };
 
@@ -2128,6 +2674,7 @@ setTimeout(exportCookies, 5000);
 
       this.pendingProfiles.delete(options.profileId);
       this.activeProfiles.set(options.profileId, profileInstance);
+      profileInstance.syncEligible = true;
       console.log(`Chrome launched successfully for profile: ${options.profileId}`);
       return { success: true };
 
@@ -2317,6 +2864,8 @@ setTimeout(exportCookies, 5000);
     }
 
     try {
+      // Give the cookie-sync extension one interval to persist its final state.
+      await new Promise(resolve => setTimeout(resolve, 1100));
       if (process.platform === 'win32') {
         const escapedPath = instance.profilePath.replace(/'/g, "''");
         await this.runPowerShell(`
@@ -2368,6 +2917,10 @@ setTimeout(exportCookies, 5000);
     console.log(
       `[Spectra OpenPost] Force close ${profileId}; Chrome PIDs before: ${beforeProcessIds.join(',') || 'none'}`
     );
+    if (beforeProcessIds.length > 0) {
+      // OpenPost normally flushes explicitly; this also protects emergency/UI closes.
+      await new Promise(resolve => setTimeout(resolve, 1100));
+    }
     await this.terminateProfileProcesses(profilePath);
     const afterProcessIds = await this.getProfileProcessIds(profilePath);
     console.log(
@@ -2380,7 +2933,17 @@ setTimeout(exportCookies, 5000);
         'profiles:activeUpdate',
         Array.from(this.activeProfiles.keys())
       );
-      this.mainWindow.webContents.send('profile:closed', profileId);
+      if (instance?.syncEligible && !instance.closeNotified) {
+        instance.closeNotified = true;
+        const portableAuthReady = !instance.requiresPortableAuth ||
+          this.ensureAuthenticatedXSnapshot(instance.profilePath);
+        this.mainWindow.webContents.send('profile:closed', profileId, {
+          syncEligible: portableAuthReady,
+          launchMode: instance.launchMode,
+          requiresPortableAuth: instance.requiresPortableAuth,
+          reason: portableAuthReady ? 'forced-close' : 'missing-authenticated-x-snapshot',
+        });
+      }
     }
   }
 

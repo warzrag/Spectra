@@ -94,6 +94,36 @@ export async function getAllUsers(teamId?: string): Promise<UserProfile[]> {
   }
 }
 
+export async function findUserByEmail(email: string): Promise<UserProfile | null> {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail) return null;
+  const q = query(
+    collection(db, USERS_COLLECTION),
+    where('email', '==', normalizedEmail),
+    limit(1)
+  );
+  const snapshot = await getDocs(q);
+  if (snapshot.empty) return null;
+  const result = snapshot.docs[0];
+  return { uid: result.id, ...result.data() } as UserProfile;
+}
+
+export async function getTeamById(teamId: string): Promise<Team | null> {
+  if (!teamId) return null;
+  const teamDoc = await getDoc(doc(db, TEAMS_COLLECTION, teamId));
+  return teamDoc.exists() ? ({ id: teamDoc.id, ...teamDoc.data() } as Team) : null;
+}
+
+export async function getTeamsByOwnerId(ownerId: string): Promise<Team[]> {
+  if (!ownerId) return [];
+  const q = query(collection(db, TEAMS_COLLECTION), where('ownerId', '==', ownerId));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(teamDoc => ({
+    id: teamDoc.id,
+    ...teamDoc.data(),
+  })) as Team[];
+}
+
 export function subscribeToTeams(callback: (teams: Team[]) => void): Unsubscribe {
   const q = query(collection(db, TEAMS_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
@@ -110,24 +140,27 @@ export function subscribeToTeams(callback: (teams: Team[]) => void): Unsubscribe
 // ── Profiles (Cloud Sync) ──────────────────────────────────────
 
 export function subscribeToProfiles(
-  teamId: string | null | undefined,
+  teamId: string | string[] | null | undefined,
   callback: (profiles: Profile[]) => void,
   assignedFolderId?: string | null
 ): Unsubscribe {
-  const q = teamId
+  const teamIds = Array.isArray(teamId) ? teamId.filter(Boolean) : teamId ? [teamId] : [];
+  const q = teamIds.length
     ? assignedFolderId
       ? query(
           collection(db, PROFILES_COLLECTION),
-          where('teamId', '==', teamId),
+          where('teamId', teamIds.length === 1 ? '==' : 'in', teamIds.length === 1 ? teamIds[0] : teamIds.slice(0, 30)),
           where('folderId', '==', assignedFolderId)
         )
-      : query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+      : teamIds.length === 1
+        ? query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamIds[0]), orderBy('createdAt', 'desc'))
+        : query(collection(db, PROFILES_COLLECTION), where('teamId', 'in', teamIds.slice(0, 30)))
     : query(collection(db, PROFILES_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const profiles: Profile[] = snapshot.docs.map(d => ({
       id: d.id,
       ...d.data(),
-    })) as Profile[];
+    })).sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))) as Profile[];
     callback(profiles);
   }, (error) => {
     console.error('Profiles subscription error:', error);
@@ -135,25 +168,28 @@ export function subscribeToProfiles(
 }
 
 export function subscribeToFolders(
-  teamId: string | null | undefined,
+  teamId: string | string[] | null | undefined,
   callback: (folders: Folder[]) => void,
   assignedFolderId?: string | null
 ): Unsubscribe {
-  if (teamId && assignedFolderId) {
+  const teamIds = Array.isArray(teamId) ? teamId.filter(Boolean) : teamId ? [teamId] : [];
+  if (teamIds.length && assignedFolderId) {
     return onSnapshot(doc(db, FOLDERS_COLLECTION, assignedFolderId), (snapshot) => {
       callback(snapshot.exists() ? [{ id: snapshot.id, ...snapshot.data() } as Folder] : []);
     }, (error) => {
       console.error('Folder subscription error:', error);
     });
   }
-  const q = teamId
-    ? query(collection(db, FOLDERS_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+  const q = teamIds.length
+    ? teamIds.length === 1
+      ? query(collection(db, FOLDERS_COLLECTION), where('teamId', '==', teamIds[0]), orderBy('createdAt', 'desc'))
+      : query(collection(db, FOLDERS_COLLECTION), where('teamId', 'in', teamIds.slice(0, 30)))
     : query(collection(db, FOLDERS_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const folders: Folder[] = snapshot.docs.map(d => ({
       id: d.id,
       ...d.data(),
-    })) as Folder[];
+    })).sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))) as Folder[];
     callback(folders);
   }, (error) => {
     console.error('Folders subscription error:', error);
@@ -374,17 +410,18 @@ export interface FirestoreProxy {
   updatedAt?: string;
 }
 
-export function subscribeToProxies(teamId: string, callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, PROXIES_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToProxies(teamId: string | string[] | null | undefined, callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
+  const teamIds = Array.isArray(teamId) ? teamId.filter(Boolean) : teamId ? [teamId] : [];
+  const q = teamIds.length
+    ? teamIds.length === 1
+      ? query(collection(db, PROXIES_COLLECTION), where('teamId', '==', teamIds[0]), orderBy('createdAt', 'desc'))
+      : query(collection(db, PROXIES_COLLECTION), where('teamId', 'in', teamIds.slice(0, 30)))
+    : query(collection(db, PROXIES_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const proxies: FirestoreProxy[] = snapshot.docs.map(d => ({
       id: d.id,
       ...d.data(),
-    })) as FirestoreProxy[];
+    })).sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))) as FirestoreProxy[];
     callback(proxies);
   }, (error) => {
     console.error('Proxies subscription error:', error);

@@ -22,7 +22,7 @@ export class ChromeLauncher {
   private static processes = new Map<string, any>();
   private static activeUrls = new Map<string, string>();
   private static activeProfiles = new Set<string>();
-  private static readonly compactWindow = { width: 480, height: 500, margin: 0, gap: 0 };
+  private static readonly compactWindow = { width: 900, height: 720, margin: 0, gap: 0 };
 
   static isProfileActive(profileId: string): boolean {
     return this.activeProfiles.has(profileId);

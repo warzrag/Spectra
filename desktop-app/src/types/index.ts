@@ -91,6 +91,7 @@ export interface Profile {
   cloudSyncSize?: number;
   cloudSyncVersion?: number;
   cloudSyncRevision?: string;
+  cloudSyncProtocolVersion?: number;
   cloudSyncChecksum?: string;
   cloudSyncChecksumRevision?: string;
   cloudSyncedBy?: string;
@@ -139,6 +140,7 @@ export interface AppSettings {
   defaultBrowser: 'chrome' | 'firefox' | 'edge';
   sortBy: 'name' | 'created' | 'lastUsed' | 'custom';
   sortOrder: 'asc' | 'desc';
+  activeWorkspaceEmail?: string;
 }
 
 export interface StoreData {

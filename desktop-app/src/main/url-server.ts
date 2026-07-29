@@ -6,6 +6,26 @@ export class UrlTrackingServer {
   private server: http.Server | null = null;
   private port = 0;
   private readonly token = crypto.randomBytes(32).toString('hex');
+  private readonly sessionImportCredentials = new Map<
+    string,
+    { profileId: string; username: string; password: string; totpSecret: string; expiresAt: number }
+  >();
+
+  stageSessionImport(
+    attemptId: string,
+    profileId: string,
+    credentials: { username: string; password: string; totpSecret: string }
+  ): void {
+    this.sessionImportCredentials.set(attemptId, {
+      profileId,
+      ...credentials,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+  }
+
+  clearSessionImport(attemptId: string): void {
+    this.sessionImportCredentials.delete(attemptId);
+  }
 
   start(): Promise<{ port: number; token: string }> {
     if (this.server) return Promise.resolve({ port: this.port, token: this.token });
@@ -41,12 +61,39 @@ export class UrlTrackingServer {
         }
 
         if (
+          req.method === 'GET' &&
+          requestUrl.pathname === '/api/session-import-credentials'
+        ) {
+          const attemptId = requestUrl.searchParams.get('attemptId') || '';
+          const profileId = requestUrl.searchParams.get('profileId') || '';
+          const staged = this.sessionImportCredentials.get(attemptId);
+          if (!staged || staged.profileId !== profileId || staged.expiresAt < Date.now()) {
+            this.sessionImportCredentials.delete(attemptId);
+            res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ error: 'Session import attempt not found' }));
+            return;
+          }
+          this.sessionImportCredentials.delete(attemptId);
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+          });
+          res.end(JSON.stringify({
+            username: staged.username,
+            password: staged.password,
+            totpSecret: staged.totpSecret,
+          }));
+          return;
+        }
+
+        if (
           req.method === 'POST' &&
           (
             req.url === '/api/save-url' ||
             req.url === '/api/save-cookies' ||
             req.url === '/api/launch-status' ||
-            req.url === '/api/close-profile'
+            req.url === '/api/close-profile' ||
+            req.url === '/api/session-import-status'
           )
         ) {
           let body = '';
@@ -114,6 +161,27 @@ export class UrlTrackingServer {
                   res.writeHead(400);
                   res.end(JSON.stringify({ error: 'Invalid profile ID' }));
                 }
+              } else if (req.url === '/api/session-import-status') {
+                const { profileId, attemptId, status, message } = data;
+                if (
+                  typeof profileId === 'string' &&
+                  /^[A-Za-z0-9_-]{1,160}$/.test(profileId) &&
+                  typeof attemptId === 'string' &&
+                  /^[A-Fa-f0-9-]{16,64}$/.test(attemptId) &&
+                  typeof status === 'string'
+                ) {
+                  ipcMain.emit('internal:session-import-status', null, {
+                    profileId,
+                    attemptId,
+                    status: status.slice(0, 64),
+                    message: typeof message === 'string' ? message.slice(0, 240) : '',
+                  });
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end(JSON.stringify({ error: 'Invalid session import status' }));
+                }
               }
             } catch {
               res.writeHead(400);
@@ -142,6 +210,7 @@ export class UrlTrackingServer {
   }
 
   stop() {
+    this.sessionImportCredentials.clear();
     if (this.server) {
       this.server.close();
       this.server = null;

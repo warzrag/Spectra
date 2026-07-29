@@ -3,6 +3,13 @@ import { doc, getDoc, collection, runTransaction } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import { AppUser, UserRole } from '../../types';
 
+class UserConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserConfigurationError';
+  }
+}
+
 async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string; assignedFolderId: string | null }> {
   const userRef = doc(db, 'users', user.uid);
   const userDoc = await getDoc(userRef);
@@ -13,13 +20,27 @@ async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string
     const teamId = data.teamId;
 
     if (!teamId) {
-      throw new Error('Ce compte doit être rattaché à une équipe par un administrateur');
+      throw new UserConfigurationError('Ce compte doit être rattaché à une équipe par un administrateur');
     }
 
     return { role, teamId, assignedFolderId: data.assignedFolderId || null };
   }
 
-  throw new Error('Compte non configuré. Utilisez un code d’invitation valide.');
+  throw new UserConfigurationError('Compte non configuré. Utilisez un code d’invitation valide.');
+}
+
+function toAppUser(
+  user: User,
+  resolved: { role: UserRole; teamId: string; assignedFolderId: string | null }
+): AppUser {
+  return {
+    uid: user.uid,
+    email: user.email || '',
+    displayName: user.displayName,
+    role: resolved.role,
+    teamId: resolved.teamId,
+    assignedFolderId: resolved.assignedFolderId,
+  };
 }
 
 export async function loginWithEmail(email: string, password: string): Promise<AppUser> {
@@ -126,25 +147,61 @@ export async function logout(): Promise<void> {
 }
 
 export function onAuthStateChanged(callback: (user: AppUser | null) => void): () => void {
-  return firebaseOnAuthStateChanged(auth, async (firebaseUser) => {
-    if (firebaseUser) {
-      try {
-        const { role, teamId, assignedFolderId } = await resolveUser(firebaseUser);
-        callback({
-          uid: firebaseUser.uid,
-          email: firebaseUser.email || '',
-          displayName: firebaseUser.displayName,
-          role,
-          teamId,
-          assignedFolderId,
-        });
-      } catch (error) {
-        console.error('Unable to resolve authenticated user:', error);
-        await signOut(auth).catch(() => {});
-        callback(null);
-      }
-    } else {
-      callback(null);
-    }
+  let cancelled = false;
+  let generation = 0;
+  let lastResolvedUser: AppUser | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const waitForRetry = (delay: number) => new Promise<void>(resolve => {
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      resolve();
+    }, delay);
   });
+
+  const unsubscribe = firebaseOnAuthStateChanged(auth, (firebaseUser) => {
+    const currentGeneration = ++generation;
+    if (!firebaseUser) {
+      lastResolvedUser = null;
+      callback(null);
+      return;
+    }
+
+    void (async () => {
+      let attempt = 0;
+      while (!cancelled && currentGeneration === generation && auth.currentUser?.uid === firebaseUser.uid) {
+        try {
+          const resolved = await resolveUser(firebaseUser);
+          if (cancelled || currentGeneration !== generation) return;
+          lastResolvedUser = toAppUser(firebaseUser, resolved);
+          callback(lastResolvedUser);
+          return;
+        } catch (error) {
+          if (error instanceof UserConfigurationError) {
+            console.error('Authenticated account is not configured:', error);
+            await signOut(auth).catch(() => {});
+            if (!cancelled && currentGeneration === generation) callback(null);
+            return;
+          }
+
+          // A temporary network or Firestore failure must not destroy a valid
+          // Firebase session. Keep the previous user and retry in the background.
+          console.warn('Temporary user resolution failure; session retained:', error);
+          if (lastResolvedUser?.uid === firebaseUser.uid && attempt === 0) {
+            callback(lastResolvedUser);
+          }
+          const delays = [1000, 3000, 5000, 10000, 30000];
+          await waitForRetry(delays[Math.min(attempt, delays.length - 1)]);
+          attempt++;
+        }
+      }
+    })();
+  });
+
+  return () => {
+    cancelled = true;
+    generation++;
+    if (retryTimer) clearTimeout(retryTimer);
+    unsubscribe();
+  };
 }

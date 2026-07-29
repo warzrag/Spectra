@@ -34,6 +34,7 @@ const getCookieSyncBackgroundSource = ({ profileId, profileName, launchId }) => 
     .replaceAll('${JSON.stringify(options.profileName)}', JSON.stringify(profileName))
     .replaceAll('${JSON.stringify(autoStartLaunchId)}', JSON.stringify(launchId))
     .replaceAll('${JSON.stringify(Boolean(targetTweetUrl))}', 'false')
+    .replaceAll('${JSON.stringify(sessionImportAttemptId)}', JSON.stringify(''))
     .replaceAll('${this.localServerConfig?.port || 0}', '45678')
     .replaceAll("${JSON.stringify(this.localServerConfig?.token || '')}", JSON.stringify('test-token'))
     .replaceAll('\\\\', '\\');
@@ -56,6 +57,107 @@ test('X post links are normalized and non-post URLs are rejected', () => {
   assert.equal(normalizeTweetUrl('http://x.com/user/status/42'), null);
   assert.equal(normalizeTweetUrl('https://example.com/user/status/42'), null);
   assert.equal(normalizeTweetUrl('javascript:alert(1)'), null);
+});
+
+test('manual and managed browser launches use isolated startup policies', () => {
+  const {
+    resolveLaunchMode,
+    isManagedLaunch,
+    shouldAppendLaunchUrl,
+    shouldOpenSetupTab,
+  } = loadTypeScriptModule('desktop-app/src/shared/launch-policy.ts');
+
+  assert.equal(resolveLaunchMode({}), 'manual');
+  assert.equal(resolveLaunchMode({ targetTweetUrl: 'https://x.com/user/status/1' }), 'open-post');
+  assert.equal(resolveLaunchMode({ autoStartTwitterBot: true }), 'automation');
+  assert.equal(resolveLaunchMode({ sessionImportAttemptId: 'attempt' }), 'session-import');
+
+  assert.equal(isManagedLaunch('manual'), false);
+  assert.equal(isManagedLaunch('open-post'), true);
+  assert.equal(shouldAppendLaunchUrl('manual', true), false);
+  assert.equal(shouldAppendLaunchUrl('manual', false), true);
+  assert.equal(shouldAppendLaunchUrl('open-post', true), true);
+  assert.equal(shouldOpenSetupTab('manual', false), true);
+  assert.equal(shouldOpenSetupTab('manual', true), false);
+  assert.equal(shouldOpenSetupTab('open-post', false), false);
+});
+
+test('manual windows are fitted to smaller displays without changing valid layouts', () => {
+  const { fitWindowToWorkArea } = loadTypeScriptModule(
+    'desktop-app/src/shared/launch-policy.ts'
+  );
+  const smallDisplay = { x: 0, y: 0, width: 800, height: 600 };
+
+  assert.equal(
+    fitWindowToWorkArea(
+      { left: 20, top: 20, right: 720, bottom: 520 },
+      smallDisplay
+    ),
+    null
+  );
+  assert.deepEqual(
+    fitWindowToWorkArea(
+      { left: 1200, top: 50, right: 2100, bottom: 770 },
+      smallDisplay
+    ),
+    { left: 8, top: 8, right: 792, bottom: 592 }
+  );
+  assert.deepEqual(
+    fitWindowToWorkArea(
+      { left: -400, top: -300, right: 100, bottom: 200 },
+      smallDisplay
+    ),
+    { left: 8, top: 8, right: 508, bottom: 508 }
+  );
+});
+
+test('failed browser startups cannot trigger a profile upload', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  assert.match(launcher, /syncEligible:\s*false/);
+  assert.match(launcher, /this\.activeProfiles\.set\(options\.profileId, profileInstance\);\s*profileInstance\.syncEligible = true/);
+  assert.match(launcher, /if \(profileInstance\.syncEligible && !profileInstance\.closeNotified\)/);
+  assert.match(launcher, /if \(instance\?\.syncEligible && !instance\.closeNotified\)/);
+  assert.match(
+    preload,
+    /details\?: \{[\s\S]*syncEligible\?: boolean;[\s\S]*requiresPortableAuth\?: boolean;[\s\S]*reason\?: string;/
+  );
+  assert.match(app, /if \(details\?\.syncEligible === false\)/);
+});
+
+test('manual launches preserve the user window while managed launches keep equal sizing', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  assert.match(
+    launcher,
+    /if \(managedLaunch\) \{\s*args\.push\(`--window-size=\$\{compactWindowSize\}`\);\s*args\.push\(`--window-position=\$\{compactWindowPosition\}`\);/
+  );
+  assert.match(
+    launcher,
+    /if \(managedLaunch\) \{\s*this\.enforceWindowPlacement\(chromeProcess\.pid, placement\);\s*\}/
+  );
+  assert.match(
+    launcher,
+    /\.\.\.\(managedLaunch \? \[\{[\s\S]*js: \['x-cookie-consent\.js'\][\s\S]*\}\] : \[\]\)/
+  );
+});
+
+test('stale cross-device profile uploads are rejected before the compatibility mirror changes', () => {
+  const sync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
+  const conflictCheck = sync.indexOf('cloudVersion !== baseVersion || revisionConflict');
+  const transactionUpdate = sync.indexOf('transaction.update(profileRef');
+  const compatibilityMirror = sync.indexOf('Compatibility mirror for older Spectra clients');
+
+  assert.notEqual(conflictCheck, -1);
+  assert.notEqual(transactionUpdate, -1);
+  assert.notEqual(compatibilityMirror, -1);
+  assert.ok(conflictCheck < transactionUpdate);
+  assert.ok(transactionUpdate < compatibilityMirror);
+  assert.match(sync, /cloudProfile\.lockedBy !== currentUser\.uid/);
+  assert.match(sync, /cloudProfile\.lockedByInstallationId !== currentUser\.installationId/);
+  assert.match(sync, /conflictError\.code = 'profile-sync\/conflict'/);
 });
 
 test('folder post launch is isolated from Open Selected and retains one target tab', () => {
@@ -100,7 +202,7 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(launcher, /let openPostCompleted = false/);
   assert.match(launcher, /Completion marker detected/);
   assert.match(launcher, /if \(!openPostCompleted && !bootstrapComplete && !bootstrapPromise\)/);
-  assert.match(launcher, /Actions finished; closing instance through both channels/);
+  assert.match(launcher, /Actions finished; saving session before closing instance/);
   assert.match(launcher, /chrome\.windows\.remove\(sender\.tab\.windowId\)/);
   assert.match(launcher, /sendResponse\(\{ accepted: true \}\)/);
   assert.match(launcher, /for \(let attempt = 0; attempt < 5; attempt\+\+\)/);
@@ -141,13 +243,86 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(app, /batchStart \+= launchBatchSize/);
   assert.match(app, /await Promise\.all\(/);
   assert.match(app, /windowLayout:\s*\{\s*index:\s*batchIndex,\s*total:\s*batch\.length\s*\}/);
-  assert.match(launcher, /compactWindow = \{ width: 480, height: 500/);
+  assert.match(launcher, /compactWindow = \{ width: 900, height: 720/);
+  assert.match(launcher, /--force-device-scale-factor=\$\{deviceScaleFactor\}/);
+  assert.match(launcher, /x-cookie-consent\.js/);
+  assert.match(launcher, /data-testid="BottomBar"/);
+  assert.match(launcher, /rejectPattern/);
   assert.match(launcher, /for \(\$attempt = 0; \$attempt -lt 3; \$attempt\+\+\)/);
   assert.match(dashboard, /selectedFolderProfileIds = selectedProfiles\.filter/);
   assert.match(dashboard, /Open post \(\{selectedFolderProfileIds\.length\}\)/);
   assert.match(dashboard, /onOpenTweetInFolder\(selectedFolderProfileIds, normalizedTweetUrl\)/);
   assert.match(dashboard, /Arrêter tout/);
   assert.match(dashboard, /onClick=\{onStopOpenPost\}/);
+});
+
+test('manual profile launches do not inherit managed OpenPost tab behavior', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  assert.match(
+    launcher,
+    /const MANAGED_STARTUP_MODE = OPEN_POST_MODE \|\| Boolean\(LAUNCH_ID\) \|\| SESSION_IMPORT_MODE/
+  );
+  assert.match(
+    launcher,
+    /const ENFORCE_SINGLE_TAB = OPEN_POST_MODE \|\| Boolean\(LAUNCH_ID\)/
+  );
+  assert.match(
+    launcher,
+    /if \(MANAGED_STARTUP_MODE\) \{[\s\S]*bootstrap\(\)\.then\(\(tabId\) => startSessionImport\(tabId\)\)/
+  );
+  assert.match(
+    launcher,
+    /chrome\.tabs\.onCreated\.addListener\(\(tab\) => \{\s*if \(\s*ENFORCE_SINGLE_TAB/
+  );
+  assert.match(
+    launcher,
+    /async function runStartupWatchdog\(\) \{[\s\S]*if \(ENFORCE_SINGLE_TAB\) \{[\s\S]*chrome\.tabs\.remove/
+  );
+  assert.match(
+    launcher,
+    /\} else \{\s*importCookies\(\)\s*\.then\(\(\) => \{ cookiesImported = true; \}\)/
+  );
+});
+
+test('authenticated X sessions survive fast closes and cross-device sync', () => {
+  const main = read('desktop-app/src/main/main.ts');
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const sync = read('desktop-app/src/main/profile-sync.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const { hasAuthenticatedXSession } = loadTypeScriptModule(
+    'desktop-app/src/shared/x-auth-snapshot.ts'
+  );
+
+  const future = 2_000_000_000;
+  assert.equal(hasAuthenticatedXSession([
+    { name: 'auth_token', value: 'auth', domain: '.x.com', expirationDate: future },
+    { name: 'ct0', value: 'csrf', domain: '.x.com', expirationDate: future },
+  ], 1_900_000_000), true);
+  assert.equal(hasAuthenticatedXSession([
+    { name: 'auth_token', value: 'auth', domain: '.x.com', expirationDate: 1_800_000_000 },
+    { name: 'ct0', value: 'csrf', domain: '.x.com', expirationDate: future },
+  ], 1_900_000_000), false);
+
+  assert.match(main, /hasAuthenticatedXSession\(cookies\)/);
+  assert.match(main, /authenticated_cookies\.json/);
+  assert.match(main, /protected X snapshot retained/);
+  assert.match(sync, /'authenticated_cookies\.json'/);
+  assert.match(launcher, /ensureAuthenticatedXSnapshot/);
+  assert.match(launcher, /missing-authenticated-x-snapshot/);
+  assert.match(launcher, /authenticationCookieChanged \? 0 : 150/);
+  assert.match(preload, /profile:hasAuthenticatedXSnapshot/);
+  assert.match(app, /not synchronized: authenticated X snapshot is missing/);
+  assert.match(app, /not synchronized: X login snapshot was not captured/);
+  assert.match(launcher, /const syncedIsAuthenticated =/);
+  assert.match(launcher, /const protectedIsAuthenticated =/);
+  assert.match(launcher, /const syncedIsNewer =/);
+  assert.match(launcher, /protectedIsAuthenticated[\s\S]*authenticatedCookiesPath/);
+  assert.match(launcher, /async function flushCookiesBeforeClose\(\)/);
+  assert.match(launcher, /async function requestProfileClose\(source\) \{\s*await flushCookiesBeforeClose\(\)/);
+  assert.match(launcher, /setInterval\(exportCookies, 1000\)/);
+  assert.match(launcher, /await new Promise\(resolve => setTimeout\(resolve, 1100\)\)/);
 });
 
 test('cloud profile downloads use authenticated Electron transport instead of renderer XHR', () => {
@@ -180,6 +355,47 @@ test('account credentials are not persisted in renderer storage', () => {
   assert.doesNotMatch(sidebar, /password:\s*newPassword/);
 });
 
+test('session import accepts TXT, JSONL and JSON without exposing secrets', () => {
+  const { parseSessionImportFile } = loadTypeScriptModule(
+    'desktop-app/src/shared/session-import.ts'
+  );
+  assert.deepEqual(
+    parseSessionImportFile('alice|password-1|JBSWY3DPEHPK3PXP'),
+    [{ username: 'alice', password: 'password-1', totpSecret: 'JBSWY3DPEHPK3PXP' }]
+  );
+  assert.equal(
+    parseSessionImportFile(
+      '{"username":"alice","password":"one","totp_secret":"JBSWY3DPEHPK3PXP"}\n' +
+      '{"username":"bob","password":"two","totp_secret":"JBSWY3DPEHPK3PXQ"}'
+    ).length,
+    2
+  );
+  assert.equal(
+    parseSessionImportFile(JSON.stringify([
+      { username: '@alice', password: 'one', totp_secret: 'JBSW Y3DP EHPK 3PXP' },
+    ]))[0].username,
+    'alice'
+  );
+  assert.throws(
+    () => parseSessionImportFile('alice|one|JBSWY3DPEHPK3PXP\nalice|two|JBSWY3DPEHPK3PXQ'),
+    /dupliqu/
+  );
+
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const server = read('desktop-app/src/main/url-server.ts');
+  assert.match(app, /3 - \(usageByProxy\.get\(key\) \|\| 0\)/);
+  assert.match(app, /window\.electronAPI\.proxy\.test\(proxy\)/);
+  assert.match(app, /account\.password = ''/);
+  assert.doesNotMatch(app, /localStorage\.setItem\([^)]*session/i);
+  assert.match(server, /sessionImportCredentials\.delete\(attemptId\)/);
+  assert.match(server, /Cache-Control.*no-store/);
+  assert.match(launcher, /code 2FA/);
+  assert.match(launcher, /crypto\.subtle\.sign\('HMAC'/);
+  assert.match(launcher, /credentials\.password = ''/);
+  assert.doesNotMatch(launcher, /JSON\.stringify\(options\.sessionImport\?\.password/);
+});
+
 test('Firestore and Storage access is scoped by role, team, and profile', () => {
   const firestoreRules = read('admin-panel/firestore.rules');
   const storageRules = read('admin-panel/storage.rules');
@@ -188,6 +404,25 @@ test('Firestore and Storage access is scoped by role, team, and profile', () => 
   assert.doesNotMatch(firestoreRules, /allow read,\s*write:\s*if request\.auth != null/);
   assert.match(storageRules, /function canUseProfile/);
   assert.doesNotMatch(storageRules, /allow read:\s*if request\.auth != null/);
+});
+
+test('super admins work inside one explicitly selected agency workspace', () => {
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const sidebar = read('desktop-app/src/renderer/components/Sidebar.tsx');
+
+  assert.match(app, /const scopeTeamId = activeWorkspaceTeamIds\.length/);
+  assert.match(app, /subscribeToProxies\(scopeTeamId, setProxies\)/);
+  assert.match(app, /spectra-active-workspace:/);
+  assert.match(app, /findUserByEmail\(email\)/);
+  assert.match(app, /getTeamsByOwnerId\(ownerId\)/);
+  assert.match(app, /spectra-active-workspace-teams:/);
+  assert.doesNotMatch(app, /const scopeTeamId = user\.role === 'super_admin' \? null/);
+  assert.match(sidebar, /Active workspace/);
+  assert.match(sidebar, /Owner or member email/);
+  assert.match(sidebar, /onOpenWorkspace/);
+  const dashboard = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+  assert.match(dashboard, /workspaceTitle/);
+  assert.doesNotMatch(dashboard, /isSuperAdmin \? \(/);
 });
 
 test('Chrome launch waits for a visible window and repairs stale singleton files', () => {
@@ -333,10 +568,11 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(openStartUrl, /throw error/);
   assert.match(openStartUrl, /startup-tabs-ready written/);
   assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true \|\| Boolean\(targetTweetUrl\)/);
-  assert.match(launcher, /suppressExtensionInstallTabs\(runtimePath\)/);
-  assert.match(launcher, /workerSource\.includes\('html\/initialSetup\.html'\)/);
-  assert.match(launcher, /Shadowban initial setup suppressed/);
-  assert.match(launcher, /manifest\.version = \[\.\.\.versionParts, '65000'\]\.join\('\.'\)/);
+  assert.match(launcher, /getChromeExtensionId\(runtimePath\)/);
+  assert.match(launcher, /shadowbanSetupUrl\s*=/);
+  assert.match(launcher, /html\/initialSetup\.html/);
+  assert.match(launcher, /Opening the standard Shadowban setup tab/);
+  assert.doesNotMatch(launcher, /Shadowban initial setup suppressed/);
   assert.doesNotMatch(launcher, /const spectraTabsCreate = chrome\.tabs\.create/);
   assert.match(launcher, /autonomousPhaseStartTime\|manualPause\|spectraPendingLaunchId/);
   assert.match(launcher, /e\.spectraPendingLaunchId===/);
@@ -527,7 +763,7 @@ test('managed Chrome and the advertised user-agent stay version-aligned', () => 
   assert.match(launcher, /Correcting Chrome User-Agent mismatch/);
   assert.match(launcher, /normalizedPath\.startsWith\(`\$\{managedBrowserRoot\}\$\{path\.sep\}`\)/);
   assert.match(launcher, /browserVersions\.get\(normalizedPath\)/);
-  assert.match(launcher, /const fp = \{ \.\.\.\(options\.fingerprint \|\| \{\}\), userAgent, platform \}/);
+  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform \}/);
 });
 
 test('team deletion is targeted and refuses teams that still own resources', () => {
@@ -537,6 +773,17 @@ test('team deletion is targeted and refuses teams that still own resources', () 
   assert.match(admin, /Suppression refusée : team utilisée/);
   assert.match(admin, /deleteDoc\(doc\(db, 'teams', teamId\)\)/);
   assert.doesNotMatch(admin, /const ownerTeams = teams\.filter/);
+});
+
+test('profile-specific fingerprint repairs persist without changing other profiles', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const sync = read('desktop-app/src/main/profile-sync.ts');
+
+  assert.match(launcher, /const fingerprintOverridePath = path\.join\(profilePath, 'fingerprint_override\.json'\)/);
+  assert.match(launcher, /effectiveFingerprint = \{ \.\.\.effectiveFingerprint, \.\.\.override \}/);
+  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform \}/);
+  assert.match(launcher, /'fingerprint_override\.json'/);
+  assert.match(sync, /'fingerprint_override\.json'/);
 });
 
 test('cloud profile restore validates in staging and rolls back failed swaps', () => {
@@ -555,8 +802,9 @@ test('cookie and lock synchronization survive fast closes and app restarts', () 
   const app = read('desktop-app/src/renderer/App.tsx');
   const sync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
   assert.match(launcher, /chrome\.cookies\.onChanged\.addListener/);
-  assert.match(launcher, /setInterval\(exportCookies, 5000\)/);
-  assert.match(main, /fs\.renameSync\(tempPath, syncedPath\)/);
+  assert.match(launcher, /setInterval\(exportCookies, 1000\)/);
+  assert.match(main, /function atomicWriteJson/);
+  assert.match(main, /atomicWriteJson\(syncedPath, cookies\)/);
   assert.match(launcher, /static async getRunningProfiles/);
   assert.match(app, /profiles\.getRunning\(locallyLockedIds\)/);
   assert.match(sync, /lockedAt: serverTimestamp\(\)/);
@@ -572,4 +820,42 @@ test('Spectra blocks shutdown and updates while profiles are active or syncing',
   assert.match(main, /ipcMain\.handle\('profileSync:setBusy'/);
   assert.match(app, /profileSync\?\.setBusy\(true\)/);
   assert.match(app, /profileSync\?\.setBusy\(false\)/);
+});
+
+test('temporary Firestore failures retain the authenticated Spectra session', () => {
+  const authService = read('desktop-app/src/renderer/services/auth-service.ts');
+
+  assert.match(authService, /class UserConfigurationError extends Error/);
+  assert.match(authService, /error instanceof UserConfigurationError/);
+  assert.match(authService, /Temporary user resolution failure; session retained/);
+  assert.match(authService, /const delays = \[1000, 3000, 5000, 10000, 30000\]/);
+  assert.doesNotMatch(
+    authService,
+    /Unable to resolve authenticated user:[\s\S]{0,160}signOut\(auth\)/
+  );
+});
+
+test('authenticated legacy profiles are migrated without automatic cloud overwrite', () => {
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const sync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
+
+  assert.match(app, /Protected authentication migration:/);
+  assert.match(app, /Promise\.allSettled\([\s\S]*hasAuthenticatedXSnapshot/);
+  assert.match(sync, /cloudSyncProtocolVersion:\s*2/);
+});
+
+test('development mode hot-reloads React and safely restarts Electron main changes', () => {
+  const packageJson = read('desktop-app/package.json');
+  const main = read('desktop-app/src/main/main.ts');
+
+  assert.match(packageJson, /"dev:main": "tsc -p tsconfig\.json --watch --preserveWatchOutput"/);
+  assert.match(packageJson, /npm run dev:react/);
+  assert.match(packageJson, /npm run dev:main/);
+  assert.match(packageJson, /npm run dev:electron:wait/);
+  assert.match(packageJson, /concurrently --kill-others-on-fail/);
+  assert.doesNotMatch(packageJson, /concurrently --kill-others "/);
+  assert.match(main, /function startDevAutoRestart\(\)/);
+  assert.match(main, /fs\.watch\(directory, \{ recursive: true \}/);
+  assert.match(main, /if \(hasUnsafeShutdownState\(\)\) \{\s*devRestartPending = true/);
+  assert.match(main, /app\.relaunch\(\);\s*app\.exit\(0\)/);
 });

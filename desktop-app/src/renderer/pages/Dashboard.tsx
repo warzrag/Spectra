@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket, GripVertical, Square } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Plus, Trash2, MoveRight, Search, Play, MoreVertical, Globe, Shield, Smartphone, Wifi, Circle, Copy, ExternalLink, Settings, ArrowUpDown, Tag, Monitor, UserPlus, Upload, Download, ArrowLeft, Users, FolderOpen, Edit, FileText, ChevronRight, ChevronDown, Lock, Loader2, Rocket, GripVertical, Square, KeyRound } from 'lucide-react';
 import MoveFolderModal from '../components/MoveFolderModal';
 import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
@@ -8,11 +8,13 @@ import { logActivity } from '../services/firestore-service';
 import { Profile, Folder, Team, AppSettings, Platform, ProfileStatus } from '../../types';
 import { isLockedByOther } from '../services/profile-sync-service';
 import { normalizeTweetUrl } from '../../shared/twitter-url';
+import { SessionImportProgress } from '../../shared/session-import';
 
 interface DashboardProps {
   profiles: Profile[];
   folders: Folder[];
   teams?: Team[];
+  workspaceLabel?: string;
   loading: boolean;
   selectedFolderId: string | null;
   onSelectFolder: (folderId: string | null) => void;
@@ -26,6 +28,9 @@ interface DashboardProps {
   bulkLaunching: { total: number; current: number; name: string } | null;
   isOpenPostRunning: boolean;
   onStopOpenPost: () => void;
+  sessionImportProgress: SessionImportProgress | null;
+  onImportSessions: (content: string, fileName: string) => void;
+  onStopSessionImport: () => void;
   onMoveProfile: (profileId: string, folderId: string | null) => void;
   onShowCreateModal: () => void;
   onEditProfile: (profile: Profile) => void;
@@ -37,6 +42,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   profiles,
   folders,
   teams = [],
+  workspaceLabel,
   loading,
   selectedFolderId,
   onSelectFolder,
@@ -50,6 +56,9 @@ const Dashboard: React.FC<DashboardProps> = ({
   bulkLaunching,
   isOpenPostRunning,
   onStopOpenPost,
+  sessionImportProgress,
+  onImportSessions,
+  onStopSessionImport,
   onMoveProfile,
   onShowCreateModal,
   onEditProfile,
@@ -59,6 +68,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   const { user, isAdmin, isVA } = useAuth();
   const { showToast } = useToast();
   const [searchTerm, setSearchTerm] = useState('');
+  const sessionImportInputRef = useRef<HTMLInputElement>(null);
   const [selectedProfiles, setSelectedProfiles] = useState<string[]>([]);
   const [showMoveModal, setShowMoveModal] = useState(false);
   const [moveProfileIds, setMoveProfileIds] = useState<string[]>([]);
@@ -416,27 +426,9 @@ const Dashboard: React.FC<DashboardProps> = ({
     const filteredUnassigned = gridSearchTerm
       ? unassignedProfiles.filter(p => p.name.toLowerCase().includes(gridSearchTerm))
       : unassignedProfiles;
-    const isSuperAdmin = user?.role === 'super_admin';
-    const teamNameById = new Map(teams.map(team => [team.id, team.name]));
-    const teamIds = Array.from(new Set([
-      ...filteredFolders.map(folder => folder.teamId || 'unknown'),
-      ...filteredUnassigned.map(profile => profile.teamId || 'unknown'),
-    ]));
-    const teamSections = teamIds
-      .map(teamId => {
-        const teamFolders = filteredFolders.filter(folder => (folder.teamId || 'unknown') === teamId);
-        const teamUnassigned = filteredUnassigned.filter(profile => (profile.teamId || 'unknown') === teamId);
-        const teamProfiles = profiles.filter(profile => (profile.teamId || 'unknown') === teamId);
-        return {
-          teamId,
-          teamName: teamNameById.get(teamId) || (teamId === 'unknown' ? 'No team' : `Team ${teamId.slice(0, 6)}`),
-          folders: teamFolders,
-          unassigned: teamUnassigned,
-          profileCount: teamProfiles.length,
-        };
-      })
-      .filter(section => section.folders.length > 0 || section.unassigned.length > 0)
-      .sort((a, b) => a.teamName.localeCompare(b.teamName));
+    const workspaceTitle = workspaceLabel?.includes(' — ')
+      ? workspaceLabel.split(' — ').pop()
+      : workspaceLabel;
 
     const renderFolderCard = (folder: Folder) => {
       const childIds = getChildFolderIds(folder.id);
@@ -556,9 +548,11 @@ const Dashboard: React.FC<DashboardProps> = ({
         {/* Header */}
         <header className="px-6 py-4 flex items-center justify-between gap-4" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
           <div>
-            <h1 className="text-[18px] font-bold" style={{ color: 'var(--text-primary)' }}>Folders</h1>
+            <h1 className="text-[18px] font-bold" style={{ color: 'var(--text-primary)' }}>
+              {workspaceTitle || 'Folders'}
+            </h1>
             <p className="text-[12px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-              {folders.length} folder{folders.length !== 1 ? 's' : ''} &middot; {profiles.length} instance{profiles.length !== 1 ? 's' : ''} total
+              {filteredFolders.length} folder{filteredFolders.length !== 1 ? 's' : ''} &middot; {profiles.length} instance{profiles.length !== 1 ? 's' : ''}
             </p>
           </div>
           <div className="relative w-64">
@@ -589,36 +583,10 @@ const Dashboard: React.FC<DashboardProps> = ({
               </div>
             </div>
           ) : (
-            isSuperAdmin ? (
-              <div className="space-y-8">
-                {teamSections.map(section => (
-                  <section key={section.teamId}>
-                    <div className="flex items-center justify-between mb-3">
-                      <div>
-                        <h2 className="text-[15px] font-semibold" style={{ color: 'var(--text-primary)' }}>
-                          {section.teamName}
-                        </h2>
-                        <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-                          {section.folders.length} folder{section.folders.length !== 1 ? 's' : ''} &middot; {section.profileCount} instance{section.profileCount !== 1 ? 's' : ''}
-                        </p>
-                      </div>
-                      <span className="text-[10px] px-2 py-1 rounded-md" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
-                        {section.teamId}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                      {section.folders.map(renderFolderCard)}
-                      {section.unassigned.length > 0 && renderUnassignedCard(section.unassigned, `unassigned-${section.teamId}`)}
-                    </div>
-                  </section>
-                ))}
-              </div>
-            ) : (
-              <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {filteredFolders.map(renderFolderCard)}
-                {filteredUnassigned.length > 0 && renderUnassignedCard(filteredUnassigned)}
-              </div>
-            )
+            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {filteredFolders.map(renderFolderCard)}
+              {filteredUnassigned.length > 0 && renderUnassignedCard(filteredUnassigned)}
+            </div>
           )}
         </div>
       </div>
@@ -666,6 +634,38 @@ const Dashboard: React.FC<DashboardProps> = ({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          <input
+            ref={sessionImportInputRef}
+            type="file"
+            accept=".txt,.json,.jsonl,text/plain,application/json"
+            className="hidden"
+            onChange={async (event) => {
+              const file = event.target.files?.[0];
+              event.target.value = '';
+              if (!file) return;
+              try {
+                const content = await file.text();
+                onImportSessions(content, file.name);
+              } catch {
+                showToast('Impossible de lire le fichier de sessions', 'error');
+              }
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => sessionImportInputRef.current?.click()}
+            disabled={!!bulkLaunching || sessionImportProgress?.running}
+            className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-[13px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{
+              background: 'rgba(99,102,241,0.10)',
+              border: '1px solid rgba(129,140,248,0.55)',
+              color: '#a5b4fc',
+            }}
+            title="Importer des sessions X depuis un fichier séparé"
+          >
+            <KeyRound size={14} />
+            {sessionImportProgress?.running ? 'Import en cours…' : 'Import sessions'}
+          </button>
           {launchableVisibleProfiles.length > 0 && (
             <button
               onClick={() => onBulkLaunch(launchableVisibleProfiles.map(profile => profile.id))}
@@ -794,6 +794,48 @@ const Dashboard: React.FC<DashboardProps> = ({
           </span>
         </div>
       </header>
+
+      {sessionImportProgress && (
+        <div
+          className="px-5 py-2.5 flex items-center gap-3"
+          style={{ borderBottom: '1px solid var(--border-subtle)', background: 'rgba(99,102,241,0.06)' }}
+        >
+          {sessionImportProgress.running && <Loader2 size={15} className="animate-spin shrink-0" style={{ color: '#a5b4fc' }} />}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-3 text-[12px]">
+              <span className="truncate font-medium" style={{ color: 'var(--text-primary)' }}>
+                {sessionImportProgress.username ? `@${sessionImportProgress.username} — ` : ''}
+                {sessionImportProgress.message}
+              </span>
+              <span className="tabular-nums shrink-0" style={{ color: 'var(--text-muted)' }}>
+                {sessionImportProgress.current}/{sessionImportProgress.total}
+              </span>
+            </div>
+            <div className="h-1 mt-2 rounded-full overflow-hidden" style={{ background: 'var(--bg-elevated)' }}>
+              <div
+                className="h-full rounded-full transition-all"
+                style={{
+                  width: `${sessionImportProgress.total
+                    ? Math.round((sessionImportProgress.current / sessionImportProgress.total) * 100)
+                    : 0}%`,
+                  background: sessionImportProgress.status === 'failed' ? '#ef4444' : '#818cf8',
+                }}
+              />
+            </div>
+          </div>
+          {sessionImportProgress.running && (
+            <button
+              type="button"
+              onClick={onStopSessionImport}
+              className="px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 text-[12px] font-medium shrink-0"
+              style={{ background: 'var(--danger-subtle)', color: 'var(--danger)' }}
+            >
+              <Square size={12} fill="currentColor" />
+              Arrêter l’import
+            </button>
+          )}
+        </div>
+      )}
 
       {currentFolder && (
         <form

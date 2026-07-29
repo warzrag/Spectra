@@ -19,7 +19,8 @@ interface ProxyManagerPageProps {
   folders?: Folder[];
   onUpdateProfile?: (profileId: string, data: any) => Promise<void>;
   userId?: string;
-  teamId?: string;
+  teamId?: string | null;
+  teamScope?: string[];
 }
 
 type StatusFilter = 'all' | 'healthy' | 'failed' | 'untested';
@@ -40,7 +41,7 @@ function CountryFlag({ code }: { code: string }) {
   );
 }
 
-const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], folders = [], onUpdateProfile, userId, teamId }) => {
+const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], folders = [], onUpdateProfile, userId, teamId, teamScope }) => {
   const { showToast } = useToast();
   const [proxies, setProxies] = useState<Proxy[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -61,15 +62,16 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
   const [folderDropdownProxy, setFolderDropdownProxy] = useState<string | null>(null);
   const folderDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Subscribe to Firestore proxies (real-time sync, scoped by teamId)
+  // A null team scope is reserved for super admins and loads every agency.
   useEffect(() => {
-    if (!teamId) return;
-    const unsub = subscribeToProxies(teamId, (allProxies) => {
+    if (teamId === undefined) return;
+    setLoading(true);
+    const unsub = subscribeToProxies(teamScope?.length ? teamScope : teamId, (allProxies) => {
       setProxies(allProxies);
       setLoading(false);
     });
     return () => unsub();
-  }, [teamId]);
+  }, [teamId, teamScope]);
 
   // Close assign dropdown on click outside
   useEffect(() => {

@@ -41,6 +41,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
   },
 
+  sessionImport: {
+    run: (profileData: any, credentials: any) =>
+      ipcRenderer.invoke('sessionImport:run', profileData, credentials),
+    stop: (profileId?: string) => ipcRenderer.invoke('sessionImport:stop', profileId),
+    onStatus: (callback: (payload: any) => void) => {
+      const listener = (_event: any, payload: any) => callback(payload);
+      ipcRenderer.on('sessionImport:status', listener);
+      return () => ipcRenderer.removeListener('sessionImport:status', listener);
+    },
+  },
+
   folders: {
     // Legacy: used only for one-time migration to Firestore
     getAll: () => ipcRenderer.invoke('folders:getAll'),
@@ -68,6 +79,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     zipForSync: (profileId: string) => ipcRenderer.invoke('profile:zipForSync', profileId),
     unzipFromSync: (profileId: string, zipData: Uint8Array) => ipcRenderer.invoke('profile:unzipFromSync', profileId, zipData),
     hasLocalData: (profileId: string) => ipcRenderer.invoke('profile:hasLocalData', profileId),
+    hasAuthenticatedXSnapshot: (profileId: string) =>
+      ipcRenderer.invoke('profile:hasAuthenticatedXSnapshot', profileId),
     getLocalSyncVersion: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncVersion', profileId),
     setLocalSyncVersion: (profileId: string, version: number) => ipcRenderer.invoke('profile:setLocalSyncVersion', profileId, version),
     getLocalSyncRevision: (profileId: string) => ipcRenderer.invoke('profile:getLocalSyncRevision', profileId),
@@ -83,8 +96,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
     },
     getHostname: () => ipcRenderer.invoke('system:hostname'),
     getInstallationId: () => ipcRenderer.invoke('system:installationId'),
-    onProfileClosed: (callback: (profileId: string) => void) => {
-      const listener = (_event: any, profileId: string) => callback(profileId);
+    onProfileClosed: (
+      callback: (
+        profileId: string,
+        details?: {
+          syncEligible?: boolean;
+          launchMode?: string;
+          requiresPortableAuth?: boolean;
+          reason?: string;
+        }
+      ) => void
+    ) => {
+      const listener = (
+        _event: any,
+        profileId: string,
+        details?: {
+          syncEligible?: boolean;
+          launchMode?: string;
+          requiresPortableAuth?: boolean;
+          reason?: string;
+        }
+      ) => callback(profileId, details);
       ipcRenderer.on('profile:closed', listener);
       return () => ipcRenderer.removeListener('profile:closed', listener);
     },

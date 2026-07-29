@@ -8,6 +8,9 @@ interface SidebarProps {
   onNavigate: (page: AppPage) => void;
   folders: FolderType[];
   teams?: Team[];
+  activeWorkspaceTeamId?: string;
+  activeWorkspaceLabel?: string;
+  onOpenWorkspace?: (email: string) => Promise<boolean>;
   selectedFolderId: string | null;
   profileCounts: { [folderId: string]: number };
   totalProfiles: number;
@@ -29,6 +32,9 @@ const Sidebar: React.FC<SidebarProps> = ({
   onNavigate,
   folders,
   teams = [],
+  activeWorkspaceTeamId,
+  activeWorkspaceLabel,
+  onOpenWorkspace,
   selectedFolderId,
   profileCounts,
   totalProfiles,
@@ -50,6 +56,10 @@ const Sidebar: React.FC<SidebarProps> = ({
   const [foldersExpanded, setFoldersExpanded] = useState(true);
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
   const [showNewDropdown, setShowNewDropdown] = useState(false);
+  const [showWorkspaceSwitch, setShowWorkspaceSwitch] = useState(false);
+  const [workspaceEmail, setWorkspaceEmail] = useState('');
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState('');
   const [appVersion, setAppVersion] = useState('');
   // Remove credentials stored by versions prior to 1.10.
   useEffect(() => {
@@ -183,6 +193,65 @@ const Sidebar: React.FC<SidebarProps> = ({
         )}
       </div>
 
+      {isSuperAdmin && !collapsed && activeWorkspaceTeamId && (
+        <div className="px-3 pb-1">
+          <label className="block px-1 mb-1 text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+            Active workspace
+          </label>
+          <button
+            onClick={() => {
+              setShowWorkspaceSwitch(value => !value);
+              setWorkspaceError('');
+            }}
+            className="w-full px-3 py-2 rounded-lg text-left"
+            style={{ background: 'var(--bg-elevated)', border: '1px solid var(--accent)', color: 'var(--text-primary)' }}
+            aria-label="Switch active workspace"
+          >
+            <span className="block text-[12px] font-semibold truncate">{activeWorkspaceLabel || 'Current workspace'}</span>
+            <span className="block text-[10px] mt-0.5" style={{ color: 'var(--accent-light)' }}>Switch workspace</span>
+          </button>
+          {showWorkspaceSwitch && (
+            <form
+              className="mt-2 p-2 rounded-lg"
+              style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+              onSubmit={async e => {
+                e.preventDefault();
+                if (!onOpenWorkspace || !workspaceEmail.trim()) return;
+                setWorkspaceLoading(true);
+                setWorkspaceError('');
+                const opened = await onOpenWorkspace(workspaceEmail);
+                setWorkspaceLoading(false);
+                if (opened) {
+                  setWorkspaceEmail('');
+                  setShowWorkspaceSwitch(false);
+                } else {
+                  setWorkspaceError('No workspace found for this email');
+                }
+              }}
+            >
+              <input
+                type="email"
+                value={workspaceEmail}
+                onChange={e => setWorkspaceEmail(e.target.value)}
+                placeholder="Owner or member email"
+                className="w-full px-2.5 py-2 rounded-md text-[11px]"
+                style={{ background: 'var(--bg-base)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
+                autoFocus
+              />
+              {workspaceError && <p className="mt-1 text-[10px]" style={{ color: 'var(--danger)' }}>{workspaceError}</p>}
+              <button
+                type="submit"
+                disabled={workspaceLoading || !workspaceEmail.trim()}
+                className="w-full mt-2 py-1.5 rounded-md text-[11px] font-semibold text-white disabled:opacity-50"
+                style={{ background: 'var(--accent)' }}
+              >
+                {workspaceLoading ? 'Opening...' : 'Open workspace'}
+              </button>
+            </form>
+          )}
+        </div>
+      )}
+
       {/* New Profile Button - only for admins */}
       {isAdmin && (
         <div className={`${collapsed ? 'px-2' : 'p-3'}`}>
@@ -238,14 +307,16 @@ const Sidebar: React.FC<SidebarProps> = ({
         </div>
       )}
 
-      {/* Main Navigation */}
-      <nav className={`px-2 space-y-0.5 ${isAdmin ? '' : 'pt-3'}`}>
-        {filterItems(mainNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
-      </nav>
+      {/* Scrollable navigation keeps folders reachable on shorter windows. */}
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {/* Main Navigation */}
+        <nav className={`px-2 space-y-0.5 ${isAdmin ? '' : 'pt-3'}`}>
+          {filterItems(mainNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
+        </nav>
 
-      {/* Folders section - only visible when on profiles page and not collapsed */}
-      {activePage === 'profiles' && !collapsed && (
-        <div className="flex-1 px-2 pb-2 overflow-y-auto mt-3">
+        {/* Folders section - only visible when on profiles page and not collapsed */}
+        {activePage === 'profiles' && !collapsed && (
+          <div className="px-2 pb-2 mt-3">
           {/* Divider */}
           <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-3 mx-1" />
 
@@ -416,28 +487,26 @@ const Sidebar: React.FC<SidebarProps> = ({
               );
             })()}
           </div>
-        </div>
-      )}
-
-      {/* Spacer when folders not shown */}
-      {(activePage !== 'profiles' || collapsed) && <div className="flex-1" />}
-
-      {/* Team Section */}
-      {isAdmin && (
-        <div className="px-2 pb-2">
-          <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-2 mx-1" />
-          {!collapsed && (
-            <div className="px-3 mb-1">
-              <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                Team
-              </span>
-            </div>
-          )}
-          <div className="space-y-0.5">
-            {filterItems(teamNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
           </div>
-        </div>
-      )}
+        )}
+
+        {/* Team Section */}
+        {isAdmin && (
+          <div className="px-2 pb-2">
+            <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-2 mx-1" />
+            {!collapsed && (
+              <div className="px-3 mb-1">
+                <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                  Team
+                </span>
+              </div>
+            )}
+            <div className="space-y-0.5">
+              {filterItems(teamNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Bottom: User info */}
       <div className={`${collapsed ? 'px-2' : 'px-3'} py-3 space-y-2 relative`} style={{ borderTop: '1px solid var(--border-subtle)' }}>

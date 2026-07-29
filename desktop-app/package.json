@@ -1,11 +1,12 @@
 {
   "name": "spectra",
-  "version": "1.10.14",
+  "version": "1.10.15",
   "description": "Spectra - Multi-profile browser management",
   "main": "dist/src/main/main.js",
   "scripts": {
-    "dev": "concurrently --kill-others \"npm run dev:react\" \"npm run dev:electron:wait\"",
-    "dev:electron:wait": "wait-on http://localhost:9000 && electron .",
+    "dev": "concurrently --kill-others-on-fail \"npm run dev:react\" \"npm run dev:main\" \"npm run dev:electron:wait\"",
+    "dev:main": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "dev:electron:wait": "wait-on http://localhost:9000 dist/src/main/main.js && electron .",
     "dev:react": "webpack serve --mode development",
     "dev:electron": "electron .",
     "build": "npm run build:react && npm run build:electron",

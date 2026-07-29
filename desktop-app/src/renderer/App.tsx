@@ -26,7 +26,11 @@ import {
   subscribeToProfiles,
   subscribeToFolders,
   subscribeToExtensions,
-  subscribeToTeams,
+  subscribeToProxies,
+  findUserByEmail,
+  getTeamById,
+  getTeamsByOwnerId,
+  FirestoreProxy,
   createProfile as firestoreCreateProfile,
   updateProfile as firestoreUpdateProfile,
   deleteProfile as firestoreDeleteProfile,
@@ -46,6 +50,10 @@ import {
   releaseProfileLock,
 } from './services/profile-sync-service';
 import { normalizeTweetUrl } from '../shared/twitter-url';
+import {
+  parseSessionImportFile,
+  SessionImportProgress,
+} from '../shared/session-import';
 
 declare global {
   interface Window {
@@ -74,6 +82,19 @@ declare global {
         onActiveUpdate: (callback: (activeProfiles: string[]) => void) => () => void;
         onUrlChanged: (callback: (profileId: string, url: string) => void) => () => void;
       };
+      sessionImport?: {
+        run: (
+          profileData: any,
+          credentials: { username: string; password: string; totpSecret: string }
+        ) => Promise<{ status: 'success' | 'manual' | 'failed'; message: string }>;
+        stop: (profileId?: string) => Promise<boolean>;
+        onStatus: (callback: (payload: {
+          profileId: string;
+          attemptId: string;
+          status: SessionImportProgress['status'];
+          message: string;
+        }) => void) => () => void;
+      };
       folders: {
         getAll: () => Promise<Folder[]>;
         create: (folderData: any) => Promise<Folder>;
@@ -81,7 +102,7 @@ declare global {
         delete: (folderId: string) => Promise<boolean>;
       };
       fingerprint: {
-        generate: (os?: string, browserType?: string) => Promise<any>;
+        generate: (os?: string, browserType?: string, countryCode?: string) => Promise<any>;
         getPresets: () => Promise<any[]>;
       };
       proxy: {
@@ -137,6 +158,7 @@ declare global {
         zipForSync: (profileId: string) => Promise<{ buffer: Uint8Array; size: number }>;
         unzipFromSync: (profileId: string, zipData: Uint8Array) => Promise<boolean>;
         hasLocalData: (profileId: string) => Promise<boolean>;
+        hasAuthenticatedXSnapshot: (profileId: string) => Promise<boolean>;
         getLocalSyncVersion: (profileId: string) => Promise<number>;
         setLocalSyncVersion: (profileId: string, version: number) => Promise<boolean>;
         getLocalSyncRevision: (profileId: string) => Promise<string | null>;
@@ -146,7 +168,17 @@ declare global {
         onDownloadProgress: (callback: (profileId: string, percent: number) => void) => () => void;
         getHostname: () => Promise<string>;
         getInstallationId: () => Promise<string>;
-        onProfileClosed: (callback: (profileId: string) => void) => () => void;
+        onProfileClosed: (
+          callback: (
+            profileId: string,
+            details?: {
+              syncEligible?: boolean;
+              launchMode?: string;
+              requiresPortableAuth?: boolean;
+              reason?: string;
+            }
+          ) => void
+        ) => () => void;
       };
       browser?: {
         onDownloadProgress: (callback: (data: { percent: number; status: string }) => void) => () => void;
@@ -181,10 +213,16 @@ function App() {
   const [folders, setFolders] = useState<Folder[]>([]);
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
+  const [activeWorkspaceTeamId, setActiveWorkspaceTeamId] = useState<string | null>(null);
+  const [activeWorkspaceTeamIds, setActiveWorkspaceTeamIds] = useState<string[]>([]);
+  const [activeWorkspaceLabel, setActiveWorkspaceLabel] = useState('');
+  const [proxies, setProxies] = useState<FirestoreProxy[]>([]);
   const [loading, setLoading] = useState(true);
   const [activePage, setActivePage] = useState<AppPage>('profiles');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
+  const [sessionImportProgress, setSessionImportProgress] = useState<SessionImportProgress | null>(null);
+  const sessionImportRunRef = useRef<{ cancelled: boolean; profileId?: string } | null>(null);
   const [currentDeviceName, setCurrentDeviceName] = useState<string | null>(null);
   const [currentInstallationId, setCurrentInstallationId] = useState<string | null>(null);
 
@@ -279,6 +317,98 @@ function App() {
     return unsubscribe;
   }, []);
 
+  useEffect(() => {
+    if (!user) {
+      setActiveWorkspaceTeamId(null);
+      setActiveWorkspaceTeamIds([]);
+      return;
+    }
+    if (user.role !== 'super_admin') {
+      setActiveWorkspaceTeamId(user.teamId);
+      setActiveWorkspaceTeamIds([user.teamId]);
+      setActiveWorkspaceLabel(user.displayName ? `${user.displayName} — ${user.email}` : user.email);
+      return;
+    }
+    const saved = localStorage.getItem(`spectra-active-workspace:${user.uid}`);
+    const primaryTeamId = saved || user.teamId;
+    const savedTeamIds = localStorage.getItem(`spectra-active-workspace-teams:${user.uid}`);
+    let parsedTeamIds: string[] = [];
+    try {
+      parsedTeamIds = savedTeamIds ? JSON.parse(savedTeamIds) : [];
+    } catch {}
+    setActiveWorkspaceTeamId(primaryTeamId);
+    setActiveWorkspaceTeamIds(parsedTeamIds.length ? parsedTeamIds : [primaryTeamId]);
+    setActiveWorkspaceLabel(
+      localStorage.getItem(`spectra-active-workspace-label:${user.uid}`) ||
+      (user.displayName ? `${user.displayName} — ${user.email}` : user.email)
+    );
+  }, [user]);
+
+  useEffect(() => {
+    if (!activeWorkspaceTeamId) {
+      setTeams([]);
+      return;
+    }
+    let cancelled = false;
+    getTeamById(activeWorkspaceTeamId)
+      .then(async team => {
+        if (!team || cancelled) {
+          if (!cancelled) setTeams([]);
+          return;
+        }
+        const workspaceTeams = user?.role === 'super_admin'
+          ? await getTeamsByOwnerId(team.ownerId)
+          : [team];
+        if (cancelled) return;
+        const resolvedTeams = workspaceTeams.length ? workspaceTeams : [team];
+        const resolvedTeamIds = Array.from(new Set(resolvedTeams.map(item => item.id)));
+        setTeams(resolvedTeams);
+        setActiveWorkspaceTeamIds(resolvedTeamIds);
+        if (user?.role === 'super_admin') {
+          localStorage.setItem(`spectra-active-workspace-teams:${user.uid}`, JSON.stringify(resolvedTeamIds));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setTeams([]);
+      });
+    return () => { cancelled = true; };
+  }, [activeWorkspaceTeamId, user]);
+
+  useEffect(() => {
+    const workspaceEmail = settings.activeWorkspaceEmail?.trim().toLowerCase();
+    if (!user || user.role !== 'super_admin' || !workspaceEmail) return;
+    let cancelled = false;
+    const openConfiguredWorkspace = async () => {
+      try {
+        const workspaceUser = await findUserByEmail(workspaceEmail);
+        if (!workspaceUser?.teamId || cancelled) return;
+        const currentTeam = await getTeamById(workspaceUser.teamId);
+        const ownerId = currentTeam?.ownerId || workspaceUser.uid;
+        const ownerTeams = await getTeamsByOwnerId(ownerId);
+        if (cancelled) return;
+        const workspaceTeamIds = Array.from(new Set([
+          workspaceUser.teamId,
+          ...ownerTeams.map(team => team.id),
+        ]));
+        const label = workspaceUser.displayName
+          ? `${workspaceUser.displayName} — ${workspaceUser.email}`
+          : workspaceUser.email;
+        setActiveWorkspaceTeamId(workspaceUser.teamId);
+        setActiveWorkspaceTeamIds(workspaceTeamIds);
+        setActiveWorkspaceLabel(label);
+        localStorage.setItem(`spectra-active-workspace:${user.uid}`, workspaceUser.teamId);
+        localStorage.setItem(`spectra-active-workspace-teams:${user.uid}`, JSON.stringify(workspaceTeamIds));
+        localStorage.setItem(`spectra-active-workspace-label:${user.uid}`, label);
+        setSelectedFolderId(null);
+        setActivePage('profiles');
+      } catch (error) {
+        console.error('Failed to open configured workspace:', error);
+      }
+    };
+    openConfiguredWorkspace();
+    return () => { cancelled = true; };
+  }, [user, settings.activeWorkspaceEmail]);
+
   // Apply theme
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', settings.theme);
@@ -299,7 +429,7 @@ function App() {
 
   // Firestore real-time sync for profiles and folders (scoped by teamId)
   useEffect(() => {
-    if (!user) return;
+    if (!user || !activeWorkspaceTeamId) return;
     setLoading(true);
 
     // One-time migration: move local profiles to Firestore if needed
@@ -320,7 +450,7 @@ function App() {
     };
     migrate();
 
-    const scopeTeamId = user.role === 'super_admin' ? null : user.teamId;
+    const scopeTeamId = activeWorkspaceTeamIds.length ? activeWorkspaceTeamIds : [activeWorkspaceTeamId];
     const assignedFolderScope = user.role === 'va' ? user.assignedFolderId : null;
 
     // Subscribe to Firestore collections (super admin = global, others = scoped by teamId)
@@ -333,21 +463,18 @@ function App() {
       setFolders(allFolders);
     }, assignedFolderScope);
 
-    const unsubExtensions = subscribeToExtensions(scopeTeamId, (allExtensions) => {
+    const unsubExtensions = subscribeToExtensions(activeWorkspaceTeamId, (allExtensions) => {
       setExtensions(allExtensions);
     });
-
-    const unsubTeams = user.role === 'super_admin'
-      ? subscribeToTeams(setTeams)
-      : () => setTeams([]);
+    const unsubProxies = subscribeToProxies(scopeTeamId, setProxies);
 
     return () => {
       unsubProfiles();
       unsubFolders();
       unsubExtensions();
-      unsubTeams();
+      unsubProxies();
     };
-  }, [user]);
+  }, [user, activeWorkspaceTeamId, activeWorkspaceTeamIds]);
 
   // Release only this device/user's own stale local locks. Never clear another user's lock.
   const lockCleanupKey = useRef<string | null>(null);
@@ -417,6 +544,37 @@ function App() {
     profilesRef.current = profiles;
   }, [profiles]);
 
+  // Non-destructive migration: promote existing portable authenticated cookies
+  // to the protected snapshot format. Cloud data is not changed here; the next
+  // verified profile close uploads it through sync protocol v2.
+  const authSnapshotBackfillKey = useRef('');
+  useEffect(() => {
+    if (!window.electronAPI.profileSync?.hasAuthenticatedXSnapshot || profiles.length === 0) return;
+    const xProfileIds = profiles
+      .filter(profile =>
+        profile.platform === 'twitter' ||
+        /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\//i.test(profile.lastUrl || '')
+      )
+      .map(profile => profile.id)
+      .sort();
+    const migrationKey = xProfileIds.join(',');
+    if (!migrationKey || authSnapshotBackfillKey.current === migrationKey) return;
+    authSnapshotBackfillKey.current = migrationKey;
+
+    Promise.allSettled(
+      xProfileIds.map(profileId =>
+        window.electronAPI.profileSync!.hasAuthenticatedXSnapshot(profileId)
+      )
+    ).then(results => {
+      const protectedCount = results.filter(
+        result => result.status === 'fulfilled' && result.value === true
+      ).length;
+      console.log(
+        `[ProfileSync] Protected authentication migration: ${protectedCount}/${xProfileIds.length}`
+      );
+    });
+  }, [profiles]);
+
   // Listen for URL changes from main process and sync to Firestore
   useEffect(() => {
     if (!user) return;
@@ -458,10 +616,36 @@ function App() {
         while (uploadQueue.length > 0) {
           const { profileId, profileName } = uploadQueue[0];
           try {
+            const queuedProfile = profilesRef.current.find(p => p.id === profileId);
+            const requiresPortableAuth = queuedProfile?.platform === 'twitter' ||
+              /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\//i.test(queuedProfile?.lastUrl || '');
+            if (requiresPortableAuth) {
+              const portableAuthReady =
+                await window.electronAPI.profileSync.hasAuthenticatedXSnapshot(profileId);
+              if (!portableAuthReady) {
+                uploadQueue.shift();
+                persistQueue();
+                await releaseProfileLock(profileId, {
+                  uid: user.uid,
+                  deviceName: currentDeviceName,
+                  installationId: currentInstallationId,
+                }).catch(() => {});
+                showToast(
+                  `"${profileName}" not synchronized: authenticated X snapshot is missing`,
+                  'warning'
+                );
+                continue;
+              }
+            }
             setSyncProgress({ profileId, percent: 0, type: 'upload', profileName });
             await uploadProfileToCloud(
               profileId,
-              { uid: user.uid, email: user.email },
+              {
+                uid: user.uid,
+                email: user.email,
+                deviceName: currentDeviceName,
+                installationId: currentInstallationId,
+              },
               (percent) => setSyncProgress(prev => prev ? { ...prev, percent } : null)
             );
             await releaseProfileLock(profileId, {
@@ -476,6 +660,24 @@ function App() {
           } catch (error) {
             console.error('[ProfileSync] Upload failed; lock retained:', error);
             setSyncProgress(null);
+            const errorCode = (error as { code?: string })?.code;
+            const errorMessage = error instanceof Error ? error.message : '';
+            const isConflict = errorCode === 'profile-sync/conflict' ||
+              errorMessage.includes('changed on another device');
+            if (isConflict) {
+              uploadQueue.shift();
+              persistQueue();
+              await releaseProfileLock(profileId, {
+                uid: user.uid,
+                deviceName: currentDeviceName,
+                installationId: currentInstallationId,
+              }).catch(() => {});
+              showToast(
+                `"${profileName}" changed on another device — stale local data was not uploaded`,
+                'warning'
+              );
+              continue;
+            }
             showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
             retryTimer = window.setTimeout(processQueue, 30000);
             break;
@@ -487,7 +689,25 @@ function App() {
       }
     };
 
-    const unsubscribe = window.electronAPI.profileSync.onProfileClosed(async (profileId) => {
+    const unsubscribe = window.electronAPI.profileSync.onProfileClosed(async (profileId, details) => {
+      if (details?.syncEligible === false) {
+        console.warn(`[ProfileSync] Ignored ineligible close event for ${profileId}: ${details.reason || 'unknown'}`);
+        uploadQueue = uploadQueue.filter(item => item.profileId !== profileId);
+        persistQueue();
+        await releaseProfileLock(profileId, {
+          uid: user.uid,
+          deviceName: currentDeviceName,
+          installationId: currentInstallationId,
+        }).catch(() => {});
+        if (details.reason === 'missing-authenticated-x-snapshot') {
+          const profile = profilesRef.current.find(p => p.id === profileId);
+          showToast(
+            `"${profile?.name || profileId}" not synchronized: X login snapshot was not captured`,
+            'warning'
+          );
+        }
+        return;
+      }
       const profile = profilesRef.current.find(p => p.id === profileId);
       const profileName = profile?.name || profileId;
       if (!uploadQueue.some(item => item.profileId === profileId)) {
@@ -505,6 +725,209 @@ function App() {
     };
   }, [user, currentDeviceName, currentInstallationId]);
 
+  useEffect(() => {
+    if (!window.electronAPI.sessionImport?.onStatus) return;
+    return window.electronAPI.sessionImport.onStatus((payload) => {
+      setSessionImportProgress(previous => {
+        if (!previous?.running || previous.profileId !== payload.profileId) return previous;
+        return {
+          ...previous,
+          status: payload.status,
+          message: payload.message || previous.message,
+        };
+      });
+    });
+  }, []);
+
+  const handleStopSessionImport = async () => {
+    const run = sessionImportRunRef.current;
+    if (!run) return;
+    run.cancelled = true;
+    setSessionImportProgress(previous => previous ? {
+      ...previous,
+      running: false,
+      status: 'stopped',
+      message: 'Import arrêté',
+    } : previous);
+    await window.electronAPI.sessionImport?.stop(run.profileId).catch(() => {});
+    showToast('Import des sessions arrêté', 'info');
+  };
+
+  const handleImportSessions = async (content: string, fileName: string) => {
+    if (!user || !window.electronAPI.sessionImport || sessionImportRunRef.current) {
+      showToast('Un import de sessions est déjà en cours', 'warning');
+      return;
+    }
+
+    let accounts;
+    try {
+      accounts = parseSessionImportFile(content);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Fichier de sessions invalide', 'error');
+      return;
+    }
+
+    const usageByProxy = new Map<string, number>();
+    for (const profile of profiles.filter(profile => !profile.deleted && profile.proxy?.host)) {
+      const key = `${profile.proxy!.host.toLowerCase()}:${profile.proxy!.port}`;
+      usageByProxy.set(key, (usageByProxy.get(key) || 0) + 1);
+    }
+    const uniqueCandidates = new Map<string, FirestoreProxy>();
+    for (const proxy of proxies) {
+      const key = `${proxy.host.toLowerCase()}:${proxy.port}`;
+      if ((usageByProxy.get(key) || 0) < 3 && !uniqueCandidates.has(key)) {
+        uniqueCandidates.set(key, proxy);
+      }
+    }
+    const candidates = Array.from(uniqueCandidates.values());
+
+    setSessionImportProgress({
+      running: true,
+      total: accounts.length,
+      current: 0,
+      status: 'testing-proxy',
+      message: 'Test des proxies disponibles',
+    });
+    const run = { cancelled: false, profileId: undefined as string | undefined };
+    sessionImportRunRef.current = run;
+
+    try {
+      const validSlots: FirestoreProxy[] = [];
+      for (const proxy of candidates) {
+        if (run.cancelled) return;
+        const key = `${proxy.host.toLowerCase()}:${proxy.port}`;
+        const remaining = Math.max(0, 3 - (usageByProxy.get(key) || 0));
+        let testResult: any = false;
+        try {
+          testResult = await window.electronAPI.proxy.test(proxy);
+        } catch {}
+        const healthy = typeof testResult === 'boolean' ? testResult : testResult?.isHealthy === true;
+        if (healthy) {
+          for (let index = 0; index < remaining; index++) validSlots.push(proxy);
+        }
+      }
+      if (validSlots.length < accounts.length) {
+        setSessionImportProgress({
+          running: false,
+          total: accounts.length,
+          current: 0,
+          status: 'failed',
+          message: `Capacité proxy insuffisante (${validSlots.length}/${accounts.length})`,
+        });
+        showToast('Import annulé : capacité insuffisante de proxies valides (3 comptes maximum par proxy)', 'error');
+        return;
+      }
+
+      let successful = 0;
+      let failed = 0;
+      for (let index = 0; index < accounts.length; index++) {
+        if (run.cancelled) return;
+        const account = accounts[index];
+        const proxy = validSlots[index];
+        setSessionImportProgress({
+          running: true,
+          total: accounts.length,
+          current: index + 1,
+          username: account.username,
+          status: 'creating',
+          message: `Création du profil ${index + 1}/${accounts.length}`,
+        });
+
+        const fingerprint = await window.electronAPI.fingerprint.generate(
+          'windows',
+          'chrome',
+          proxy.country
+        );
+        const proxyData = {
+          type: proxy.type,
+          host: proxy.host,
+          port: proxy.port,
+          username: proxy.username,
+          password: proxy.password,
+        };
+        const profile = await firestoreCreateProfile({
+          name: `X — ${account.username}`,
+          platform: 'twitter',
+          userAgent: fingerprint?.userAgent || '',
+          timezone: fingerprint?.timezone || 'UTC',
+          language: fingerprint?.language || 'en-US',
+          screenResolution: fingerprint?.screenResolution || '1920x1080',
+          fingerprint: fingerprint || {},
+          os: 'windows',
+          browserType: 'chrome',
+          connectionType: 'proxy',
+          connectionConfig: { type: 'proxy', proxy: proxyData },
+          proxy: proxyData,
+          folderId: selectedFolderId || undefined,
+          lastUrl: 'https://x.com/home',
+          status: 'none',
+          tags: ['session-import'],
+          createdAt: new Date().toISOString(),
+        } as any, user.uid, activeWorkspaceTeamId || user.teamId);
+        run.profileId = profile.id;
+        await acquireProfileLock(
+          profile.id,
+          { uid: user.uid, email: user.email },
+          currentInstallationId
+        );
+
+        setSessionImportProgress(previous => previous ? {
+          ...previous,
+          profileId: profile.id,
+          status: 'launching',
+          message: 'Ouverture de X',
+        } : previous);
+        const result = await window.electronAPI.sessionImport.run(profile, account);
+        account.password = '';
+        account.totpSecret = '';
+
+        if (result.status === 'manual') {
+          setSessionImportProgress(previous => previous ? {
+            ...previous,
+            running: false,
+            status: 'manual',
+            message: result.message || 'Vérification manuelle requise — fenêtre laissée ouverte',
+          } : previous);
+          showToast('Import en pause : terminez la vérification manuellement dans la fenêtre ouverte', 'warning');
+          return;
+        }
+        if (result.status === 'success') successful++;
+        else failed++;
+        run.profileId = undefined;
+      }
+
+      setSessionImportProgress({
+        running: false,
+        total: accounts.length,
+        current: accounts.length,
+        status: failed ? 'failed' : 'success',
+        message: `${successful} session(s) importée(s), ${failed} échec(s)`,
+      });
+      showToast(
+        `${successful} session(s) importée(s) depuis ${fileName}${failed ? `, ${failed} échec(s)` : ''}`,
+        failed ? 'warning' : 'success'
+      );
+    } catch (error) {
+      console.error('[SessionImport] Import failed without credential details:', error);
+      setSessionImportProgress(previous => previous ? {
+        ...previous,
+        running: false,
+        status: 'failed',
+        message: 'Import interrompu par une erreur',
+      } : previous);
+      showToast('L’import des sessions a échoué', 'error');
+      if (run.profileId) {
+        await window.electronAPI.sessionImport.stop(run.profileId).catch(() => {});
+      }
+    } finally {
+      for (const account of accounts) {
+        account.password = '';
+        account.totpSecret = '';
+      }
+      if (sessionImportRunRef.current === run) sessionImportRunRef.current = null;
+    }
+  };
+
   const handleLogout = async () => {
     if (activeProfiles.length > 0) {
       showToast('Fermez les instances ouvertes et attendez leur synchronisation avant de vous déconnecter', 'warning');
@@ -516,7 +939,7 @@ function App() {
     }
     if (user) {
       logActivity({
-        teamId: user.teamId,
+        teamId: activeWorkspaceTeamId || user.teamId,
         userId: user.uid,
         userName: user.email,
         action: 'user_logout',
@@ -547,11 +970,11 @@ function App() {
 
   const handleCreateProfile = async (profileData: any) => {
     try {
-      const newProfile = await firestoreCreateProfile(profileData, user!.uid, user!.teamId);
+      const newProfile = await firestoreCreateProfile(profileData, user!.uid, activeWorkspaceTeamId || user!.teamId);
       showToast(`"${newProfile.name}" created`, 'success');
       if (user) {
         logActivity({
-          teamId: user.teamId,
+          teamId: activeWorkspaceTeamId || user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_created', targetProfileId: newProfile.id, targetProfileName: newProfile.name,
           timestamp: new Date().toISOString(),
@@ -599,11 +1022,11 @@ function App() {
         platform: profile.platform,
         createdAt: new Date().toISOString(),
       };
-      const newProfile = await firestoreCreateProfile(cloneData, user!.uid, user!.teamId);
+      const newProfile = await firestoreCreateProfile(cloneData, user!.uid, activeWorkspaceTeamId || user!.teamId);
       showToast(`"${profile.name}" cloned as "${newProfile.name}"`, 'success');
       if (user) {
         logActivity({
-          teamId: user.teamId,
+          teamId: activeWorkspaceTeamId || user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_created', targetProfileId: newProfile.id, targetProfileName: newProfile.name,
           timestamp: new Date().toISOString(),
@@ -627,7 +1050,7 @@ function App() {
       showToast(`"${profile?.name}" moved to recycle bin`, 'success');
       if (user && profile) {
         logActivity({
-          teamId: user.teamId,
+          teamId: activeWorkspaceTeamId || user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_deleted', targetProfileId: profileId, targetProfileName: profile.name,
           timestamp: new Date().toISOString(),
@@ -650,7 +1073,7 @@ function App() {
       showToast(`"${profile?.name}" restored`, 'success');
       if (user && profile) {
         logActivity({
-          teamId: user.teamId,
+          teamId: activeWorkspaceTeamId || user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_restored', targetProfileId: profileId, targetProfileName: profile.name,
           timestamp: new Date().toISOString(),
@@ -674,7 +1097,7 @@ function App() {
       // onSnapshot handles state update
       if (user && profile) {
         logActivity({
-          teamId: user.teamId,
+          teamId: activeWorkspaceTeamId || user.teamId,
           userId: user.uid, userName: user.email,
           action: 'profile_permanently_deleted', targetProfileId: profileId, targetProfileName: profile.name,
           timestamp: new Date().toISOString(),
@@ -797,7 +1220,7 @@ function App() {
         showToast(`"${profile.name}" launched successfully`, 'success');
         if (user) {
           logActivity({
-            teamId: user.teamId,
+            teamId: activeWorkspaceTeamId || user.teamId,
             userId: user.uid, userName: user.email,
             action: 'profile_launched', targetProfileId: profile.id, targetProfileName: profile.name,
             timestamp: new Date().toISOString(),
@@ -885,6 +1308,7 @@ function App() {
       const launched = await handleLaunchProfile({
         ...profile,
         lastUrl: 'https://x.com/i/chat/requests',
+        launchMode: 'automation',
         autoStartTwitterBot: true,
         windowLayout: { index: i, total: profilesToLaunch.length },
       });
@@ -973,6 +1397,7 @@ function App() {
           const launched = await handleLaunchProfile({
             ...profile,
             lastUrl: normalizedUrl,
+            launchMode: 'open-post',
             targetTweetUrl: normalizedUrl,
             autoStartTwitterBot: false,
             __shouldCancel: () => runState.cancelled,
@@ -1050,7 +1475,7 @@ function App() {
 
   const handleCreateFolder = async (folderData: any) => {
     try {
-      await firestoreCreateFolder(folderData, user!.uid, user!.teamId);
+      await firestoreCreateFolder(folderData, user!.uid, activeWorkspaceTeamId || user!.teamId);
       // onSnapshot handles state update
     } catch (error) {
       console.error('Failed to create folder:', error);
@@ -1151,6 +1576,7 @@ function App() {
             profiles={visibleProfiles}
             folders={visibleFolders}
             teams={teams}
+            workspaceLabel={activeWorkspaceLabel}
             loading={loading}
             selectedFolderId={selectedFolderId}
             onSelectFolder={setSelectedFolderId}
@@ -1164,6 +1590,9 @@ function App() {
             bulkLaunching={bulkLaunching}
             isOpenPostRunning={isOpenPostRunning}
             onStopOpenPost={handleStopOpenPost}
+            sessionImportProgress={sessionImportProgress}
+            onImportSessions={handleImportSessions}
+            onStopSessionImport={handleStopSessionImport}
             onMoveProfile={handleMoveProfile}
             onShowCreateModal={() => setShowCreateModal(true)}
             onEditProfile={(profile) => { setEditingProfile(profile); setShowCreateModal(true); }}
@@ -1172,15 +1601,24 @@ function App() {
           />
         );
       case 'proxies':
-        return <ProxyManagerPage profiles={visibleProfiles} folders={visibleFolders} onUpdateProfile={handleUpdateProfile} userId={user?.uid} teamId={user?.teamId} />;
+        return (
+          <ProxyManagerPage
+            profiles={visibleProfiles}
+            folders={visibleFolders}
+            onUpdateProfile={handleUpdateProfile}
+            userId={user?.uid}
+            teamId={activeWorkspaceTeamId}
+            teamScope={activeWorkspaceTeamIds}
+          />
+        );
       case 'extensions':
-        return hasAdminAccess ? <ExtensionsPage teamId={user?.role === 'super_admin' ? null : user?.teamId || null} teams={teams} /> : null;
+        return hasAdminAccess ? <ExtensionsPage teamId={activeWorkspaceTeamId} teams={teams} /> : null;
       case 'diagnostics':
         return <DiagnosticsPage user={user} profiles={visibleProfiles} activeProfiles={activeProfiles} />;
       case 'settings':
         return <SettingsPage settings={settings} onSettingsChange={handleSettingsChange} user={user} onLogout={handleLogout} />;
       case 'activity':
-        return hasAdminAccess ? <ActivityLogPage teamId={user?.role === 'super_admin' ? '' : user?.teamId || ''} /> : null;
+        return hasAdminAccess ? <ActivityLogPage teamId={activeWorkspaceTeamId || ''} /> : null;
       case 'recycle-bin':
         return hasAdminAccess ? (
           <RecycleBinPage
@@ -1193,7 +1631,7 @@ function App() {
       case 'billing':
         return hasAdminAccess ? <BillingPage /> : null;
       case 'members':
-        return hasAdminAccess ? <MembersPage teamId={user?.teamId || ''} folders={folders} /> : null;
+        return hasAdminAccess ? <MembersPage teamId={activeWorkspaceTeamId || ''} folders={folders} /> : null;
       case 'admin-panel':
         return user?.role === 'super_admin' ? <AdminPage /> : null;
       default:
@@ -1239,6 +1677,38 @@ function App() {
             onNavigate={setActivePage}
             folders={visibleFolders}
             teams={teams}
+            activeWorkspaceTeamId={activeWorkspaceTeamId || undefined}
+            activeWorkspaceLabel={activeWorkspaceLabel}
+            onOpenWorkspace={async (email) => {
+              try {
+                const workspaceUser = await findUserByEmail(email);
+                if (!workspaceUser?.teamId) return false;
+                const currentTeam = await getTeamById(workspaceUser.teamId);
+                const ownerId = currentTeam?.ownerId || workspaceUser.uid;
+                const ownerTeams = await getTeamsByOwnerId(ownerId);
+                const workspaceTeamIds = Array.from(new Set([
+                  workspaceUser.teamId,
+                  ...ownerTeams.map(team => team.id),
+                ]));
+                const label = workspaceUser.displayName
+                  ? `${workspaceUser.displayName} — ${workspaceUser.email}`
+                  : workspaceUser.email;
+                setActiveWorkspaceTeamId(workspaceUser.teamId);
+                setActiveWorkspaceTeamIds(workspaceTeamIds);
+                setActiveWorkspaceLabel(label);
+                localStorage.setItem(`spectra-active-workspace:${user.uid}`, workspaceUser.teamId);
+                localStorage.setItem(`spectra-active-workspace-teams:${user.uid}`, JSON.stringify(workspaceTeamIds));
+                localStorage.setItem(`spectra-active-workspace-label:${user.uid}`, label);
+                setSettings(current => ({ ...current, activeWorkspaceEmail: workspaceUser.email }));
+                await window.electronAPI.settings.set({ activeWorkspaceEmail: workspaceUser.email });
+                setSelectedFolderId(null);
+                setActivePage('profiles');
+                return true;
+              } catch (error) {
+                console.error('Failed to open workspace:', error);
+                return false;
+              }
+            }}
             selectedFolderId={selectedFolderId}
             profileCounts={profileCounts}
             totalProfiles={visibleProfiles.length}

@@ -2,9 +2,12 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { autoUpdater } from 'electron-updater';
 import { Profile, Folder } from '../types';
 import { ChromeLauncher } from './chrome-launcher';
+import { resolveLaunchMode } from '../shared/launch-policy';
+import { hasAuthenticatedXSession } from '../shared/x-auth-snapshot';
 import { PuppeteerLauncher } from './puppeteer-launcher';
 import { UrlTrackingServer } from './url-server';
 import ProxyManager from './proxy-manager';
@@ -55,10 +58,67 @@ const store = new Store({
 let mainWindow: BrowserWindow | null = null;
 const profileWindows = new Map<string, BrowserWindow>();
 const urlServer = new UrlTrackingServer();
+const sessionImportWaiters = new Map<
+  string,
+  {
+    profileId: string;
+    resolve: (result: { status: string; message: string }) => void;
+    timeout: NodeJS.Timeout;
+  }
+>();
 let profileSyncBusy = false;
+let devRestartPending = false;
+let devRestartTimer: NodeJS.Timeout | null = null;
+let devRestartInProgress = false;
 
 function hasUnsafeShutdownState(): boolean {
   return PuppeteerLauncher.getActiveProfiles().length > 0 || profileSyncBusy;
+}
+
+function requestDevRestart(changedFile?: string): void {
+  if (!isDev || devRestartInProgress) return;
+  if (devRestartTimer) clearTimeout(devRestartTimer);
+  devRestartTimer = setTimeout(() => {
+    devRestartTimer = null;
+    if (hasUnsafeShutdownState()) {
+      devRestartPending = true;
+      console.log(
+        `[DevReload] Main-process change deferred until profiles are closed: ${changedFile || 'unknown'}`
+      );
+      return;
+    }
+    devRestartInProgress = true;
+    console.log(`[DevReload] Restarting Electron after change: ${changedFile || 'compiled main file'}`);
+    app.relaunch();
+    app.exit(0);
+  }, 350);
+}
+
+function startDevAutoRestart(): void {
+  if (!isDev) return;
+  const watchDirectories = [
+    path.join(app.getAppPath(), 'dist', 'src', 'main'),
+    path.join(app.getAppPath(), 'dist', 'src', 'shared'),
+  ];
+  for (const directory of watchDirectories) {
+    if (!fs.existsSync(directory)) continue;
+    try {
+      fs.watch(directory, { recursive: true }, (_, fileName) => {
+        const changedFile = String(fileName || '');
+        if (!changedFile.endsWith('.js')) return;
+        requestDevRestart(changedFile);
+      });
+      console.log(`[DevReload] Watching ${directory}`);
+    } catch (error) {
+      console.warn(`[DevReload] Could not watch ${directory}:`, error);
+    }
+  }
+  setInterval(() => {
+    if (devRestartPending && !hasUnsafeShutdownState()) {
+      devRestartPending = false;
+      requestDevRestart('deferred main-process changes');
+    }
+  }, 500);
 }
 
 function showUnsafeShutdownWarning(): void {
@@ -128,9 +188,17 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
     console.log('Extension paths count:', extensionPaths.length);
 
     // Use PuppeteerLauncher for better stealth
+    const launchMode = resolveLaunchMode({
+      launchMode: profileData.launchMode,
+      sessionImportAttemptId: profileData.sessionImport?.attemptId,
+      targetTweetUrl: profileData.targetTweetUrl,
+      autoStartTwitterBot: profileData.autoStartTwitterBot,
+    });
     const result = await PuppeteerLauncher.launch({
       profileId: profileId,
       profileName: profileData.name,
+      launchMode,
+      platform: profileData.platform,
       userAgent: profileData.userAgent,
       proxy: profileData.proxy,
       fingerprint: profileData.fingerprint,
@@ -140,6 +208,7 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
       windowLayout: profileData.windowLayout,
       autoStartTwitterBot: profileData.autoStartTwitterBot === true,
       targetTweetUrl: profileData.targetTweetUrl,
+      sessionImport: profileData.sessionImport,
     });
 
     // Check if Chrome returned an error because profile is already running
@@ -244,6 +313,7 @@ if (!gotTheLock) {
 
 app.whenReady().then(async () => {
   createWindow();
+  startDevAutoRestart();
 
   // Check for updates after window loads
   mainWindow?.webContents.once('did-finish-load', () => {
@@ -319,6 +389,13 @@ ipcMain.on('internal:save-url', (_, profileId, url) => {
 });
 
 // Handle internal cookie save event — save to synced_cookies.json for cloud sync
+function atomicWriteJson(filePath: string, value: unknown): void {
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(tempPath, JSON.stringify(value));
+  fs.renameSync(tempPath, filePath);
+}
+
 ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
   try {
     if (typeof profileId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
@@ -330,12 +407,17 @@ ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
     const userDataDir = process.platform === 'win32'
       ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
       : path.join(os.homedir(), '.antidetect-browser', 'profiles');
-    const syncedPath = path.join(userDataDir, profileId, 'synced_cookies.json');
-    const tempPath = `${syncedPath}.${process.pid}.tmp`;
-    fs.mkdirSync(path.dirname(syncedPath), { recursive: true });
-    fs.writeFileSync(tempPath, JSON.stringify(cookies));
-    fs.renameSync(tempPath, syncedPath);
-    console.log(`[CookieSync] Saved ${cookies.length} cookies for profile ${profileId}`);
+    const profileDir = path.join(userDataDir, profileId);
+    const syncedPath = path.join(profileDir, 'synced_cookies.json');
+    atomicWriteJson(syncedPath, cookies);
+    const authenticated = hasAuthenticatedXSession(cookies);
+    if (authenticated) {
+      atomicWriteJson(path.join(profileDir, 'authenticated_cookies.json'), cookies);
+    }
+    console.log(
+      `[CookieSync] Saved ${cookies.length} cookies for profile ${profileId}` +
+      (authenticated ? ' (authenticated X snapshot protected)' : ' (protected X snapshot retained)')
+    );
   } catch (e: any) {
     console.error('[CookieSync] Error saving cookies:', e.message);
   }
@@ -343,6 +425,19 @@ ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
 
 ipcMain.on('internal:launch-status', (_, payload) => {
   PuppeteerLauncher.reportLaunchStatus(payload);
+});
+
+ipcMain.on('internal:session-import-status', (_, payload) => {
+  if (!payload || typeof payload.attemptId !== 'string') return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('sessionImport:status', payload);
+  }
+  if (!['success', 'manual', 'failed'].includes(payload.status)) return;
+  const waiter = sessionImportWaiters.get(payload.attemptId);
+  if (!waiter) return;
+  clearTimeout(waiter.timeout);
+  sessionImportWaiters.delete(payload.attemptId);
+  waiter.resolve({ status: payload.status, message: payload.message || '' });
 });
 
 ipcMain.on('internal:close-profile', (_, profileId) => {
@@ -408,6 +503,83 @@ ipcMain.handle('profile:close', async (_, profileId) => {
 
 ipcMain.handle('profiles:getActive', () => {
   return PuppeteerLauncher.getActiveProfiles();
+});
+
+ipcMain.handle('sessionImport:run', async (_, profileData, credentials) => {
+  const profileId = String(profileData?.id || '');
+  assertSafeId(profileId, 'profile ID');
+  const username = String(credentials?.username || '').trim();
+  const password = String(credentials?.password || '');
+  const totpSecret = String(credentials?.totpSecret || '').replace(/[\s-]/g, '').toUpperCase();
+  if (
+    !/^@?[A-Za-z0-9_.-]{1,64}$/.test(username) ||
+    !password ||
+    password.length > 512 ||
+    !/^[A-Z2-7]+=*$/.test(totpSecret) ||
+    totpSecret.length > 128
+  ) {
+    throw new Error('Invalid session import account');
+  }
+
+  const attemptId = crypto.randomUUID();
+  urlServer.stageSessionImport(attemptId, profileId, {
+    username: username.replace(/^@/, ''),
+    password,
+    totpSecret,
+  });
+
+  const resultPromise = new Promise<{ status: string; message: string }>((resolve) => {
+    const timeout = setTimeout(() => {
+      sessionImportWaiters.delete(attemptId);
+      urlServer.clearSessionImport(attemptId);
+      resolve({ status: 'failed', message: 'Délai de connexion X dépassé' });
+    }, 3 * 60 * 1000);
+    sessionImportWaiters.set(attemptId, { profileId, resolve, timeout });
+  });
+
+  const launchResult = await launchProfileBrowser(profileId, {
+    ...profileData,
+    lastUrl: 'https://x.com/i/flow/login',
+    launchMode: 'session-import',
+    autoStartTwitterBot: false,
+    targetTweetUrl: undefined,
+    sessionImport: { attemptId },
+    windowLayout: { index: 0, total: 1 },
+  });
+  if (!launchResult.success) {
+    const waiter = sessionImportWaiters.get(attemptId);
+    if (waiter) clearTimeout(waiter.timeout);
+    sessionImportWaiters.delete(attemptId);
+    urlServer.clearSessionImport(attemptId);
+    return { status: 'failed', message: launchResult.error || 'Impossible d’ouvrir le profil' };
+  }
+
+  const result = await resultPromise;
+  urlServer.clearSessionImport(attemptId);
+  if (result.status === 'success') {
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    await PuppeteerLauncher.closeProfile(profileId).catch(() =>
+      PuppeteerLauncher.forceCloseProfile(profileId)
+    );
+  } else if (result.status === 'failed') {
+    await PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
+  }
+  return result;
+});
+
+ipcMain.handle('sessionImport:stop', async (_, profileId?: string) => {
+  if (profileId) {
+    assertSafeId(profileId, 'profile ID');
+    for (const [attemptId, waiter] of sessionImportWaiters) {
+      if (waiter.profileId !== profileId) continue;
+      clearTimeout(waiter.timeout);
+      sessionImportWaiters.delete(attemptId);
+      urlServer.clearSessionImport(attemptId);
+      waiter.resolve({ status: 'failed', message: 'Import arrêté' });
+    }
+    await PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
+  }
+  return true;
 });
 
 ipcMain.handle('profile:forceClose', async (_, profileId) => {
@@ -634,6 +806,10 @@ ipcMain.handle('profile:getLocalSyncVersion', (_, profileId: string) => {
 ipcMain.handle('profile:setLocalSyncVersion', (_, profileId: string, version: number) => {
   setLocalSyncVersion(profileId, version);
   return true;
+});
+
+ipcMain.handle('profile:hasAuthenticatedXSnapshot', (_, profileId: string) => {
+  return PuppeteerLauncher.hasAuthenticatedXSnapshot(profileId);
 });
 
 ipcMain.handle('profile:getLocalSyncRevision', (_, profileId: string) => {
