@@ -454,7 +454,8 @@ test('proxy imports ignore duplicates without merging distinct provider credenti
   assert.match(identity, /proxy\.username/);
   assert.doesNotMatch(identity, /proxy\.password/);
   assert.match(identity, /SHA-256/);
-  assert.match(proxyPage, /new Set\(proxies\.map\(proxyIdentityKey\)\)/);
+  assert.match(proxyPage, /filter\(proxy => !teamId \|\| proxy\.teamId === teamId\)/);
+  assert.match(proxyPage, /\.map\(proxyIdentityKey\)/);
   assert.match(proxyPage, /knownKeys\.has\(key\)/);
   assert.match(proxyPage, /const bulkAnalysis = analyzeBulkProxyText\(\)/);
   assert.match(proxyPage, /Doublons ignorés/);
@@ -1009,4 +1010,17 @@ test('development mode hot-reloads React and safely restarts Electron main chang
   assert.match(main, /fs\.watch\(directory, \{ recursive: true \}/);
   assert.match(main, /if \(hasUnsafeShutdownState\(\)\) \{\s*devRestartPending = true/);
   assert.match(main, /app\.relaunch\(\);\s*app\.exit\(0\)/);
+});
+
+test('deleting proxies also detaches every assigned profile', () => {
+  const proxyManager = read('desktop-app/src/renderer/pages/ProxyManager.tsx');
+  const firestore = read('desktop-app/src/renderer/services/firestore-service.ts');
+
+  assert.match(proxyManager, /filter\(proxy => !teamId \|\| proxy\.teamId === teamId\)/);
+  assert.match(proxyManager, /assignedProfileIdsFor/);
+  assert.match(proxyManager, /firestoreDeleteProxy\(proxyId, assignedProfileIds\)/);
+  assert.match(proxyManager, /deleteProxiesBulk\(ids, assignedProfileIds\)/);
+  assert.match(firestore, /proxy:\s*null/);
+  assert.match(firestore, /connectionType:\s*'system'/);
+  assert.match(firestore, /connectionConfig:\s*\{\s*type:\s*'system'\s*\}/);
 });

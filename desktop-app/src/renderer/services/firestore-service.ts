@@ -481,16 +481,40 @@ export async function updateProxy(proxyId: string, data: Partial<FirestoreProxy>
   });
 }
 
-export async function deleteProxy(proxyId: string): Promise<void> {
-  await deleteDoc(doc(db, PROXIES_COLLECTION, proxyId));
+const PROXY_DELETE_BATCH_SIZE = 450;
+
+export async function deleteProxy(
+  proxyId: string,
+  assignedProfileIds: string[] = []
+): Promise<void> {
+  await deleteProxiesBulk([proxyId], assignedProfileIds);
 }
 
-export async function deleteProxiesBulk(proxyIds: string[]): Promise<void> {
-  const batch = writeBatch(db);
-  for (const id of proxyIds) {
-    batch.delete(doc(db, PROXIES_COLLECTION, id));
+export async function deleteProxiesBulk(
+  proxyIds: string[],
+  assignedProfileIds: string[] = []
+): Promise<void> {
+  const operations = [
+    ...Array.from(new Set(assignedProfileIds)).map(id => ({ type: 'profile' as const, id })),
+    ...Array.from(new Set(proxyIds)).map(id => ({ type: 'proxy' as const, id })),
+  ];
+
+  for (let offset = 0; offset < operations.length; offset += PROXY_DELETE_BATCH_SIZE) {
+    const batch = writeBatch(db);
+    for (const operation of operations.slice(offset, offset + PROXY_DELETE_BATCH_SIZE)) {
+      if (operation.type === 'profile') {
+        batch.update(doc(db, PROFILES_COLLECTION, operation.id), {
+          proxy: null,
+          connectionType: 'system',
+          connectionConfig: { type: 'system' },
+          updatedAt: new Date().toISOString(),
+        });
+      } else {
+        batch.delete(doc(db, PROXIES_COLLECTION, operation.id));
+      }
+    }
+    await batch.commit();
   }
-  await batch.commit();
 }
 
 // ── Migration: assign teamId to existing data ──────────────────

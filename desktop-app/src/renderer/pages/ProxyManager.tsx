@@ -126,7 +126,11 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
   const analyzeBulkProxyText = () => {
     const lines = bulkProxies.split('\n').filter(line => line.trim());
     const parsed: Omit<Proxy, 'id'>[] = [];
-    const knownKeys = new Set(proxies.map(proxyIdentityKey));
+    const knownKeys = new Set(
+      proxies
+        .filter(proxy => !teamId || proxy.teamId === teamId)
+        .map(proxyIdentityKey)
+    );
     let invalid = 0;
     let duplicates = 0;
     for (const line of lines) {
@@ -245,26 +249,70 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
     showToast(`Tested ${selected.length} proxies`, 'success');
   };
 
+  const assignedProfileIdsFor = (targetProxies: Proxy[]) => {
+    const proxyKeys = new Set(targetProxies.map(proxy =>
+      `${proxy.teamId || ''}|${proxyIdentityKey(proxy)}`
+    ));
+
+    return profiles
+      .filter(profile => {
+        const assignedProxy = profile.proxy || profile.connectionConfig?.proxy;
+        if (!assignedProxy?.host) return false;
+        return proxyKeys.has(`${profile.teamId || ''}|${proxyIdentityKey(assignedProxy)}`);
+      })
+      .map(profile => profile.id);
+  };
+
   const removeProxy = async (proxyId: string) => {
     try {
-      await firestoreDeleteProxy(proxyId);
+      const proxy = proxies.find(item => item.id === proxyId);
+      if (!proxy) return;
+      const assignedProfileIds = assignedProfileIdsFor([proxy]);
+      if (
+        assignedProfileIds.length > 0 &&
+        !confirm(`Remove this proxy and detach it from ${assignedProfileIds.length} instance(s)?`)
+      ) {
+        return;
+      }
+      await firestoreDeleteProxy(proxyId, assignedProfileIds);
       setSelectedProxies(prev => {
         const next = new Set(prev);
         next.delete(proxyId);
         return next;
       });
+      showToast(
+        assignedProfileIds.length > 0
+          ? `Proxy removed from ${assignedProfileIds.length} instance(s)`
+          : 'Proxy removed',
+        'success'
+      );
     } catch (error) {
       console.error('Failed to remove proxy:', error);
+      showToast('Failed to remove proxy', 'error');
     }
   };
 
   const removeSelected = async () => {
     const count = selectedProxies.size;
-    if (!confirm(`Remove ${count} proxies?`)) return;
     const ids = Array.from(selectedProxies);
-    await deleteProxiesBulk(ids);
-    setSelectedProxies(new Set());
-    showToast(`Removed ${count} proxies`, 'success');
+    const targetProxies = proxies.filter(proxy => selectedProxies.has(proxy.id));
+    const assignedProfileIds = assignedProfileIdsFor(targetProxies);
+    const detachMessage = assignedProfileIds.length > 0
+      ? ` and detach them from ${assignedProfileIds.length} instance(s)`
+      : '';
+    if (!confirm(`Remove ${count} proxies${detachMessage}?`)) return;
+    try {
+      await deleteProxiesBulk(ids, assignedProfileIds);
+      setSelectedProxies(new Set());
+      showToast(
+        `Removed ${count} proxies` +
+          (assignedProfileIds.length > 0 ? ` from ${assignedProfileIds.length} instance(s)` : ''),
+        'success'
+      );
+    } catch (error) {
+      console.error('Bulk proxy removal failed:', error);
+      showToast('Failed to remove selected proxies', 'error');
+    }
   };
 
   // Assign a specific proxy to a specific profile
