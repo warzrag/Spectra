@@ -1,6 +1,7 @@
 import { collection, addDoc, getDocs, query, orderBy, limit, where, startAfter, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, Unsubscribe } from 'firebase/firestore';
 import { db } from './firebase';
 import { ActivityLogEntry, UserProfile, Profile, Folder, Extension, Team } from '../../types';
+import { proxyDocumentId } from '../../shared/proxy-identity';
 
 const ACTIVITY_COLLECTION = 'activityLogs';
 const USERS_COLLECTION = 'users';
@@ -437,7 +438,9 @@ export async function createProxy(proxyData: Omit<FirestoreProxy, 'id'>, userId:
     createdAt: now,
     updatedAt: now,
   };
-  const docRef = await addDoc(collection(db, PROXIES_COLLECTION), data);
+  const deterministicId = await proxyDocumentId(teamId, proxyData);
+  const docRef = doc(db, PROXIES_COLLECTION, deterministicId);
+  await setDoc(docRef, data, { merge: true });
   return { id: docRef.id, ...data } as FirestoreProxy;
 }
 
@@ -449,7 +452,8 @@ export async function createProxiesBulk(proxies: Omit<FirestoreProxy, 'id'>[], u
 
   for (const proxy of proxies) {
     try {
-      const docRef = doc(collection(db, PROXIES_COLLECTION));
+      const deterministicId = await proxyDocumentId(teamId, proxy);
+      const docRef = doc(db, PROXIES_COLLECTION, deterministicId);
       batch.set(docRef, {
         ...proxy,
         teamId,

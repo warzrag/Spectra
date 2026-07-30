@@ -2,9 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Plus, Trash2, RefreshCw, CheckCircle, XCircle, Download, Shield, Globe, X, Shuffle, Search, Copy, AlertCircle, Zap, Clock, Filter, ChevronDown, Link2, Unlink, FolderOpen } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Profile, Folder } from '../../types';
+import { proxyIdentityKey } from '../../shared/proxy-identity';
 import {
   subscribeToProxies,
-  createProxy as firestoreCreateProxy,
   createProxiesBulk,
   updateProxy as firestoreUpdateProxy,
   deleteProxy as firestoreDeleteProxy,
@@ -123,21 +123,36 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
     return null;
   };
 
+  const analyzeBulkProxyText = () => {
+    const lines = bulkProxies.split('\n').filter(line => line.trim());
+    const parsed: Omit<Proxy, 'id'>[] = [];
+    const knownKeys = new Set(proxies.map(proxyIdentityKey));
+    let invalid = 0;
+    let duplicates = 0;
+    for (const line of lines) {
+      const proxy = parseProxyString(line.trim());
+      if (!proxy) {
+        invalid++;
+        continue;
+      }
+      const key = proxyIdentityKey(proxy);
+      if (knownKeys.has(key)) {
+        duplicates++;
+        continue;
+      }
+      knownKeys.add(key);
+      parsed.push(proxy);
+    }
+    return { parsed, duplicates, invalid, total: lines.length };
+  };
+
+  const bulkAnalysis = analyzeBulkProxyText();
+
   const handleAddBulkProxies = async () => {
     if (!bulkProxies.trim()) return;
     setAdding(true);
     try {
-      const lines = bulkProxies.split('\n').filter(l => l.trim());
-      const parsed: Omit<Proxy, 'id'>[] = [];
-      let failed = 0;
-      for (const line of lines) {
-        const proxy = parseProxyString(line.trim());
-        if (proxy) {
-          parsed.push(proxy);
-        } else {
-          failed++;
-        }
-      }
+      const { parsed, duplicates, invalid: failed } = analyzeBulkProxyText();
       if (parsed.length > 0) {
         // Clean undefined values (Firestore doesn't accept undefined)
         const cleaned = parsed.map(p => {
@@ -149,11 +164,12 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
         });
         await createProxiesBulk(cleaned, userId || 'unknown', teamId || '');
       }
-      if (failed > 0) {
-        showToast(`Added ${parsed.length} proxies, ${failed} failed (invalid format)`, parsed.length > 0 ? 'success' : 'error');
-      } else {
-        showToast(`Added ${parsed.length} proxies successfully`, 'success');
-      }
+      const summary = [
+        `${parsed.length} ajouté${parsed.length !== 1 ? 's' : ''}`,
+        duplicates ? `${duplicates} doublon${duplicates !== 1 ? 's' : ''} ignoré${duplicates !== 1 ? 's' : ''}` : '',
+        failed ? `${failed} ligne${failed !== 1 ? 's' : ''} invalide${failed !== 1 ? 's' : ''}` : '',
+      ].filter(Boolean).join(', ');
+      showToast(summary, parsed.length > 0 ? 'success' : duplicates > 0 && failed === 0 ? 'info' : 'error');
       setBulkProxies('');
       setAddProxyFolderId('');
       setShowAddModal(false);
@@ -1137,6 +1153,31 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
                   </span>
                 )}
               </div>
+              {bulkAnalysis.total > 0 && (
+                <div
+                  className="mt-3 grid grid-cols-3 gap-2 rounded-xl p-3"
+                  style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}
+                >
+                  <div className="text-center">
+                    <div className="text-sm font-bold" style={{ color: 'var(--success)' }}>
+                      {bulkAnalysis.parsed.length}
+                    </div>
+                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>À ajouter</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-sm font-bold" style={{ color: 'var(--warning)' }}>
+                      {bulkAnalysis.duplicates}
+                    </div>
+                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Doublons ignorés</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-sm font-bold" style={{ color: 'var(--danger)' }}>
+                      {bulkAnalysis.invalid}
+                    </div>
+                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Invalides</div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="px-6 py-4 flex justify-end gap-3" style={{ borderTop: '1px solid var(--border-subtle)' }}>
@@ -1146,11 +1187,13 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
                 Cancel
               </button>
               <button onClick={handleAddBulkProxies}
-                disabled={lineCount === 0 || adding}
+                disabled={bulkAnalysis.parsed.length === 0 || adding}
                 className="px-4 py-2 rounded-lg text-[13px] font-semibold text-white transition-all flex items-center gap-2 disabled:opacity-40"
                 style={{ background: 'var(--accent)' }}>
                 {adding ? <RefreshCw size={14} className="animate-spin" /> : <Plus size={14} />}
-                {adding ? 'Adding...' : `Add ${lineCount > 0 ? `${lineCount} Prox${lineCount > 1 ? 'ies' : 'y'}` : 'Proxies'}`}
+                {adding
+                  ? 'Adding...'
+                  : `Add ${bulkAnalysis.parsed.length} ${bulkAnalysis.parsed.length === 1 ? 'Proxy' : 'Proxies'}`}
               </button>
             </div>
           </div>

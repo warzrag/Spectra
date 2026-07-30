@@ -1189,16 +1189,6 @@ public class Win32 {
           `--window-position=${manualPlacementCorrection.left},${manualPlacementCorrection.top}`
         );
       }
-      const deviceScaleFactor = Number(effectiveFingerprint.devicePixelRatio);
-      if (
-        Number.isFinite(deviceScaleFactor) &&
-        deviceScaleFactor >= 0.5 &&
-        deviceScaleFactor <= 4
-      ) {
-        // Align Chrome's native hit-testing coordinates with the scale exposed
-        // to page scripts by the fingerprint runtime.
-        args.push(`--force-device-scale-factor=${deviceScaleFactor}`);
-      }
       // Force User-Agent to match fingerprint (consistent across Mac/Windows)
       if (userAgent) {
         args.push(`--user-agent=${userAgent}`);

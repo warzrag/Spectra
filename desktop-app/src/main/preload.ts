@@ -5,6 +5,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   diagnostics: {
     getEnvironment: () => ipcRenderer.invoke('diagnostics:environment'),
   },
+  vaManager: {
+    status: () => ipcRenderer.invoke('vaManager:status'),
+    connect: (email: string, password: string) =>
+      ipcRenderer.invoke('vaManager:connect', email, password),
+    disconnect: () => ipcRenderer.invoke('vaManager:disconnect'),
+    listOrganizations: () => ipcRenderer.invoke('vaManager:listOrganizations'),
+    listAccounts: (organizationId?: string) =>
+      ipcRenderer.invoke('vaManager:listAccounts', organizationId),
+  },
 
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
@@ -44,6 +53,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   sessionImport: {
     run: (profileData: any, credentials: any) =>
       ipcRenderer.invoke('sessionImport:run', profileData, credentials),
+    runVaManager: (profileData: any, organizationId: string, accountId: string) =>
+      ipcRenderer.invoke('sessionImport:runVaManager', profileData, organizationId, accountId),
     stop: (profileId?: string) => ipcRenderer.invoke('sessionImport:stop', profileId),
     onStatus: (callback: (payload: any) => void) => {
       const listener = (_event: any, payload: any) => callback(payload);

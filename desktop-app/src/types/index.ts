@@ -1,4 +1,4 @@
-export type AppPage = 'profiles' | 'proxies' | 'extensions' | 'settings' | 'diagnostics' | 'activity' | 'recycle-bin' | 'billing' | 'members' | 'admin-panel';
+export type AppPage = 'profiles' | 'va-manager' | 'proxies' | 'extensions' | 'settings' | 'diagnostics' | 'activity' | 'recycle-bin' | 'billing' | 'members' | 'admin-panel';
 
 export type UserRole = 'super_admin' | 'owner' | 'admin' | 'va';
 
@@ -84,6 +84,10 @@ export interface Profile {
   updatedAt?: string;
   lastUsed?: string;
   lastUrl?: string;
+  vaManagerAccountId?: string | null;
+  vaManagerLoginStatus?: 'pending' | 'connected' | 'manual' | 'failed';
+  vaManagerLoginMessage?: string;
+  vaManagerLastLoginAt?: string;
 
   // Cloud sync
   cloudStorageUrl?: string;
@@ -141,6 +145,35 @@ export interface AppSettings {
   sortBy: 'name' | 'created' | 'lastUsed' | 'custom';
   sortOrder: 'asc' | 'desc';
   activeWorkspaceEmail?: string;
+}
+
+export interface VaManagerOrganization {
+  id: string;
+  name: string;
+}
+
+export interface VaManagerConnectionStatus {
+  connected: boolean;
+  email?: string;
+  primaryOrganizationId?: string;
+}
+
+export interface VaManagerAccount {
+  id: string;
+  organizationId?: string;
+  username: string;
+  status: 'active' | 'shadowban' | 'banned' | 'error' | string;
+  followers: number | null;
+  followersUpdatedAt?: string;
+  lastScannedAt?: string;
+  lastScanError?: string;
+  hasPassword: boolean;
+  passwordUsable: boolean;
+  hasTwoFa: boolean;
+  hasAuthToken: boolean;
+  hasEmail: boolean;
+  hasEmailPassword: boolean;
+  emailPasswordUsable: boolean;
 }
 
 export interface StoreData {

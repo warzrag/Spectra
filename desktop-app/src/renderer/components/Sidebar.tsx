@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, Crown, Activity } from 'lucide-react';
+import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, Crown, Activity, Database } from 'lucide-react';
 import { Folder as FolderType, Team, AppPage } from '../../types';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -73,6 +73,7 @@ const Sidebar: React.FC<SidebarProps> = ({
   // Main navigation items
   const mainNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean }[] = [
     { page: 'profiles', label: 'Instances', icon: <Users size={18} /> },
+    { page: 'va-manager', label: 'VA Manager', icon: <Database size={18} />, adminOnly: true },
     { page: 'proxies', label: 'Proxies', icon: <Globe size={18} />, adminOnly: true },
     { page: 'extensions', label: 'Extensions', icon: <Puzzle size={18} />, adminOnly: true },
     { page: 'diagnostics', label: 'Diagnostics', icon: <Activity size={18} /> },

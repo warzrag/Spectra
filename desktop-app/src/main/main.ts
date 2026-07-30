@@ -23,6 +23,14 @@ import {
   getLocalSyncRevision,
   setLocalSyncRevision,
 } from './profile-sync';
+import {
+  connectVaManager,
+  disconnectVaManager,
+  getVaManagerSessionImportCredentials,
+  getVaManagerConnectionStatus,
+  listVaManagerAccounts,
+  listVaManagerOrganizations,
+} from './va-manager-client';
 
 const Store = require('electron-store');
 
@@ -455,6 +463,27 @@ ipcMain.handle('app:getVersion', () => {
   return app.getVersion();
 });
 
+ipcMain.handle('vaManager:status', () => {
+  return getVaManagerConnectionStatus(store);
+});
+
+ipcMain.handle('vaManager:connect', async (_, email: string, password: string) => {
+  return connectVaManager(store, email, password);
+});
+
+ipcMain.handle('vaManager:disconnect', () => {
+  disconnectVaManager(store);
+  return true;
+});
+
+ipcMain.handle('vaManager:listOrganizations', () => {
+  return listVaManagerOrganizations(store);
+});
+
+ipcMain.handle('vaManager:listAccounts', (_, organizationId?: string) => {
+  return listVaManagerAccounts(store, organizationId);
+});
+
 ipcMain.handle('diagnostics:environment', () => {
   return PuppeteerLauncher.diagnoseEnvironment();
 });
@@ -505,7 +534,10 @@ ipcMain.handle('profiles:getActive', () => {
   return PuppeteerLauncher.getActiveProfiles();
 });
 
-ipcMain.handle('sessionImport:run', async (_, profileData, credentials) => {
+async function runSessionImport(
+  profileData: any,
+  credentials: { username: string; password: string; totpSecret: string }
+): Promise<{ status: string; message: string }> {
   const profileId = String(profileData?.id || '');
   assertSafeId(profileId, 'profile ID');
   const username = String(credentials?.username || '').trim();
@@ -565,7 +597,30 @@ ipcMain.handle('sessionImport:run', async (_, profileData, credentials) => {
     await PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
   }
   return result;
+}
+
+ipcMain.handle('sessionImport:run', async (_, profileData, credentials) => {
+  return runSessionImport(profileData, credentials);
 });
+
+ipcMain.handle(
+  'sessionImport:runVaManager',
+  async (_, profileData, organizationId: string, accountId: string) => {
+    assertSafeId(String(organizationId || ''), 'organization ID');
+    assertSafeId(String(accountId || ''), 'VA Manager account ID');
+    const credentials = await getVaManagerSessionImportCredentials(
+      store,
+      organizationId,
+      accountId
+    );
+    try {
+      return await runSessionImport(profileData, credentials);
+    } finally {
+      credentials.password = '';
+      credentials.totpSecret = '';
+    }
+  }
+);
 
 ipcMain.handle('sessionImport:stop', async (_, profileId?: string) => {
   if (profileId) {

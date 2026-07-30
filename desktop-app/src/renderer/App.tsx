@@ -9,6 +9,7 @@ import RecycleBinPage from './pages/RecycleBinPage';
 import BillingPage from './pages/BillingPage';
 import MembersPage from './pages/MembersPage';
 import AdminPage from './pages/AdminPage';
+import VaManagerPage from './pages/VaManagerPage';
 import LoginPage from './pages/LoginPage';
 import TitleBar from './components/TitleBar';
 import Sidebar from './components/Sidebar';
@@ -39,7 +40,18 @@ import {
   deleteFolder as firestoreDeleteFolder,
   migrateLocalProfiles,
 } from './services/firestore-service';
-import { Profile, Folder, Extension, Team, AppPage, AppSettings, AppUser } from '../types';
+import {
+  Profile,
+  Folder,
+  Extension,
+  Team,
+  AppPage,
+  AppSettings,
+  AppUser,
+  VaManagerAccount,
+  VaManagerConnectionStatus,
+  VaManagerOrganization,
+} from '../types';
 import {
   uploadProfileToCloud,
   downloadProfileFromCloud,
@@ -54,6 +66,7 @@ import {
   parseSessionImportFile,
   SessionImportProgress,
 } from '../shared/session-import';
+import { proxyIdentityKey } from '../shared/proxy-identity';
 
 declare global {
   interface Window {
@@ -61,6 +74,13 @@ declare global {
       getVersion: () => Promise<string>;
       diagnostics?: {
         getEnvironment: () => Promise<any>;
+      };
+      vaManager: {
+        status: () => Promise<VaManagerConnectionStatus>;
+        connect: (email: string, password: string) => Promise<VaManagerConnectionStatus>;
+        disconnect: () => Promise<boolean>;
+        listOrganizations: () => Promise<VaManagerOrganization[]>;
+        listAccounts: (organizationId?: string) => Promise<VaManagerAccount[]>;
       };
       window: {
         minimize: () => void;
@@ -86,6 +106,11 @@ declare global {
         run: (
           profileData: any,
           credentials: { username: string; password: string; totpSecret: string }
+        ) => Promise<{ status: 'success' | 'manual' | 'failed'; message: string }>;
+        runVaManager: (
+          profileData: any,
+          organizationId: string,
+          accountId: string
         ) => Promise<{ status: 'success' | 'manual' | 'failed'; message: string }>;
         stop: (profileId?: string) => Promise<boolean>;
         onStatus: (callback: (payload: {
@@ -769,12 +794,12 @@ function App() {
 
     const usageByProxy = new Map<string, number>();
     for (const profile of profiles.filter(profile => !profile.deleted && profile.proxy?.host)) {
-      const key = `${profile.proxy!.host.toLowerCase()}:${profile.proxy!.port}`;
+      const key = proxyIdentityKey(profile.proxy!);
       usageByProxy.set(key, (usageByProxy.get(key) || 0) + 1);
     }
     const uniqueCandidates = new Map<string, FirestoreProxy>();
     for (const proxy of proxies) {
-      const key = `${proxy.host.toLowerCase()}:${proxy.port}`;
+      const key = proxyIdentityKey(proxy);
       if ((usageByProxy.get(key) || 0) < 3 && !uniqueCandidates.has(key)) {
         uniqueCandidates.set(key, proxy);
       }
@@ -795,7 +820,7 @@ function App() {
       const validSlots: FirestoreProxy[] = [];
       for (const proxy of candidates) {
         if (run.cancelled) return;
-        const key = `${proxy.host.toLowerCase()}:${proxy.port}`;
+        const key = proxyIdentityKey(proxy);
         const remaining = Math.max(0, 3 - (usageByProxy.get(key) || 0));
         let testResult: any = false;
         try {
@@ -836,23 +861,29 @@ function App() {
         const fingerprint = await window.electronAPI.fingerprint.generate(
           'windows',
           'chrome',
-          proxy.country
+          proxy.country || 'US'
         );
+        const usFingerprint = {
+          ...(fingerprint || {}),
+          language: 'en-US',
+          languages: ['en-US', 'en'],
+        };
         const proxyData = {
           type: proxy.type,
           host: proxy.host,
           port: proxy.port,
           username: proxy.username,
           password: proxy.password,
+          country: proxy.country || 'US',
         };
         const profile = await firestoreCreateProfile({
           name: `X — ${account.username}`,
           platform: 'twitter',
-          userAgent: fingerprint?.userAgent || '',
-          timezone: fingerprint?.timezone || 'UTC',
-          language: fingerprint?.language || 'en-US',
-          screenResolution: fingerprint?.screenResolution || '1920x1080',
-          fingerprint: fingerprint || {},
+          userAgent: usFingerprint.userAgent || '',
+          timezone: usFingerprint.timezone || 'UTC',
+          language: 'en-US',
+          screenResolution: usFingerprint.screenResolution || '1920x1080',
+          fingerprint: usFingerprint,
           os: 'windows',
           browserType: 'chrome',
           connectionType: 'proxy',
@@ -993,6 +1024,364 @@ function App() {
     } catch (error) {
       console.error('Failed to update profile:', error);
       showToast('Failed to update profile', 'error');
+    }
+  };
+
+  const handleUpdateVaManagerLink = async (
+    profileId: string,
+    profileData: Partial<Profile>
+  ) => {
+    try {
+      await firestoreUpdateProfile(profileId, profileData);
+      showToast(
+        profileData.vaManagerAccountId ? 'Liaison VA Manager enregistrée' : 'Liaison VA Manager supprimée',
+        'success'
+      );
+    } catch (error) {
+      console.error('Failed to update VA Manager link:', error);
+      showToast('Impossible d’enregistrer la liaison VA Manager', 'error');
+      throw error;
+    }
+  };
+
+  const handleCreateVaManagerInstances = async (
+    accounts: VaManagerAccount[],
+    organizationId: string
+  ): Promise<{ successful: number; failed: number; manual: boolean; message: string }> => {
+    if (!user || !window.electronAPI.sessionImport?.runVaManager) {
+      throw new Error('Connexion automatique VA Manager indisponible');
+    }
+    if (sessionImportRunRef.current) {
+      throw new Error('Une création ou connexion est déjà en cours');
+    }
+
+    const existingAccountIds = new Set(
+      profiles
+        .filter(profile => !profile.deleted && profile.vaManagerAccountId)
+        .map(profile => profile.vaManagerAccountId as string)
+    );
+    const pendingAccounts = accounts.filter(account => !existingAccountIds.has(account.id));
+    if (pendingAccounts.length === 0) {
+      return {
+        successful: 0,
+        failed: 0,
+        manual: false,
+        message: 'Toutes les instances sélectionnées existent déjà',
+      };
+    }
+
+    const usageByProxy = new Map<string, number>();
+    for (const profile of profiles.filter(profile => !profile.deleted && profile.proxy?.host)) {
+      const key = proxyIdentityKey(profile.proxy!);
+      usageByProxy.set(key, (usageByProxy.get(key) || 0) + 1);
+    }
+    const uniqueCandidates = new Map<string, FirestoreProxy>();
+    for (const proxy of proxies) {
+      const key = proxyIdentityKey(proxy);
+      if ((usageByProxy.get(key) || 0) < 3 && !uniqueCandidates.has(key)) {
+        uniqueCandidates.set(key, proxy);
+      }
+    }
+
+    setSessionImportProgress({
+      running: true,
+      total: pendingAccounts.length,
+      current: 0,
+      status: 'testing-proxy',
+      message: 'Vérification de la capacité des proxies',
+    });
+    const run = { cancelled: false, profileId: undefined as string | undefined };
+    let currentCreatedProfile: Profile | null = null;
+    sessionImportRunRef.current = run;
+
+    try {
+      const validSlots: FirestoreProxy[] = [];
+      for (const proxy of uniqueCandidates.values()) {
+        if (run.cancelled) break;
+        const key = proxyIdentityKey(proxy);
+        const remaining = Math.max(0, 3 - (usageByProxy.get(key) || 0));
+        let testResult: any = false;
+        try {
+          testResult = await window.electronAPI.proxy.test(proxy);
+        } catch {}
+        const healthy = typeof testResult === 'boolean'
+          ? testResult
+          : testResult?.isHealthy === true;
+        if (healthy) {
+          for (let index = 0; index < remaining; index++) validSlots.push(proxy);
+        }
+      }
+      if (validSlots.length === 0) {
+        throw new Error(
+          'Aucune place proxy valide disponible'
+        );
+      }
+
+      const accountsToProcess = pendingAccounts.slice(0, validSlots.length);
+      const deferredCount = pendingAccounts.length - accountsToProcess.length;
+      let successful = 0;
+      let failed = 0;
+      for (let index = 0; index < accountsToProcess.length; index++) {
+        if (run.cancelled) break;
+        const account = accountsToProcess[index];
+        const proxy = validSlots[index];
+        setSessionImportProgress({
+          running: true,
+          total: accountsToProcess.length,
+          current: index + 1,
+          username: account.username,
+          status: 'creating',
+          message: `Création de @${account.username} (${index + 1}/${accountsToProcess.length})`,
+        });
+
+        const fingerprint = await window.electronAPI.fingerprint.generate(
+          'windows',
+          'chrome',
+          proxy.country || 'US'
+        );
+        const usFingerprint = {
+          ...(fingerprint || {}),
+          language: 'en-US',
+          languages: ['en-US', 'en'],
+        };
+        const proxyData = {
+          type: proxy.type,
+          host: proxy.host,
+          port: proxy.port,
+          username: proxy.username,
+          password: proxy.password,
+          country: proxy.country || 'US',
+        };
+        const profile = await firestoreCreateProfile({
+          name: `X — ${account.username}`,
+          platform: 'twitter',
+          vaManagerAccountId: account.id,
+          vaManagerLoginStatus: 'pending',
+          vaManagerLoginMessage: 'Première connexion en attente',
+          userAgent: usFingerprint.userAgent || '',
+          timezone: usFingerprint.timezone || 'UTC',
+          language: 'en-US',
+          screenResolution: usFingerprint.screenResolution || '1920x1080',
+          fingerprint: usFingerprint,
+          os: 'windows',
+          browserType: 'chrome',
+          connectionType: 'proxy',
+          connectionConfig: { type: 'proxy', proxy: proxyData },
+          proxy: proxyData,
+          folderId: selectedFolderId || undefined,
+          lastUrl: 'https://x.com/home',
+          status: 'none',
+          tags: ['va-manager'],
+          createdAt: new Date().toISOString(),
+        } as any, user.uid, activeWorkspaceTeamId || user.teamId);
+        currentCreatedProfile = profile;
+        run.profileId = profile.id;
+
+        logActivity({
+          teamId: activeWorkspaceTeamId || user.teamId,
+          userId: user.uid,
+          userName: user.email,
+          action: 'profile_created',
+          targetProfileId: profile.id,
+          targetProfileName: profile.name,
+          timestamp: new Date().toISOString(),
+          metadata: { source: 'va-manager', vaManagerAccountId: account.id },
+        }).catch(() => {});
+
+        await acquireProfileLock(
+          profile.id,
+          { uid: user.uid, email: user.email },
+          currentInstallationId
+        );
+        setSessionImportProgress(previous => previous ? {
+          ...previous,
+          profileId: profile.id,
+          status: 'launching',
+          message: `Première connexion de @${account.username}`,
+        } : previous);
+
+        let result: { status: 'success' | 'manual' | 'failed'; message: string };
+        try {
+          result = await window.electronAPI.sessionImport.runVaManager(
+            profile,
+            organizationId,
+            account.id
+          );
+        } catch (connectionError) {
+          failed++;
+          const connectionMessage = connectionError instanceof Error
+            ? connectionError.message
+            : 'Connexion X interrompue';
+          await firestoreUpdateProfile(profile.id, {
+            vaManagerLoginStatus: 'failed',
+            vaManagerLoginMessage: connectionMessage,
+            vaManagerLastLoginAt: new Date().toISOString(),
+          }).catch(() => {});
+          await window.electronAPI.sessionImport.stop(profile.id).catch(() => {});
+          run.profileId = undefined;
+          currentCreatedProfile = null;
+          continue;
+        }
+        if (result.status === 'manual') {
+          await firestoreUpdateProfile(profile.id, {
+            vaManagerLoginStatus: 'manual',
+            vaManagerLoginMessage: result.message || 'Vérification manuelle requise',
+            vaManagerLastLoginAt: new Date().toISOString(),
+          });
+          setSessionImportProgress(previous => previous ? {
+            ...previous,
+            running: false,
+            status: 'manual',
+            message: result.message || 'Vérification manuelle requise',
+          } : previous);
+          return {
+            successful,
+            failed,
+            manual: true,
+            message: `Vérification manuelle requise pour @${account.username}`,
+          };
+        }
+        if (result.status === 'success') {
+          successful++;
+          await firestoreUpdateProfile(profile.id, {
+            vaManagerLoginStatus: 'connected',
+            vaManagerLoginMessage: result.message || 'Connexion X confirmée',
+            vaManagerLastLoginAt: new Date().toISOString(),
+          });
+        } else {
+          failed++;
+          await firestoreUpdateProfile(profile.id, {
+            vaManagerLoginStatus: 'failed',
+            vaManagerLoginMessage: result.message || 'Connexion X non confirmée',
+            vaManagerLastLoginAt: new Date().toISOString(),
+          });
+        }
+        run.profileId = undefined;
+        currentCreatedProfile = null;
+      }
+
+      const message = `${successful} instance(s) créée(s) et connectée(s)` +
+        (failed ? `, ${failed} échec(s)` : '') +
+        (deferredCount ? `, ${deferredCount} en attente de proxy` : '');
+      setSessionImportProgress({
+        running: false,
+        total: accountsToProcess.length,
+        current: accountsToProcess.length,
+        status: failed ? 'failed' : 'success',
+        message,
+      });
+      showToast(message, failed ? 'warning' : 'success');
+      return { successful, failed, manual: false, message };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Création VA Manager interrompue';
+      setSessionImportProgress(previous => previous ? {
+        ...previous,
+        running: false,
+        status: 'failed',
+        message,
+      } : previous);
+      showToast(message, 'error');
+      if (currentCreatedProfile) {
+        await firestoreUpdateProfile(currentCreatedProfile.id, {
+          vaManagerLoginStatus: 'failed',
+          vaManagerLoginMessage: message,
+          vaManagerLastLoginAt: new Date().toISOString(),
+        }).catch(() => {});
+      }
+      if (run.profileId) {
+        await window.electronAPI.sessionImport.stop(run.profileId).catch(() => {});
+      }
+      throw error;
+    } finally {
+      if (sessionImportRunRef.current === run) sessionImportRunRef.current = null;
+    }
+  };
+
+  const handleRetryVaManagerConnection = async (
+    account: VaManagerAccount,
+    organizationId: string,
+    profile: Profile
+  ): Promise<{ status: 'success' | 'manual' | 'failed'; message: string }> => {
+    if (!user || !window.electronAPI.sessionImport?.runVaManager) {
+      throw new Error('Connexion automatique VA Manager indisponible');
+    }
+    if (!profile.proxy?.host) {
+      throw new Error('Un proxy doit être assigné avant de relancer la connexion');
+    }
+    if (sessionImportRunRef.current) {
+      throw new Error('Une création ou connexion est déjà en cours');
+    }
+
+    const run = { cancelled: false, profileId: profile.id };
+    sessionImportRunRef.current = run;
+    setSessionImportProgress({
+      running: true,
+      total: 1,
+      current: 1,
+      profileId: profile.id,
+      username: account.username,
+      status: 'launching',
+      message: `Nouvelle tentative de connexion pour @${account.username}`,
+    });
+    await firestoreUpdateProfile(profile.id, {
+      vaManagerLoginStatus: 'pending',
+      vaManagerLoginMessage: 'Nouvelle tentative en cours',
+    });
+
+    try {
+      await acquireProfileLock(
+        profile.id,
+        { uid: user.uid, email: user.email },
+        currentInstallationId
+      );
+      const result = await window.electronAPI.sessionImport.runVaManager(
+        profile,
+        organizationId,
+        account.id
+      );
+      await firestoreUpdateProfile(profile.id, {
+        vaManagerLoginStatus: result.status === 'success'
+          ? 'connected'
+          : result.status === 'manual'
+            ? 'manual'
+            : 'failed',
+        vaManagerLoginMessage: result.message,
+        vaManagerLastLoginAt: new Date().toISOString(),
+      });
+      setSessionImportProgress({
+        running: false,
+        total: 1,
+        current: 1,
+        profileId: profile.id,
+        username: account.username,
+        status: result.status,
+        message: result.message,
+      });
+      showToast(
+        result.message,
+        result.status === 'success' ? 'success' : result.status === 'manual' ? 'warning' : 'error'
+      );
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Nouvelle tentative interrompue';
+      await firestoreUpdateProfile(profile.id, {
+        vaManagerLoginStatus: 'failed',
+        vaManagerLoginMessage: message,
+        vaManagerLastLoginAt: new Date().toISOString(),
+      }).catch(() => {});
+      setSessionImportProgress({
+        running: false,
+        total: 1,
+        current: 1,
+        profileId: profile.id,
+        username: account.username,
+        status: 'failed',
+        message,
+      });
+      await window.electronAPI.sessionImport.stop(profile.id).catch(() => {});
+      throw error;
+    } finally {
+      if (sessionImportRunRef.current === run) sessionImportRunRef.current = null;
     }
   };
 
@@ -1611,6 +2000,17 @@ function App() {
             teamScope={activeWorkspaceTeamIds}
           />
         );
+      case 'va-manager':
+        return hasAdminAccess ? (
+          <VaManagerPage
+            profiles={visibleProfiles}
+            onUpdateProfile={handleUpdateVaManagerLink}
+            onCreateAndConnect={handleCreateVaManagerInstances}
+            onRetryConnection={handleRetryVaManagerConnection}
+            importProgress={sessionImportProgress}
+            onStopImport={handleStopSessionImport}
+          />
+        ) : null;
       case 'extensions':
         return hasAdminAccess ? <ExtensionsPage teamId={activeWorkspaceTeamId} teams={teams} /> : null;
       case 'diagnostics':

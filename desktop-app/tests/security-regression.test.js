@@ -244,7 +244,7 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(app, /await Promise\.all\(/);
   assert.match(app, /windowLayout:\s*\{\s*index:\s*batchIndex,\s*total:\s*batch\.length\s*\}/);
   assert.match(launcher, /compactWindow = \{ width: 900, height: 720/);
-  assert.match(launcher, /--force-device-scale-factor=\$\{deviceScaleFactor\}/);
+  assert.doesNotMatch(launcher, /--force-device-scale-factor/);
   assert.match(launcher, /x-cookie-consent\.js/);
   assert.match(launcher, /data-testid="BottomBar"/);
   assert.match(launcher, /rejectPattern/);
@@ -353,6 +353,157 @@ test('account credentials are not persisted in renderer storage', () => {
   const sidebar = read('desktop-app/src/renderer/components/Sidebar.tsx');
   assert.doesNotMatch(sidebar, /localStorage\.setItem\(['"]spectra_saved_accounts/);
   assert.doesNotMatch(sidebar, /password:\s*newPassword/);
+});
+
+test('VA Manager integration is read-only, encrypted locally, and isolated from Open Post', () => {
+  const client = read('desktop-app/src/main/va-manager-client.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  assert.match(client, /safeStorage\.encryptString/);
+  assert.match(client, /safeStorage\.decryptString/);
+  assert.doesNotMatch(client, /store\.set\([^)]*password/i);
+  assert.match(client, /table:\s*'twitter_accounts'[\s\S]*action:\s*'select'/);
+  assert.match(client, /table:\s*'twitter_stats'[\s\S]*action:\s*'select'/);
+  assert.doesNotMatch(client, /action:\s*'(insert|update|upsert|delete)'/);
+  assert.match(preload, /vaManager:listAccounts/);
+  assert.match(page, /findLinkedProfile/);
+  assert.match(page, /Plus d’abonnés/);
+  assert.match(app, /case 'va-manager'/);
+  assert.doesNotMatch(page, /Open post|onOpenTweetInFolder|targetTweetUrl/);
+});
+
+test('VA Manager audit separates Anto accounts without exposing decrypted credentials', () => {
+  const client = read('desktop-app/src/main/va-manager-client.ts');
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+
+  assert.match(client, /table:\s*'gmail_accounts'[\s\S]*action:\s*'select'/);
+  assert.match(client, /'\/api\/org-password-key'[\s\S]*action:\s*'get'/);
+  assert.match(client, /canDecryptCredential/);
+  assert.match(client, /hasPassword:\s*Boolean\(account\.encrypted_password\)/);
+  assert.match(client, /passwordUsable/);
+  assert.match(client, /hasTwoFa/);
+  assert.match(client, /hasAuthToken/);
+  assert.match(client, /hasEmailPassword/);
+  assert.doesNotMatch(client, /return\s*\{[\s\S]{0,500}(password|twoFa|authToken):\s*(decrypted|notes)/i);
+
+  assert.match(page, /Instances déjà créées/);
+  assert.match(page, /Instances à créer/);
+  assert.match(page, /Informations manquantes/);
+  assert.match(page, /Prêts à créer et connecter/);
+  assert.match(page, /getMissingInformation\(account\)/);
+  assert.match(page, /auditFilter === 'ready'\) return !linked && complete/);
+  assert.match(page, /Mot de passe X illisible/);
+  assert.match(page, /Mot de passe email illisible/);
+  const missingAudit = page.slice(
+    page.indexOf('function getMissingInformation'),
+    page.indexOf('const statusStyle')
+  );
+  assert.doesNotMatch(missingAudit, /hasAuthToken|auth_token/);
+});
+
+test('VA Manager creates ready instances idempotently without sending secrets to the renderer', () => {
+  const client = read('desktop-app/src/main/va-manager-client.ts');
+  const main = read('desktop-app/src/main/main.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+
+  assert.match(client, /getVaManagerSessionImportCredentials/);
+  assert.match(client, /table:\s*'twitter_accounts'[\s\S]*action:\s*'select'/);
+  assert.match(client, /decryptCredential/);
+  assert.match(main, /sessionImport:runVaManager/);
+  assert.match(main, /getVaManagerSessionImportCredentials\([\s\S]*runSessionImport/);
+  assert.match(main, /credentials\.password = ''/);
+  assert.match(main, /credentials\.totpSecret = ''/);
+  assert.match(preload, /runVaManager:\s*\(profileData: any, organizationId: string, accountId: string\)/);
+  assert.doesNotMatch(preload, /runVaManager:[\s\S]{0,180}(password|totpSecret)/);
+
+  assert.match(app, /handleCreateVaManagerInstances/);
+  assert.match(app, /proxyIdentityKey/);
+  assert.match(app, /vaManagerAccountId:\s*account\.id/);
+  assert.match(app, /vaManagerLoginStatus:\s*'pending'/);
+  assert.match(app, /vaManagerLoginStatus:\s*'connected'/);
+  assert.match(app, /handleRetryVaManagerConnection/);
+  assert.match(app, /existingAccountIds\.has\(account\.id\)/);
+  assert.match(app, /Math\.max\(0,\s*3 - \(usageByProxy\.get\(key\) \|\| 0\)\)/);
+  assert.match(app, /pendingAccounts\.slice\(0,\s*validSlots\.length\)/);
+  assert.match(app, /en attente de proxy/);
+  assert.match(app, /window\.electronAPI\.proxy\.test\(proxy\)/);
+  assert.match(app, /fingerprint\.generate\(\s*'windows',\s*'chrome',\s*proxy\.country \|\| 'US'/);
+  assert.match(app, /country:\s*proxy\.country \|\| 'US'/);
+  assert.match(app, /language:\s*'en-US',\s*languages:\s*\['en-US',\s*'en'\]/);
+  assert.match(app, /fingerprint:\s*usFingerprint/);
+  assert.match(app, /sessionImport\.runVaManager\(/);
+  assert.match(page, /Créer et connecter les prêts/);
+  assert.match(page, /Réessayer/);
+  assert.match(page, /onStopImport/);
+  assert.doesNotMatch(page, /Open post|onOpenTweetInFolder|targetTweetUrl/);
+});
+
+test('proxy imports ignore duplicates without merging distinct provider credentials', () => {
+  const identity = read('desktop-app/src/shared/proxy-identity.ts');
+  const proxyPage = read('desktop-app/src/renderer/pages/ProxyManager.tsx');
+  const firestore = read('desktop-app/src/renderer/services/firestore-service.ts');
+
+  assert.match(identity, /proxyIdentityKey/);
+  assert.match(identity, /proxy\.type/);
+  assert.match(identity, /proxy\.host/);
+  assert.match(identity, /proxy\.port/);
+  assert.match(identity, /proxy\.username/);
+  assert.doesNotMatch(identity, /proxy\.password/);
+  assert.match(identity, /SHA-256/);
+  assert.match(proxyPage, /new Set\(proxies\.map\(proxyIdentityKey\)\)/);
+  assert.match(proxyPage, /knownKeys\.has\(key\)/);
+  assert.match(proxyPage, /const bulkAnalysis = analyzeBulkProxyText\(\)/);
+  assert.match(proxyPage, /Doublons ignorés/);
+  assert.match(proxyPage, /disabled=\{bulkAnalysis\.parsed\.length === 0 \|\| adding\}/);
+  assert.match(proxyPage, /doublon/);
+  assert.match(firestore, /proxyDocumentId\(teamId, proxy\)/);
+  assert.match(firestore, /doc\(db, PROXIES_COLLECTION, deterministicId\)/);
+});
+
+test('VA Manager accounts link to existing Spectra profiles by stable id before username', () => {
+  const { findLinkedProfile, normalizeXUsername } = loadTypeScriptModule(
+    'desktop-app/src/shared/va-manager.ts'
+  );
+  const profiles = [
+    { id: 'profile-1', name: 'X — noonine91', vaManagerAccountId: 'account-1' },
+    { id: 'profile-2', name: '@another_account' },
+  ];
+
+  assert.equal(normalizeXUsername('https://x.com/NooNine91/status/123'), 'noonine91');
+  assert.equal(
+    findLinkedProfile({ id: 'account-1', username: 'different_name' }, profiles).id,
+    'profile-1'
+  );
+  assert.equal(
+    findLinkedProfile({ id: 'account-2', username: 'another_account' }, profiles).id,
+    'profile-2'
+  );
+  assert.equal(
+    findLinkedProfile(
+      { id: 'account-3', username: 'noonine91' },
+      [{ id: 'profile-3', name: 'noonine91', vaManagerAccountId: 'another-account' }]
+    ),
+    undefined
+  );
+});
+
+test('VA Manager links are explicit, reversible, and reject duplicate profile assignments', () => {
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  assert.match(page, /vaManagerAccountId === account\.id \? 'Liaison confirmée' : 'Correspondance détectée'/);
+  assert.match(page, /Confirmer la liaison/);
+  assert.match(page, /Lier une instance/);
+  assert.match(page, /vaManagerAccountId:\s*account\.id/);
+  assert.match(page, /vaManagerAccountId:\s*null/);
+  assert.match(page, /Ce compte est déjà lié à l’instance/);
+  assert.match(page, /est déjà liée à un autre compte/);
+  assert.match(app, /handleUpdateVaManagerLink/);
+  assert.match(app, /firestoreUpdateProfile\(profileId, profileData\)/);
 });
 
 test('session import accepts TXT, JSONL and JSON without exposing secrets', () => {
