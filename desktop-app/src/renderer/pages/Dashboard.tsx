@@ -73,6 +73,12 @@ const Dashboard: React.FC<DashboardProps> = ({
   const [showMoveModal, setShowMoveModal] = useState(false);
   const [moveProfileIds, setMoveProfileIds] = useState<string[]>([]);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
+  const [testingProxyProfileIds, setTestingProxyProfileIds] = useState<Set<string>>(new Set());
+  const [proxyTestResults, setProxyTestResults] = useState<Record<string, {
+    isHealthy: boolean;
+    country: string;
+    ping: number;
+  }>>({});
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<'name' | 'created' | 'lastUsed' | 'custom'>(() => {
     return (localStorage.getItem('spectra-dashboard-sort-by') as any) || settings.sortBy || 'custom';
@@ -335,6 +341,46 @@ const Dashboard: React.FC<DashboardProps> = ({
     if (profile.connectionType === 'wifi') return { icon: <Wifi size={14} />, label: 'WiFi', color: '#34d399' };
     if (profile.connectionType === 'proxy' && profile.proxy) return { icon: <Shield size={14} />, label: profile.proxy.host || 'Proxy', color: '#a78bfa' };
     return { icon: <Globe size={14} />, label: 'Direct', color: 'var(--text-muted)' };
+  };
+
+  const handleTestProfileProxy = async (profile: Profile) => {
+    if (!profile.proxy?.host || !window.electronAPI?.proxy?.test) {
+      showToast(`"${profile.name}" n'a pas de proxy à tester`, 'warning');
+      return;
+    }
+
+    setTestingProxyProfileIds(previous => new Set(previous).add(profile.id));
+    const startedAt = performance.now();
+    try {
+      const result = await window.electronAPI.proxy.test(profile.proxy);
+      const proxyResult = result as unknown as {
+        isHealthy?: boolean;
+        country?: string | null;
+      };
+      const configuredProxy = profile.proxy as typeof profile.proxy & { country?: string };
+      const isHealthy = typeof result === 'boolean' ? result : Boolean(proxyResult?.isHealthy);
+      const ping = Math.max(1, Math.round(performance.now() - startedAt));
+      const country = String(proxyResult?.country || configuredProxy.country || '--').toUpperCase();
+      setProxyTestResults(previous => ({
+        ...previous,
+        [profile.id]: { isHealthy, country, ping },
+      }));
+      showToast(
+        isHealthy
+          ? `"${profile.name}" : proxy fonctionnel · ${country} · ${ping} ms`
+          : `"${profile.name}" : proxy inaccessible · ${ping} ms`,
+        isHealthy ? 'success' : 'error'
+      );
+    } catch (error) {
+      console.error(`Proxy test failed for ${profile.name}:`, error);
+      showToast(`"${profile.name}" : échec du test proxy`, 'error');
+    } finally {
+      setTestingProxyProfileIds(previous => {
+        const next = new Set(previous);
+        next.delete(profile.id);
+        return next;
+      });
+    }
   };
 
   const getOSLabel = (os?: string) => {
@@ -1025,6 +1071,8 @@ const Dashboard: React.FC<DashboardProps> = ({
               {filteredProfiles.map((profile) => {
                 const isActive = activeProfiles.includes(profile.id);
                 const isSelected = selectedProfiles.includes(profile.id);
+                const isTestingProxy = testingProxyProfileIds.has(profile.id);
+                const proxyTestResult = proxyTestResults[profile.id];
                 const conn = getConnectionInfo(profile);
                 const locked = !isActive && isLockedByOther(profile, user?.uid || '', currentDeviceName);
 
@@ -1235,6 +1283,39 @@ const Dashboard: React.FC<DashboardProps> = ({
 
                     <td className="px-3 py-2.5">
                       <div className="flex items-center justify-end gap-1.5">
+                        {profile.proxy?.host && (
+                          <>
+                            {proxyTestResult && !isTestingProxy && (
+                              <span
+                                className="px-1.5 py-1 rounded-md text-[10px] font-mono tabular-nums whitespace-nowrap"
+                                style={{
+                                  color: proxyTestResult.isHealthy ? 'var(--success)' : 'var(--danger)',
+                                  background: proxyTestResult.isHealthy
+                                    ? 'var(--success-subtle)'
+                                    : 'var(--danger-subtle)',
+                                }}
+                                title={`Pays ${proxyTestResult.country} · Ping ${proxyTestResult.ping} ms`}
+                              >
+                                {proxyTestResult.country} · {proxyTestResult.ping} ms
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => handleTestProfileProxy(profile)}
+                              disabled={isTestingProxy}
+                              className="p-1.5 rounded-md transition-colors disabled:opacity-60"
+                              style={{
+                                color: 'var(--accent-light)',
+                                background: 'var(--accent-subtle)',
+                              }}
+                              title="Tester le proxy de cette instance"
+                            >
+                              {isTestingProxy
+                                ? <Loader2 size={13} className="animate-spin" />
+                                : <Shield size={13} />}
+                            </button>
+                          </>
+                        )}
                         <button
                           onClick={() => !locked && onLaunchProfile(profile)}
                           className="px-3 py-1.5 rounded-md flex items-center gap-1.5 text-[12px] font-medium transition-all"

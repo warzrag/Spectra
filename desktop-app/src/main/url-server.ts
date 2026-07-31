@@ -92,6 +92,7 @@ export class UrlTrackingServer {
             req.url === '/api/save-url' ||
             req.url === '/api/save-cookies' ||
             req.url === '/api/launch-status' ||
+            req.url === '/api/lifecycle-event' ||
             req.url === '/api/close-profile' ||
             req.url === '/api/session-import-status'
           )
@@ -128,9 +129,29 @@ export class UrlTrackingServer {
               } else if (req.url === '/api/save-cookies') {
                 const { profileId, cookies } = data;
                 if (profileId && Array.isArray(cookies)) {
-                  ipcMain.emit('internal:save-cookies', null, profileId, cookies);
+                  let saveResult: {
+                    success: boolean;
+                    count?: number;
+                    authenticated?: boolean;
+                    error?: string;
+                  } | null = null;
+                  ipcMain.emit(
+                    'internal:save-cookies',
+                    null,
+                    profileId,
+                    cookies,
+                    (result: typeof saveResult) => { saveResult = result; }
+                  );
+                  if (!saveResult?.success) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                      success: false,
+                      error: saveResult?.error || 'Cookie snapshot was not acknowledged',
+                    }));
+                    return;
+                  }
                   res.writeHead(200, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ success: true, count: cookies.length }));
+                  res.end(JSON.stringify(saveResult));
                 } else {
                   res.writeHead(400);
                   res.end(JSON.stringify({ error: 'Missing profileId or cookies' }));
@@ -149,6 +170,26 @@ export class UrlTrackingServer {
                 } else {
                   res.writeHead(400);
                   res.end(JSON.stringify({ error: 'Missing launch status fields' }));
+                }
+              } else if (req.url === '/api/lifecycle-event') {
+                const { profileId, launchId, event, details } = data;
+                if (
+                  typeof profileId === 'string' &&
+                  /^[A-Za-z0-9_-]{1,160}$/.test(profileId) &&
+                  typeof event === 'string' &&
+                  /^[A-Za-z0-9_-]{1,96}$/.test(event)
+                ) {
+                  ipcMain.emit('internal:lifecycle-event', null, {
+                    profileId,
+                    launchId: typeof launchId === 'string' ? launchId.slice(0, 96) : '',
+                    event,
+                    details: details && typeof details === 'object' ? details : {},
+                  });
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end(JSON.stringify({ error: 'Invalid lifecycle event' }));
                 }
               } else if (req.url === '/api/close-profile') {
                 const { profileId } = data;

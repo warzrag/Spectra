@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -103,6 +103,7 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
   const [showCreateConfirmation, setShowCreateConfirmation] = useState(false);
   const [createActionLoading, setCreateActionLoading] = useState(false);
   const [retryingAccountId, setRetryingAccountId] = useState<string | null>(null);
+  const attemptedExistingCookieSyncs = useRef(new Set<string>());
 
   const loadOrganizations = async (preferredOrganizationId?: string) => {
     const available = await window.electronAPI.vaManager.listOrganizations();
@@ -158,6 +159,17 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
     };
   }, []);
 
+  useEffect(() => {
+    if (!connection.connected || !organizationId) return;
+    const refreshCookiesStatus = () => {
+      loadAccounts(organizationId).catch(() => {});
+    };
+    window.addEventListener('spectra:va-manager-cookies-synced', refreshCookiesStatus);
+    return () => {
+      window.removeEventListener('spectra:va-manager-cookies-synced', refreshCookiesStatus);
+    };
+  }, [connection.connected, organizationId]);
+
   const handleConnect = async (event: React.FormEvent) => {
     event.preventDefault();
     setConnecting(true);
@@ -193,6 +205,43 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
     }
     return result;
   }, [accounts, profiles]);
+
+  useEffect(() => {
+    if (!connection.connected || !organizationId || accounts.length === 0) return;
+    const pending = accounts
+      .filter(account => !account.hasCookies)
+      .map(account => ({ account, profile: linkedByAccountId.get(account.id) }))
+      .filter(({ account, profile }) =>
+        Boolean(
+          profile &&
+          profile.vaManagerAccountId === account.id &&
+          !attemptedExistingCookieSyncs.current.has(`${profile.id}:${account.id}`)
+        )
+      ) as { account: VaManagerAccount; profile: Profile }[];
+    if (pending.length === 0) return;
+
+    for (const { account, profile } of pending) {
+      attemptedExistingCookieSyncs.current.add(`${profile.id}:${account.id}`);
+    }
+    Promise.all(
+      pending.map(({ account, profile }) =>
+        window.electronAPI.vaManager.syncProfileCookies(
+          profile.id,
+          account.id,
+          account.organizationId || organizationId
+        )
+      )
+    ).then(results => {
+      if (results.some(result => result.success)) {
+        loadAccounts(organizationId).catch(() => {});
+      }
+    }).catch(() => {});
+  }, [
+    accounts,
+    connection.connected,
+    linkedByAccountId,
+    organizationId,
+  ]);
 
   const visibleAccounts = useMemo(() => {
     const query = search.trim().toLowerCase().replace(/^@/, '');
@@ -274,7 +323,18 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
       if (profile.vaManagerAccountId && profile.vaManagerAccountId !== account.id) {
         throw new Error(`L’instance "${profile.name}" est déjà liée à un autre compte`);
       }
-      await onUpdateProfile(profile.id, { vaManagerAccountId: account.id });
+      await onUpdateProfile(profile.id, {
+        vaManagerAccountId: account.id,
+        vaManagerOrganizationId: account.organizationId || organizationId,
+      });
+      const cookieSync = await window.electronAPI.vaManager.syncProfileCookies(
+        profile.id,
+        account.id,
+        account.organizationId || organizationId
+      );
+      if (cookieSync.success) {
+        await loadAccounts(account.organizationId || organizationId);
+      }
       setLinkingAccountId(null);
       setSelectedProfileId('');
     } catch (linkError) {
@@ -288,7 +348,10 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
     setLinkActionLoading(true);
     setError('');
     try {
-      await onUpdateProfile(profile.id, { vaManagerAccountId: null });
+      await onUpdateProfile(profile.id, {
+        vaManagerAccountId: null,
+        vaManagerOrganizationId: null,
+      });
     } catch (unlinkError) {
       setError(unlinkError instanceof Error ? unlinkError.message : 'Impossible de délier l’instance');
     } finally {
@@ -750,6 +813,17 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
                           {label}
                         </span>
                       ))}
+                      <span
+                        className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
+                        style={{
+                          background: account.hasCookies
+                            ? 'var(--success-subtle)'
+                            : 'var(--warning-subtle)',
+                          color: account.hasCookies ? 'var(--success)' : 'var(--warning)',
+                        }}
+                      >
+                        {account.hasCookies ? 'Cookies X synchronisés' : 'Cookies X en attente'}
+                      </span>
                     </div>
                     <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
                       {formatDate(account.lastScannedAt || account.followersUpdatedAt)}

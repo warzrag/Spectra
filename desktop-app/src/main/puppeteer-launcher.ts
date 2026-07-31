@@ -41,6 +41,7 @@ export interface PuppeteerLaunchOptions {
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
   private static pendingProfiles = new Set<string>();
+  private static pendingLaunchModes = new Map<string, SpectraLaunchMode>();
   private static cancelledProfiles = new Set<string>();
   private static launchConfirmationWaiters = new Map<
     string,
@@ -50,6 +51,61 @@ export class PuppeteerLauncher {
   private static mainWindow: any = null;
   private static localServerConfig: { port: number; token: string } | null = null;
   private static readonly compactWindow = { width: 900, height: 720, margin: 0, gap: 0 };
+  private static readonly openSelectedWindow = {
+    width: 620,
+    height: 520,
+    margin: 8,
+    gap: 8,
+  };
+
+  private static getProfilesRoot(): string {
+    return process.platform === 'win32'
+      ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
+      : path.join(os.homedir(), '.antidetect-browser', 'profiles');
+  }
+
+  private static appendLifecycleEvent(
+    profileId: string,
+    event: string,
+    details: Record<string, unknown> = {}
+  ): void {
+    try {
+      this.assertSafeId(profileId, 'profile ID');
+      const profilesRoot = this.getProfilesRoot();
+      const profilePath = path.join(profilesRoot, profileId);
+      const logsPath = path.join(path.dirname(profilesRoot), 'Logs');
+      fs.mkdirSync(profilePath, { recursive: true });
+      fs.mkdirSync(logsPath, { recursive: true });
+      const record = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        profileId,
+        event: String(event || 'unknown').slice(0, 96),
+        details,
+      }) + os.EOL;
+      fs.appendFileSync(path.join(profilePath, '.spectra-lifecycle.ndjson'), record, 'utf8');
+      fs.appendFileSync(path.join(logsPath, 'profile-lifecycle.ndjson'), record, 'utf8');
+    } catch (error) {
+      console.warn(`[Lifecycle] Could not persist ${event} for ${profileId}:`, error);
+    }
+  }
+
+  static reportLifecycleEvent(payload: {
+    profileId?: string;
+    launchId?: string;
+    event?: string;
+    details?: Record<string, unknown>;
+  }): void {
+    const profileId = String(payload?.profileId || '');
+    const event = String(payload?.event || '');
+    if (!profileId || !event) return;
+    const safeDetails = payload?.details && typeof payload.details === 'object'
+      ? payload.details
+      : {};
+    this.appendLifecycleEvent(profileId, `chrome-${event}`, {
+      launchId: String(payload?.launchId || '').slice(0, 96),
+      ...safeDetails,
+    });
+  }
 
   private static assertSafeId(value: string, label: string): void {
     if (!/^[A-Za-z0-9_-]{1,160}$/.test(value)) {
@@ -164,14 +220,32 @@ export class PuppeteerLauncher {
     }
   }
 
-  private static async waitForVisibleWindow(profilePath: string, timeoutMs = 12000): Promise<number | null> {
+  private static async waitForVisibleWindow(
+    profilePath: string,
+    timeoutMs = 12000,
+    preferredProcessId?: number
+  ): Promise<number | null> {
     if (process.platform !== 'win32') return null;
     const escapedPath = profilePath.replace(/'/g, "''");
     const timeoutSeconds = Math.max(3, Math.ceil(timeoutMs / 1000));
+    const preferredPid = Number.isFinite(preferredProcessId) && Number(preferredProcessId) > 0
+      ? Number(preferredProcessId)
+      : 0;
     const output = await this.runPowerShell(`
       $profilePath = '${escapedPath}'
+      $preferredPid = ${preferredPid}
       $deadline = (Get-Date).AddSeconds(${timeoutSeconds})
       do {
+        if ($preferredPid -gt 0) {
+          $preferredProcess = Get-Process -Id $preferredPid -ErrorAction SilentlyContinue
+          if ($preferredProcess) {
+            $preferredProcess.Refresh()
+            if ($preferredProcess.MainWindowHandle -ne 0) {
+              Write-Output $preferredProcess.MainWindowHandle
+              exit 0
+            }
+          }
+        }
         $browserProcesses = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
           Where-Object { $_.CommandLine -and $_.CommandLine.Contains($profilePath) }
         foreach ($browserProcess in $browserProcesses) {
@@ -345,7 +419,10 @@ public class Win32 {
     }
   }
 
-  private static getWindowPlacement(layout?: { index: number; total: number }) {
+  private static getWindowPlacement(
+    layout?: { index: number; total: number },
+    launchMode?: SpectraLaunchMode
+  ) {
     let workArea = { x: 0, y: 0, width: 1920, height: 1080 };
 
     try {
@@ -356,7 +433,9 @@ public class Win32 {
       workArea = display.workArea;
     } catch {}
 
-    const win = this.compactWindow;
+    const win = launchMode === 'automation'
+      ? this.openSelectedWindow
+      : this.compactWindow;
     const maxColumns = Math.max(1, Math.floor((workArea.width - win.margin * 2 + win.gap) / (win.width + win.gap)));
     const columns = Math.max(1, maxColumns);
     const slot = Math.max(0, layout?.index ?? this.activeProfiles.size);
@@ -505,10 +584,42 @@ public class Win32 {
     }
   }
 
+  private static nextVenusRuntimeVersion(profilePath: string, sourceVersion: string): string {
+    const statePath = path.join(profilePath, '.spectra-venus-runtime-version.json');
+    let previousCounter = 0;
+
+    try {
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      previousCounter = Number(state?.counter || state?.revision || 0);
+    } catch {}
+
+    const counter = Math.max(0, previousCounter) + 1;
+    const counterHigh = Math.floor(counter / 65535);
+    const counterLow = counter % 65535;
+    if (counterHigh > 65535) {
+      throw new Error(`VenusBot runtime revision exhausted for ${sourceVersion}`);
+    }
+
+    // Early development builds used a 2026.x runtime version. Chrome rejects
+    // any later 4.x copy as a downgrade and silently keeps the stale worker.
+    // Reserve a high Spectra-only namespace and increase it for every mode.
+    const runtimeVersion = `60000.1.${counterHigh}.${counterLow}`;
+    const nextState = JSON.stringify({ sourceVersion, counter, runtimeVersion });
+    const tempPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tempPath, nextState);
+    fs.renameSync(tempPath, statePath);
+    return runtimeVersion;
+  }
+
   private static configureTwitterAutoReplyAutostart(
     extensionPath: string,
     enabled: boolean,
-    launchContext: { launchId: string; profileId: string; profileName: string }
+    launchContext: {
+      launchId: string;
+      profileId: string;
+      profileName: string;
+      profilePath: string;
+    }
   ): boolean {
     const manifestPath = path.join(extensionPath, 'manifest.json');
     if (!fs.existsSync(manifestPath)) return false;
@@ -518,14 +629,28 @@ public class Win32 {
       if (!this.isTwitterAutoReplyManifest(manifest)) return false;
 
       const venusVersion = String(manifest.version || 'unknown');
+      // Chrome identifies VenusBot by its stable manifest key. Increment the
+      // fourth version component for every runtime copy, including manual and
+      // OpenPost launches, so a previous autostart worker can never survive in
+      // a mode where it is disabled. The first three upstream components stay
+      // intact, allowing a future VenusBot release to supersede this runtime.
+      manifest.version_name = venusVersion;
+      manifest.version = this.nextVenusRuntimeVersion(
+        launchContext.profilePath,
+        venusVersion
+      );
       const contentScripts = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
       const contentScriptFiles = contentScripts.flatMap((script: any) =>
         Array.isArray(script.js) ? script.js : []
       );
+      let contentCompatibilityPrepared = !enabled;
       for (const scriptFile of contentScriptFiles) {
         const scriptPath = path.join(extensionPath, scriptFile);
         if (!fs.existsSync(scriptPath)) continue;
         const source = fs.readFileSync(scriptPath, 'utf8');
+        if (!source.includes('pendingAutoStart') || !source.includes('startAutoMode')) {
+          continue;
+        }
         let patched = source.replace(
           /(\[\s*['"]pendingAutoStart['"]\s*,\s*['"]pendingMode['"]\s*,\s*['"]autonomousPhase['"])((?:\s*,\s*['"](?:autonomousPhaseStartTime|manualPause|spectraPendingLaunchId)['"])*)?(\s*,\s*['"]pendingAutonomousPost['"]\s*\])/,
           (_match, prefix, optionalKeys = '', suffix) => {
@@ -536,8 +661,7 @@ public class Win32 {
             return `${prefix}${keys}${suffix}`;
           }
         );
-        const pendingGuard =
-          `if(e.pendingAutoStart&&!e.manualPause&&(!sessionStorage.getItem(${JSON.stringify(`spectra:autostart-initializing:${launchContext.launchId}`)})||e.spectraPendingLaunchId===${JSON.stringify(launchContext.launchId)})){`;
+        const pendingGuard = 'if(e.pendingAutoStart&&!e.manualPause){';
         patched = patched.replace(
           /if\(e\.pendingAutoStart&&!e\.manualPause&&\(!sessionStorage\.getItem\(["']spectra:autostart-initializing:[^"']+["']\)\|\|e\.spectraPendingLaunchId===["'][^"']+["']\)\)\{/,
           pendingGuard
@@ -547,14 +671,29 @@ public class Win32 {
           pendingGuard
         );
         patched = patched.replace(
+          /chrome\.storage\.local\.remove\(\[\s*['"]pendingAutoStart['"]\s*,\s*['"]pendingMode['"]\s*,\s*['"]autonomousPhase['"](?:\s*,\s*['"]spectraPendingLaunchId['"])?\s*\]\)/,
+          "chrome.storage.local.remove(['pendingAutoStart','pendingMode','autonomousPhase','spectraPendingLaunchId'])"
+        );
+        patched = patched.replace(
           /:this\.isEnabled(?:&&!sessionStorage\.getItem\(["']spectra:autostart-initializing:[^"']+["']\))?&&this\.startAutoMode\(\)/,
-          `:this.isEnabled&&!sessionStorage.getItem(${JSON.stringify(`spectra:autostart-initializing:${launchContext.launchId}`)})&&this.startAutoMode()`
+          ':this.isEnabled&&this.startAutoMode()'
         );
         if (patched !== source) {
           fs.writeFileSync(scriptPath, patched);
           console.log(`[Spectra AutoStart] Patched cycle resume compatibility in ${scriptFile}`);
-          break;
         }
+        contentCompatibilityPrepared =
+          patched.includes('autonomousPhaseStartTime') &&
+          patched.includes('manualPause') &&
+          patched.includes('spectraPendingLaunchId') &&
+          patched.includes(
+            "chrome.storage.local.remove(['pendingAutoStart','pendingMode','autonomousPhase','spectraPendingLaunchId'])"
+          );
+        if (contentCompatibilityPrepared) break;
+      }
+      if (!contentCompatibilityPrepared) {
+        console.error('[Spectra AutoStart] VenusBot content contract is incompatible');
+        return false;
       }
 
       const autostartFile = 'spectra-autostart.js';
@@ -598,7 +737,7 @@ public class Win32 {
         (state) => {
           const bot = window.twitterAutoReplyBot || window.venusSecurityLabBot;
           const running = Boolean(
-            bot && (bot.isRunning || bot.autonomousCycleRunning || bot.isEnabled)
+            bot && bot.isRunning === true && bot.autonomousCycleRunning === true
           );
           if (state.isEnabled === true && state.mode === 'autonomous' && running) {
             sessionStorage.setItem(CONFIRMED_MARKER, '1');
@@ -675,7 +814,10 @@ public class Win32 {
       ) {
         sessionStorage.setItem(COMMAND_MARKER, '1');
         console.log('[Spectra AutoStart] Duplicate start blocked: current launch command already exists');
-        waitForConfirmation();
+        // The background worker may have staged the command just after
+        // VenusBot performed its one-time startup read. Reload once so the
+        // native pendingAutoStart handler consumes that owned command.
+        window.location.reload();
         return;
       }
       if (state.pendingAutoStart === true) {
@@ -726,23 +868,46 @@ public class Win32 {
     return;
   }
 
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 60000;
+  const startupTabsMarkerDeadline = Date.now() + 5000;
   const waitForReadyRequestsTab = () => {
     try {
       if (!isRequestsPage()) return;
-      if (sessionStorage.getItem(READY_MARKER) !== '1') {
-        if (Date.now() < deadline) {
+      // The cookie-sync worker stores the retained Chrome tab ID as the marker
+      // value. Presence means the single-tab bootstrap has completed. Do not
+      // let a delayed MV3 worker prevent VenusBot from starting indefinitely:
+      // Open Selected already launches Requests as its only native tab.
+      if (!sessionStorage.getItem(READY_MARKER)) {
+        if (Date.now() < startupTabsMarkerDeadline) {
           window.setTimeout(waitForReadyRequestsTab, 250);
-        } else {
-          sessionStorage.removeItem(INIT_MARKER);
-          console.warn('[Spectra AutoStart] Tab cleanup readiness timed out');
+          return;
         }
-        return;
+        console.warn('[Spectra AutoStart] Single-tab marker delayed; using Requests fallback');
       }
       const authenticatedUi = document.querySelector(
-        '[data-testid="AppTabBar_Home_Link"], [data-testid="SideNav_AccountSwitcher_Button"]'
+        [
+          '[data-testid="AppTabBar_Home_Link"]',
+          '[data-testid="SideNav_AccountSwitcher_Button"]',
+          '[data-testid="primaryColumn"]',
+          '[data-testid="AppTabBar_DirectMessage_Link"]',
+          'nav[role="navigation"] a[href="/home"]',
+        ].join(', ')
       );
-      if (authenticatedUi) {
+      const loginUi = document.querySelector(
+        [
+          'input[autocomplete="username"]',
+          'input[autocomplete="current-password"]',
+          '[data-testid="loginButton"]',
+        ].join(', ')
+      );
+      const completedXApp = document.readyState === 'complete' &&
+        Boolean(document.querySelector('#react-root, main[role="main"], #layers'));
+      if (!loginUi && (authenticatedUi || completedXApp)) {
+        console.log(
+          authenticatedUi
+            ? '[Spectra AutoStart] Authenticated X interface detected'
+            : '[Spectra AutoStart] X application ready in compact layout'
+        );
         activate();
         return;
       }
@@ -777,13 +942,22 @@ public class Win32 {
           { matches, js: [autostartFile], run_at: 'document_start' },
           ...contentScripts,
         ];
-        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
       } else if (!enabled && alreadyRegistered) {
         manifest.content_scripts = contentScripts.filter((script: any) =>
           !(Array.isArray(script.js) && script.js.includes(autostartFile))
         );
-        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
       }
+      const registeredContentScripts = Array.isArray(manifest.content_scripts)
+        ? manifest.content_scripts
+        : [];
+      const autostartRegistered = registeredContentScripts.some((script: any) =>
+        Array.isArray(script.js) && script.js.includes(autostartFile)
+      );
+      if (enabled !== autostartRegistered) {
+        console.error('[Spectra AutoStart] VenusBot manifest registration failed');
+        return false;
+      }
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 
       return true;
     } catch (error) {
@@ -951,7 +1125,11 @@ public class Win32 {
 
     if (process.platform === 'win32') {
       try {
-        const handle = await this.waitForVisibleWindow(profilePath);
+        const handle = await this.waitForVisibleWindow(
+          profilePath,
+          12000,
+          chromeProcess.pid
+        );
         if (!handle) throw new Error('no visible window');
       } catch (error: any) {
         try { chromeProcess.kill(); } catch {}
@@ -1024,6 +1202,12 @@ public class Win32 {
       if (!fs.existsSync(profilePath)) {
         fs.mkdirSync(profilePath, { recursive: true });
       }
+      this.appendLifecycleEvent(options.profileId, 'launch-requested', {
+        launchMode,
+        autoStartTwitterBot: options.autoStartTwitterBot === true,
+        hasTargetTweet: Boolean(targetTweetUrl),
+        hasSessionImport: sessionImportAttemptId.length > 0,
+      });
 
       const existingProfileProcesses = await this.getProfileProcessIds(profilePath);
       if (existingProfileProcesses.length > 0) {
@@ -1059,7 +1243,7 @@ public class Win32 {
       if (fs.existsSync(prefsPath)) {
         try { prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf8')); } catch {}
       }
-      const placement = this.getWindowPlacement(options.windowLayout);
+      const placement = this.getWindowPlacement(options.windowLayout, launchMode);
       const hasRestorableSession = this.hasChromeSessionRestore(profilePath);
       let manualPlacementCorrection: ReturnType<typeof fitWindowToWorkArea> = null;
       if (managedLaunch) {
@@ -1384,12 +1568,31 @@ public class Win32 {
       }
       fs.mkdirSync(cookieSyncPath, { recursive: true });
 
+      // The generated worker contains launch-specific state (server token,
+      // launch ID and OpenPost mode). Change its manifest version on every
+      // launch so Chrome cannot reuse a worker created for another mode.
+      const extensionVersionTime = new Date();
+      const extensionVersionYear = extensionVersionTime.getUTCFullYear();
+      const extensionVersionDay = Math.floor(
+        (
+          Date.UTC(
+            extensionVersionYear,
+            extensionVersionTime.getUTCMonth(),
+            extensionVersionTime.getUTCDate()
+          ) - Date.UTC(extensionVersionYear, 0, 0)
+        ) / 86400000
+      );
+      const cookieSyncExtensionVersion = [
+        extensionVersionYear,
+        extensionVersionDay,
+        extensionVersionTime.getUTCHours() * 60 + extensionVersionTime.getUTCMinutes(),
+        extensionVersionTime.getUTCSeconds(),
+      ].join('.');
+
       fs.writeFileSync(path.join(cookieSyncPath, 'manifest.json'), JSON.stringify({
         manifest_version: 3,
         name: 'Cookie Sync',
-        // Bump whenever the generated worker changes so Chrome does not keep
-        // executing a stale MV3 service worker from a previous Spectra build.
-        version: '1.1',
+        version: cookieSyncExtensionVersion,
         permissions: ['cookies', 'tabs', 'scripting', 'alarms'],
         host_permissions: ['<all_urls>'],
         background: { service_worker: 'background.js' },
@@ -1942,6 +2145,7 @@ public class Win32 {
 const PROFILE_NAME = ${JSON.stringify(options.profileName)};
 const LAUNCH_ID = ${JSON.stringify(autoStartLaunchId)};
 const OPEN_POST_MODE = ${JSON.stringify(Boolean(targetTweetUrl))};
+const HAS_STAGED_COOKIES = ${JSON.stringify(hasStagedCookies)};
 const SESSION_IMPORT_ATTEMPT_ID = ${JSON.stringify(sessionImportAttemptId)};
 const SESSION_IMPORT_MODE = Boolean(SESSION_IMPORT_ATTEMPT_ID);
 const MANAGED_STARTUP_MODE = OPEN_POST_MODE || Boolean(LAUNCH_ID) || SESSION_IMPORT_MODE;
@@ -1953,6 +2157,8 @@ let bootstrapComplete = false;
 let exportInProgress = false;
 let exportAgain = false;
 let exportTimer = null;
+let authenticationRetryTimer = null;
+let authenticatedSnapshotConfirmed = false;
 let retainedTabId = null;
 let cookiesImported = false;
 let venusConfirmationReported = false;
@@ -1982,6 +2188,40 @@ async function reportLaunchStatus(status, details = {}) {
     body: JSON.stringify({ profileId: PROFILE_ID, launchId: LAUNCH_ID, status, details }),
   });
   if (!response.ok) throw new Error('Launch status server returned ' + response.status);
+}
+
+async function reportLifecycleEvent(event, details = {}) {
+  try {
+    await fetch(SERVER + '/api/lifecycle-event', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + SERVER_TOKEN
+      },
+      body: JSON.stringify({
+        profileId: PROFILE_ID,
+        launchId: LAUNCH_ID,
+        event,
+        details,
+      }),
+    });
+  } catch {}
+}
+
+if (chrome.tabs.onRemoved?.addListener) {
+  chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+    reportLifecycleEvent('tab-removed', {
+      tabId,
+      windowId: removeInfo?.windowId,
+      isWindowClosing: removeInfo?.isWindowClosing === true,
+    });
+  });
+}
+
+if (chrome.windows?.onRemoved?.addListener) {
+  chrome.windows.onRemoved.addListener((windowId) => {
+    reportLifecycleEvent('window-removed', { windowId });
+  });
 }
 
 async function reportSessionImportStatus(status, message = '') {
@@ -2033,6 +2273,9 @@ async function startSessionImport(tabId) {
 }
 
 async function requestProfileClose(source) {
+  if (!OPEN_POST_MODE) {
+    throw new Error('Profile close is only available in OpenPost mode');
+  }
   await flushCookiesBeforeClose();
   const response = await fetch(SERVER + '/api/close-profile', {
     method: 'POST',
@@ -2070,7 +2313,12 @@ async function importCookies() {
         };
         if (c.expires && c.expires > 0) details.expirationDate = c.expires;
         else if (c.expirationDate && c.expirationDate > 0) details.expirationDate = c.expirationDate;
-        await chrome.cookies.set(details);
+        await Promise.race([
+          chrome.cookies.set(details),
+          wait(1500).then(() => {
+            throw new Error('Cookie import timed out: ' + c.name);
+          }),
+        ]);
         imported++;
       } catch (e) {}
     }
@@ -2165,6 +2413,28 @@ async function openStartUrl() {
     console.error('[Spectra AutoStart] Bootstrap failed: ' + (error?.message || error));
     throw error;
   }
+}
+
+async function resumeManualStartupAfterCookieImport() {
+  if (!HAS_STAGED_COOKIES || MANAGED_STARTUP_MODE) return null;
+
+  const response = await fetch(chrome.runtime.getURL('start_url.json'));
+  if (!response.ok) throw new Error('start_url.json returned ' + response.status);
+  const { startUrl } = await response.json();
+  if (!/^https?:\\/\\//i.test(startUrl || '')) throw new Error('Invalid startup URL');
+
+  // A manual launch may restore several user tabs. Only reuse Spectra's
+  // temporary blank/setup tab and never close or replace an existing user tab.
+  const tabs = await chrome.tabs.query({});
+  const temporaryTab = tabs.find((tab) => tab.id && isStartupJunkTab(tab));
+  if (!temporaryTab?.id) {
+    console.log('[Spectra FastStart] Existing manual session retained');
+    return null;
+  }
+
+  await chrome.tabs.update(temporaryTab.id, { url: startUrl, active: true });
+  console.log('[Spectra FastStart] Temporary tab resumed immediately: ' + temporaryTab.id);
+  return temporaryTab.id;
 }
 
 function bootstrap() {
@@ -2298,7 +2568,11 @@ chrome.runtime.onMessage?.addListener((message, sender, sendResponse) => {
       .catch(() => sendResponse({ accepted: false }));
     return true;
   }
-  if (message?.type !== 'spectra:open-post-actions-complete' || !sender.tab?.id) return;
+  if (
+    !OPEN_POST_MODE ||
+    message?.type !== 'spectra:open-post-actions-complete' ||
+    !sender.tab?.id
+  ) return;
   sendResponse({ accepted: true });
   (async () => {
     openPostCompleted = true;
@@ -2337,9 +2611,29 @@ async function exportCookies() {
       body: JSON.stringify({ profileId: PROFILE_ID, cookies }),
     });
     if (!response.ok) throw new Error('Cookie sync server returned ' + response.status);
+    const result = typeof response.json === 'function'
+      ? await response.json().catch(() => ({}))
+      : {};
+    if (result.authenticated === true) {
+      authenticatedSnapshotConfirmed = true;
+      if (authenticationRetryTimer) {
+        clearTimeout(authenticationRetryTimer);
+        authenticationRetryTimer = null;
+      }
+      console.log('[CookieSync] Authenticated X snapshot acknowledged by Spectra');
+      if (result.notificationRequired === true) {
+        await showAuthenticatedSnapshotConfirmation();
+      }
+    }
     console.log('[CookieSync] Exported ' + cookies.length + ' cookies');
   } catch (e) {
     console.warn('[CookieSync] Export failed', e);
+    if (!authenticatedSnapshotConfirmed && !authenticationRetryTimer) {
+      authenticationRetryTimer = setTimeout(() => {
+        authenticationRetryTimer = null;
+        exportCookies();
+      }, 500);
+    }
   } finally {
     exportInProgress = false;
     if (exportAgain) {
@@ -2369,6 +2663,38 @@ function scheduleExport(delay = 150) {
   }, delay);
 }
 
+async function showAuthenticatedSnapshotConfirmation() {
+  if (OPEN_POST_MODE) return;
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs.filter((candidate) => candidate.id && isXTab(candidate))) {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const existing = document.getElementById('spectra-session-saved-toast');
+        if (existing) existing.remove();
+        const toast = document.createElement('div');
+        toast.id = 'spectra-session-saved-toast';
+        toast.textContent = '✓ Session X enregistrée';
+        Object.assign(toast.style, {
+          position: 'fixed',
+          top: '20px',
+          right: '20px',
+          zIndex: '2147483647',
+          padding: '12px 18px',
+          borderRadius: '12px',
+          background: 'rgba(15, 23, 42, 0.96)',
+          border: '1px solid rgba(74, 222, 128, 0.55)',
+          boxShadow: '0 12px 35px rgba(0, 0, 0, 0.35)',
+          color: '#86efac',
+          font: '600 14px/1.2 system-ui, sans-serif',
+        });
+        document.documentElement.appendChild(toast);
+        window.setTimeout(() => toast.remove(), 4500);
+      },
+    }).catch(() => {});
+  }
+}
+
 if (MANAGED_STARTUP_MODE) {
   chrome.alarms.create('spectra-startup-watchdog', {
     delayInMinutes: 0.5,
@@ -2380,8 +2706,13 @@ if (MANAGED_STARTUP_MODE) {
   runStartupWatchdog();
 } else {
   importCookies()
-    .then(() => { cookiesImported = true; })
-    .catch(() => {});
+    .then(async () => {
+      cookiesImported = true;
+      await resumeManualStartupAfterCookieImport();
+    })
+    .catch((error) => {
+      console.warn('[Spectra FastStart] Cookie restore failed:', error);
+    });
 }
 chrome.runtime.onStartup.addListener(() => {
   if (MANAGED_STARTUP_MODE) {
@@ -2396,7 +2727,16 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.cookies.onChanged.addListener((changeInfo) => {
   const authenticationCookieChanged =
     changeInfo?.cookie?.name === 'auth_token' || changeInfo?.cookie?.name === 'ct0';
-  scheduleExport(authenticationCookieChanged ? 0 : 150);
+  if (authenticationCookieChanged) {
+    exportCookies();
+  } else {
+    scheduleExport(150);
+  }
+});
+chrome.windows?.onRemoved?.addListener(() => {
+  flushCookiesBeforeClose().catch((error) => {
+    console.warn('[CookieSync] Final window-close snapshot failed:', error);
+  });
 });
 chrome.runtime.onSuspend.addListener(() => exportCookies());
 
@@ -2433,8 +2773,15 @@ setTimeout(exportCookies, 1000);
           } catch (error) {
             console.warn(`[Extensions] Could not inspect extension: ${p}`, error);
           }
-          if (targetTweetUrl && extensionName.includes('shadowban scanner')) {
-            console.log('[Extensions] Shadowban Scanner skipped for Open post');
+          if (
+            (targetTweetUrl || options.autoStartTwitterBot === true) &&
+            extensionName.includes('shadowban scanner')
+          ) {
+            console.log(
+              targetTweetUrl
+                ? '[Extensions] Shadowban Scanner skipped for Open post'
+                : '[Extensions] Shadowban Scanner skipped for Open Selected'
+            );
             return [];
           }
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, p, index);
@@ -2452,6 +2799,7 @@ setTimeout(exportCookies, 1000);
               launchId: autoStartLaunchId,
               profileId: options.profileId,
               profileName: options.profileName,
+              profilePath,
             }
           )) {
             shouldAutoStartTwitterBot = options.autoStartTwitterBot === true;
@@ -2464,27 +2812,42 @@ setTimeout(exportCookies, 1000);
         const twitterAutoReplyPath = this.findTwitterAutoReplyExtensionPath();
         if (twitterAutoReplyPath) {
           const runtimePath = this.createRuntimeExtensionCopy(runtimeExtensionsRoot, twitterAutoReplyPath, extPaths.length);
-          this.configureTwitterAutoReplyAutostart(runtimePath, true, {
+          const configured = this.configureTwitterAutoReplyAutostart(runtimePath, true, {
             launchId: autoStartLaunchId,
             profileId: options.profileId,
             profileName: options.profileName,
+            profilePath,
           });
-          shouldAutoStartTwitterBot = true;
-          extPaths.push(runtimePath);
-          console.log(`[Extensions] Auto-start extension added: ${runtimePath}`);
+          if (configured) {
+            shouldAutoStartTwitterBot = true;
+            extPaths.push(runtimePath);
+            console.log(`[Extensions] Auto-start extension added: ${runtimePath}`);
+          }
         }
+      }
+      if (options.autoStartTwitterBot && !shouldAutoStartTwitterBot) {
+        throw new Error(
+          'VenusBot is unavailable or incompatible; Open Selected cannot start this profile'
+        );
       }
       // Determine start URL
       const isValidUrl = (url: string) => url && (url.startsWith('https://') || url.startsWith('http://'));
+      const isLegacyGoogleStartUrl = (url: string) =>
+        /^https?:\/\/(?:www\.)?google\.[^/]+\/?$/i.test(url.trim());
+      const configuredLastUrl = options.lastUrl || '';
       let startUrl = sessionImportAttemptId
         ? 'https://x.com/i/flow/login'
         : targetTweetUrl ||
-          (isValidUrl(options.lastUrl || '') ? options.lastUrl! : 'https://www.google.com');
+          (
+            isValidUrl(configuredLastUrl) && !isLegacyGoogleStartUrl(configuredLastUrl)
+              ? configuredLastUrl
+              : 'https://x.com/home'
+          );
       const lastUrlPath = path.join(profilePath, 'last_url.txt');
       if (!options.autoStartTwitterBot && !targetTweetUrl && !sessionImportAttemptId && fs.existsSync(lastUrlPath)) {
         try {
           const savedUrl = fs.readFileSync(lastUrlPath, 'utf8').trim();
-          if (isValidUrl(savedUrl)) {
+          if (isValidUrl(savedUrl) && !isLegacyGoogleStartUrl(savedUrl)) {
             startUrl = savedUrl;
           }
         } catch {}
@@ -2512,7 +2875,7 @@ setTimeout(exportCookies, 1000);
       // Native Chrome cookies are encrypted for their source Windows account.
       // On another PC, import the portable JSON cookies before navigating to X.
       const regularLaunchUrl = options.autoStartTwitterBot
-        ? 'about:blank'
+        ? startUrl
         : (targetTweetUrl || (hasStagedCookies ? 'about:blank' : startUrl));
       const launchUrl = sessionImportAttemptId ? startUrl : regularLaunchUrl;
       if (shouldAppendLaunchUrl(launchMode, hasRestorableSession)) {
@@ -2554,6 +2917,7 @@ setTimeout(exportCookies, 1000);
       // === SPAWN Chrome — no Puppeteer, no CDP, no debug port ===
       // Verify that the process survives startup. Some VPS/RDP machines reject
       // normal GPU initialization and previously looked like a successful launch.
+      this.pendingLaunchModes.set(options.profileId, launchMode);
       let chromeProcess: ChildProcess;
       try {
         chromeProcess = await this.spawnChromeAndVerify(chromePath, args, cleanEnv, profilePath);
@@ -2578,6 +2942,11 @@ setTimeout(exportCookies, 1000);
       }
 
       console.log(`[Chrome] Process spawned (PID: ${chromeProcess.pid}) — CDP-free`);
+      this.appendLifecycleEvent(options.profileId, 'process-spawned', {
+        launchMode,
+        pid: chromeProcess.pid || null,
+        launchId: autoStartLaunchId,
+      });
 
       const profileInstance = {
         chromeProcess,
@@ -2585,6 +2954,7 @@ setTimeout(exportCookies, 1000);
         profileId: options.profileId,
         localProxyServer,
         launchMode,
+        processMonitorTimer: null as NodeJS.Timeout | null,
         requiresPortableAuth: options.platform === 'twitter' ||
           Boolean(targetTweetUrl) ||
           options.autoStartTwitterBot === true ||
@@ -2592,12 +2962,27 @@ setTimeout(exportCookies, 1000);
           /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\//i.test(options.lastUrl || ''),
         syncEligible: false,
         closeNotified: false,
+        closeIntent: null as null | { source: string; timestamp: string },
       };
 
       let processCleanedUp = false;
-      const cleanupChromeProcess = () => {
+      const cleanupChromeProcess = (
+        source: string,
+        details: Record<string, unknown> = {}
+      ) => {
         if (processCleanedUp) return;
         processCleanedUp = true;
+        this.appendLifecycleEvent(options.profileId, 'profile-processes-gone', {
+          source,
+          launchMode,
+          launchId: autoStartLaunchId,
+          closeIntent: profileInstance.closeIntent,
+          ...details,
+        });
+        if (profileInstance.processMonitorTimer) {
+          clearTimeout(profileInstance.processMonitorTimer);
+          profileInstance.processMonitorTimer = null;
+        }
 
         if (localProxyServer) {
           localProxyServer.close();
@@ -2613,63 +2998,176 @@ setTimeout(exportCookies, 1000);
           this.mainWindow.webContents.send('profiles:activeUpdate', Array.from(this.activeProfiles.keys()));
           if (profileInstance.syncEligible && !profileInstance.closeNotified) {
             profileInstance.closeNotified = true;
-            const portableAuthReady = !profileInstance.requiresPortableAuth ||
+            const emitClosedProfile = () => {
+              if (!this.mainWindow || this.mainWindow.isDestroyed()) return;
+              const portableAuthReady = !profileInstance.requiresPortableAuth ||
+                this.ensureAuthenticatedXSnapshot(profileInstance.profilePath);
+              this.mainWindow.webContents.send('profile:closed', options.profileId, {
+                syncEligible: portableAuthReady,
+                launchMode: profileInstance.launchMode,
+                requiresPortableAuth: profileInstance.requiresPortableAuth,
+                reason: portableAuthReady ? 'chrome-exit' : 'missing-authenticated-x-snapshot',
+              });
+            };
+
+            const portableAuthAlreadyReady = !profileInstance.requiresPortableAuth ||
               this.ensureAuthenticatedXSnapshot(profileInstance.profilePath);
-            this.mainWindow.webContents.send('profile:closed', options.profileId, {
-              syncEligible: portableAuthReady,
-              launchMode: profileInstance.launchMode,
-              requiresPortableAuth: profileInstance.requiresPortableAuth,
-              reason: portableAuthReady ? 'chrome-exit' : 'missing-authenticated-x-snapshot',
-            });
+            if (portableAuthAlreadyReady) {
+              emitClosedProfile();
+            } else {
+              // The extension's final localhost POST can finish just after the
+              // Chrome process exits. Give that atomic write a short grace period.
+              setTimeout(emitClosedProfile, 1500);
+            }
           }
         }
       };
 
+      const monitorHandedOffBrowser = () => {
+        if (processCleanedUp || process.platform !== 'win32') return;
+        profileInstance.processMonitorTimer = setTimeout(async () => {
+          profileInstance.processMonitorTimer = null;
+          try {
+            const remainingProcessIds = await this.getProfileProcessIds(profilePath);
+            if (remainingProcessIds.length === 0) {
+              cleanupChromeProcess('handoff-monitor', {
+                rootPid: chromeProcess.pid || null,
+                rootExitCode: chromeProcess.exitCode,
+                rootSignalCode: chromeProcess.signalCode,
+              });
+              return;
+            }
+            monitorHandedOffBrowser();
+          } catch (error) {
+            console.warn(
+              `[Chrome] Could not monitor handed-off browser for ${options.profileId}:`,
+              error
+            );
+            monitorHandedOffBrowser();
+          }
+        }, 1000);
+      };
+
       chromeProcess.on('error', (error) => {
         console.error(`[Chrome] Process error for profile ${options.profileId}:`, error);
-        cleanupChromeProcess();
+        this.appendLifecycleEvent(options.profileId, 'root-process-error', {
+          pid: chromeProcess.pid || null,
+          name: error.name,
+          message: error.message,
+        });
+        cleanupChromeProcess('root-process-error', {
+          pid: chromeProcess.pid || null,
+          message: error.message,
+        });
       });
 
       // Monitor Chrome process exit
-      chromeProcess.on('exit', (code, signal) => {
+      chromeProcess.on('exit', async (code, signal) => {
         console.log(`[Chrome] Process exited (code: ${code}) for profile: ${options.profileId}`);
+        this.appendLifecycleEvent(options.profileId, 'root-process-exit', {
+          pid: chromeProcess.pid || null,
+          code,
+          signal,
+          launchMode,
+          closeIntent: profileInstance.closeIntent,
+        });
+
+        // On Windows/VPS, chrome.exe may hand the visible browser window to
+        // another process and let the process spawned by Spectra exit. Treat
+        // the profile as closed only when no Chrome process still owns this
+        // user-data-dir.
+        if (process.platform === 'win32') {
+          await new Promise(resolve => setTimeout(resolve, 400));
+          try {
+            const remainingProcessIds = await this.getProfileProcessIds(profilePath);
+            if (remainingProcessIds.length > 0) {
+              this.appendLifecycleEvent(options.profileId, 'browser-handoff-detected', {
+                rootPid: chromeProcess.pid || null,
+                rootExitCode: code,
+                rootSignal: signal,
+                survivingPids: remainingProcessIds,
+              });
+              console.log(
+                `[Chrome] Browser handoff detected for ${options.profileId}; ` +
+                `surviving PIDs: ${remainingProcessIds.join(',')}`
+              );
+              monitorHandedOffBrowser();
+              return;
+            }
+          } catch (error) {
+            console.warn(`[Chrome] Browser handoff check failed for ${options.profileId}:`, error);
+          }
+        }
 
         // Save last URL from open_tabs.json (updated by extension or Chrome itself)
         // Note: Without CDP we can't export cookies on exit, but Chrome saves them
         // to its native Cookies DB which is included in profile sync
-        cleanupChromeProcess();
+        cleanupChromeProcess('root-process-exit', {
+          pid: chromeProcess.pid || null,
+          code,
+          signal,
+        });
       });
 
-      if (launchConfirmationPromise) {
-        const launchStatus = await launchConfirmationPromise;
-        if (launchStatus !== 'venus-confirmed') {
-          console.error(`[Spectra AutoStart] Launch not confirmed: ${launchStatus}`);
-          await this.terminateProfileProcesses(profilePath);
-          cleanupChromeProcess();
-          throw new Error(
-            launchStatus === 'manual-pause-preserved'
-              ? 'VenusBot is manually paused; profile was not marked Running'
-              : `VenusBot launch confirmation failed: ${launchStatus}`
-          );
-        }
-      }
-
+      const profileProcessIds = process.platform === 'win32'
+        ? await this.getProfileProcessIds(profilePath)
+        : [];
       if (
         processCleanedUp ||
-        chromeProcess.exitCode !== null ||
-        chromeProcess.signalCode !== null
+        (
+          process.platform === 'win32'
+            ? profileProcessIds.length === 0
+            : chromeProcess.exitCode !== null || chromeProcess.signalCode !== null
+        )
       ) {
         throw new Error('Chrome exited before the launch could be marked Running');
       }
 
       this.pendingProfiles.delete(options.profileId);
+      this.pendingLaunchModes.delete(options.profileId);
       this.activeProfiles.set(options.profileId, profileInstance);
       profileInstance.syncEligible = true;
       console.log(`Chrome launched successfully for profile: ${options.profileId}`);
+
+      // Open Selected must not block the entire batch while VenusBot confirms.
+      // The visible browser window is the launch confirmation; VenusBot keeps
+      // reporting its own status in the background. Closing an instance
+      // manually before that report is therefore a normal close, not a failed
+      // browser launch.
+      if (launchConfirmationPromise) {
+        void launchConfirmationPromise
+          .then(launchStatus => {
+            if (launchStatus === 'venus-confirmed') {
+              console.log(
+                `[Spectra AutoStart] VenusBot confirmed for ${options.profileId}`
+              );
+            } else if (launchStatus === 'manual-pause-preserved') {
+              console.warn(
+                `[Spectra AutoStart] VenusBot manual pause preserved for ${options.profileId}`
+              );
+            } else if (launchStatus === 'timeout') {
+              console.warn(
+                `[Spectra AutoStart] VenusBot confirmation timed out for ${options.profileId}`
+              );
+            } else if (launchStatus === 'process-exited') {
+              console.log(
+                `[Spectra AutoStart] ${options.profileId} closed before VenusBot confirmation`
+              );
+            }
+          })
+          .catch(error => {
+            console.warn(
+              `[Spectra AutoStart] VenusBot background confirmation failed for ${options.profileId}:`,
+              error
+            );
+          });
+      }
+
       return { success: true };
 
     } catch (error: any) {
       this.pendingProfiles.delete(options.profileId);
+      this.pendingLaunchModes.delete(options.profileId);
       if (autoStartLaunchId) {
         this.cancelLaunchConfirmation(options.profileId, autoStartLaunchId);
       }
@@ -2841,10 +3339,17 @@ setTimeout(exportCookies, 1000);
     });
   }
 
-  static async closeProfile(profileId: string) {
+  static async closeProfile(profileId: string, source = 'ui-graceful-close') {
     this.assertSafeId(profileId, 'profile ID');
     this.cancelledProfiles.add(profileId);
     const instance = this.activeProfiles.get(profileId);
+    const closeIntent = { source, timestamp: new Date().toISOString() };
+    if (instance) instance.closeIntent = closeIntent;
+    this.appendLifecycleEvent(profileId, 'close-requested', {
+      source,
+      method: 'graceful',
+      launchMode: instance?.launchMode || this.pendingLaunchModes.get(profileId) || null,
+    });
     if (!instance) {
       const profilesRoot = process.platform === 'win32'
         ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
@@ -2894,14 +3399,25 @@ setTimeout(exportCookies, 1000);
     }
   }
 
-  static async forceCloseProfile(profileId: string) {
+  static async forceCloseProfile(profileId: string, source = 'ui-force-close') {
     this.assertSafeId(profileId, 'profile ID');
     this.cancelledProfiles.add(profileId);
     const instance = this.activeProfiles.get(profileId);
+    const closeIntent = { source, timestamp: new Date().toISOString() };
+    if (instance) instance.closeIntent = closeIntent;
+    this.appendLifecycleEvent(profileId, 'close-requested', {
+      source,
+      method: 'forced',
+      launchMode: instance?.launchMode || this.pendingLaunchModes.get(profileId) || null,
+    });
     const profilesRoot = process.platform === 'win32'
       ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser', 'Profiles')
       : path.join(os.homedir(), '.antidetect-browser', 'profiles');
     const profilePath = instance?.profilePath || path.join(profilesRoot, profileId);
+    if (instance?.processMonitorTimer) {
+      clearTimeout(instance.processMonitorTimer);
+      instance.processMonitorTimer = null;
+    }
 
     const beforeProcessIds = await this.getProfileProcessIds(profilePath);
     console.log(
@@ -2913,10 +3429,16 @@ setTimeout(exportCookies, 1000);
     }
     await this.terminateProfileProcesses(profilePath);
     const afterProcessIds = await this.getProfileProcessIds(profilePath);
+    this.appendLifecycleEvent(profileId, 'forced-close-completed', {
+      source,
+      beforeProcessIds,
+      afterProcessIds,
+    });
     console.log(
       `[Spectra OpenPost] Force close ${profileId}; Chrome PIDs after: ${afterProcessIds.join(',') || 'none'}`
     );
     this.pendingProfiles.delete(profileId);
+    this.pendingLaunchModes.delete(profileId);
     this.activeProfiles.delete(profileId);
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send(
@@ -2939,12 +3461,21 @@ setTimeout(exportCookies, 1000);
 
   static getActiveProfiles(): string[] {
     for (const [profileId, instance] of this.activeProfiles) {
+      if (process.platform === 'win32') {
+        if (!instance?.profilePath) this.activeProfiles.delete(profileId);
+        continue;
+      }
       const processExited = !instance?.chromeProcess ||
         instance.chromeProcess.exitCode !== null ||
         instance.chromeProcess.signalCode !== null;
       if (processExited) this.activeProfiles.delete(profileId);
     }
     return Array.from(this.activeProfiles.keys());
+  }
+
+  static canAcceptOpenPostClose(profileId: string): boolean {
+    return this.pendingLaunchModes.get(profileId) === 'open-post' ||
+      this.activeProfiles.get(profileId)?.launchMode === 'open-post';
   }
 
   static async getRunningProfiles(profileIds: string[]): Promise<string[]> {

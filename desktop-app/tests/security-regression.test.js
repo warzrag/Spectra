@@ -21,7 +21,12 @@ const loadTypeScriptModule = relativePath => {
   return module.exports;
 };
 
-const getCookieSyncBackgroundSource = ({ profileId, profileName, launchId }) => {
+const getCookieSyncBackgroundSource = ({
+  profileId,
+  profileName,
+  launchId,
+  hasStagedCookies = false,
+}) => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts').replace(/\r\n/g, '\n');
   const marker = "fs.writeFileSync(path.join(cookieSyncPath, 'background.js'),\n`";
   const start = launcher.indexOf(marker);
@@ -34,9 +39,35 @@ const getCookieSyncBackgroundSource = ({ profileId, profileName, launchId }) => 
     .replaceAll('${JSON.stringify(options.profileName)}', JSON.stringify(profileName))
     .replaceAll('${JSON.stringify(autoStartLaunchId)}', JSON.stringify(launchId))
     .replaceAll('${JSON.stringify(Boolean(targetTweetUrl))}', 'false')
+    .replaceAll('${JSON.stringify(hasStagedCookies)}', JSON.stringify(hasStagedCookies))
     .replaceAll('${JSON.stringify(sessionImportAttemptId)}', JSON.stringify(''))
     .replaceAll('${this.localServerConfig?.port || 0}', '45678')
     .replaceAll("${JSON.stringify(this.localServerConfig?.token || '')}", JSON.stringify('test-token'))
+    .replaceAll('\\\\', '\\');
+};
+
+const getVenusAutostartSource = ({
+  profileId,
+  profileName,
+  launchId,
+  venusVersion = '4.55.55',
+}) => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts').replace(/\r\n/g, '\n');
+  const marker = 'const autostartScript = `\n';
+  const start = launcher.indexOf(marker);
+  const end = launcher.indexOf('\n`;', start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const { resolveVenusAutostartState } = loadTypeScriptModule(
+    'desktop-app/src/main/venus-autostart-state.ts'
+  );
+  return launcher
+    .slice(start + marker.length, end)
+    .replaceAll('${JSON.stringify(launchContext.profileId)}', JSON.stringify(profileId))
+    .replaceAll('${JSON.stringify(launchContext.profileName)}', JSON.stringify(profileName))
+    .replaceAll('${JSON.stringify(launchContext.launchId)}', JSON.stringify(launchId))
+    .replaceAll('${JSON.stringify(venusVersion)}', JSON.stringify(venusVersion))
+    .replaceAll('${stateResolverSource}', resolveVenusAutostartState.toString())
     .replaceAll('\\\\', '\\');
 };
 
@@ -132,6 +163,18 @@ test('manual launches preserve the user window while managed launches keep equal
 
   assert.match(
     launcher,
+    /openSelectedWindow = \{\s*width: 620,\s*height: 520,\s*margin: 8,\s*gap: 8/
+  );
+  assert.match(
+    launcher,
+    /launchMode === 'automation'\s*\?\s*this\.openSelectedWindow\s*:\s*this\.compactWindow/
+  );
+  assert.match(
+    launcher,
+    /getWindowPlacement\(options\.windowLayout, launchMode\)/
+  );
+  assert.match(
+    launcher,
     /if \(managedLaunch\) \{\s*args\.push\(`--window-size=\$\{compactWindowSize\}`\);\s*args\.push\(`--window-position=\$\{compactWindowPosition\}`\);/
   );
   assert.match(
@@ -215,6 +258,17 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(urlServer, /Navigation fallback received/);
   assert.match(urlServer, /internal:close-profile/);
   assert.match(main, /ipcMain\.on\('internal:close-profile'/);
+  assert.match(main, /PuppeteerLauncher\.canAcceptOpenPostClose\(profileId\)/);
+  assert.match(launcher, /pendingLaunchModes/);
+  assert.match(launcher, /canAcceptOpenPostClose/);
+  assert.match(
+    launcher,
+    /async function requestProfileClose\(source\) \{\s*if \(!OPEN_POST_MODE\)/
+  );
+  assert.match(
+    launcher,
+    /!OPEN_POST_MODE \|\|\s*message\?\.type !== 'spectra:open-post-actions-complete'/
+  );
   assert.match(main, /PuppeteerLauncher\.forceCloseProfile\(profileId\)/);
   assert.match(preload, /forceClose: \(profileId: string\)/);
   assert.match(launcher, /private static cancelledProfiles = new Set<string>\(\)/);
@@ -256,9 +310,33 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(dashboard, /onClick=\{onStopOpenPost\}/);
 });
 
+test('launch-specific cookie extension workers are not reused across modes', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.match(
+    launcher,
+    /const cookieSyncExtensionVersion = \[[\s\S]*extensionVersionTime\.getUTCSeconds\(\)[\s\S]*\]\.join\('\.'\)/
+  );
+  assert.match(
+    launcher,
+    /name: 'Cookie Sync',\s*version: cookieSyncExtensionVersion/
+  );
+});
+
 test('manual profile launches do not inherit managed OpenPost tab behavior', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
 
+  assert.match(
+    launcher,
+    /isLegacyGoogleStartUrl/
+  );
+  assert.doesNotMatch(
+    launcher,
+    /isValidUrl\(options\.lastUrl \|\| ''\) \? options\.lastUrl! : 'https:\/\/www\.google\.com'/
+  );
+  assert.match(
+    launcher,
+    /isValidUrl\(savedUrl\) && !isLegacyGoogleStartUrl\(savedUrl\)/
+  );
   assert.match(
     launcher,
     /const MANAGED_STARTUP_MODE = OPEN_POST_MODE \|\| Boolean\(LAUNCH_ID\) \|\| SESSION_IMPORT_MODE/
@@ -281,7 +359,14 @@ test('manual profile launches do not inherit managed OpenPost tab behavior', () 
   );
   assert.match(
     launcher,
-    /\} else \{\s*importCookies\(\)\s*\.then\(\(\) => \{ cookiesImported = true; \}\)/
+    /\} else \{\s*importCookies\(\)\s*\.then\(async \(\) => \{\s*cookiesImported = true;\s*await resumeManualStartupAfterCookieImport\(\)/
+  );
+  assert.match(launcher, /Only reuse Spectra's[\s\S]*never close or replace an existing user tab/);
+  assert.match(launcher, /tabs\.find\(\(tab\) => tab\.id && isStartupJunkTab\(tab\)\)/);
+  assert.match(launcher, /Temporary tab resumed immediately/);
+  assert.match(
+    launcher,
+    /resumeManualStartupAfterCookieImport\(\)[\s\S]*\^https\?:\\\\\/\\\\\//
   );
 });
 
@@ -291,6 +376,7 @@ test('authenticated X sessions survive fast closes and cross-device sync', () =>
   const sync = read('desktop-app/src/main/profile-sync.ts');
   const preload = read('desktop-app/src/main/preload.ts');
   const app = read('desktop-app/src/renderer/App.tsx');
+  const urlServer = read('desktop-app/src/main/url-server.ts');
   const { hasAuthenticatedXSession } = loadTypeScriptModule(
     'desktop-app/src/shared/x-auth-snapshot.ts'
   );
@@ -308,21 +394,39 @@ test('authenticated X sessions survive fast closes and cross-device sync', () =>
   assert.match(main, /hasAuthenticatedXSession\(cookies\)/);
   assert.match(main, /authenticated_cookies\.json/);
   assert.match(main, /protected X snapshot retained/);
+  assert.match(main, /profile:authenticatedXSnapshotSaved/);
+  assert.match(main, /authenticatedSnapshotNotifications\.delete\(profileId\)/);
+  assert.match(main, /notificationRequired/);
+  assert.match(urlServer, /Cookie snapshot was not acknowledged/);
+  assert.match(urlServer, /res\.end\(JSON\.stringify\(saveResult\)\)/);
   assert.match(sync, /'authenticated_cookies\.json'/);
   assert.match(launcher, /ensureAuthenticatedXSnapshot/);
   assert.match(launcher, /missing-authenticated-x-snapshot/);
-  assert.match(launcher, /authenticationCookieChanged \? 0 : 150/);
+  assert.match(launcher, /if \(authenticationCookieChanged\) \{\s*exportCookies\(\)/);
+  assert.match(launcher, /chrome\.windows\?\.onRemoved\?\.addListener/);
   assert.match(preload, /profile:hasAuthenticatedXSnapshot/);
   assert.match(app, /not synchronized: authenticated X snapshot is missing/);
-  assert.match(app, /not synchronized: X login snapshot was not captured/);
+  assert.match(app, /non synchronisé : aucune session X connectée détectée/);
   assert.match(launcher, /const syncedIsAuthenticated =/);
   assert.match(launcher, /const protectedIsAuthenticated =/);
   assert.match(launcher, /const syncedIsNewer =/);
   assert.match(launcher, /protectedIsAuthenticated[\s\S]*authenticatedCookiesPath/);
   assert.match(launcher, /async function flushCookiesBeforeClose\(\)/);
-  assert.match(launcher, /async function requestProfileClose\(source\) \{\s*await flushCookiesBeforeClose\(\)/);
+  assert.match(launcher, /Authenticated X snapshot acknowledged by Spectra/);
+  assert.match(launcher, /authenticationRetryTimer = setTimeout/);
+  assert.match(launcher, /showAuthenticatedSnapshotConfirmation/);
+  assert.match(launcher, /result\.notificationRequired === true/);
+  assert.match(launcher, /spectra-session-saved-toast/);
+  assert.match(launcher, /Session X enregistr/);
+  assert.match(launcher, /if \(OPEN_POST_MODE\) return/);
+  assert.match(
+    launcher,
+    /async function requestProfileClose\(source\) \{[\s\S]*if \(!OPEN_POST_MODE\)[\s\S]*await flushCookiesBeforeClose\(\)/
+  );
   assert.match(launcher, /setInterval\(exportCookies, 1000\)/);
   assert.match(launcher, /await new Promise\(resolve => setTimeout\(resolve, 1100\)\)/);
+  assert.match(preload, /onAuthenticatedXSnapshotSaved/);
+  assert.match(app, /session X enregistr/);
 });
 
 test('cloud profile downloads use authenticated Electron transport instead of renderer XHR', () => {
@@ -355,8 +459,9 @@ test('account credentials are not persisted in renderer storage', () => {
   assert.doesNotMatch(sidebar, /password:\s*newPassword/);
 });
 
-test('VA Manager integration is read-only, encrypted locally, and isolated from Open Post', () => {
+test('VA Manager integration encrypts cookie write-back and remains isolated from Open Post', () => {
   const client = read('desktop-app/src/main/va-manager-client.ts');
+  const main = read('desktop-app/src/main/main.ts');
   const preload = read('desktop-app/src/main/preload.ts');
   const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
   const app = read('desktop-app/src/renderer/App.tsx');
@@ -366,9 +471,29 @@ test('VA Manager integration is read-only, encrypted locally, and isolated from 
   assert.doesNotMatch(client, /store\.set\([^)]*password/i);
   assert.match(client, /table:\s*'twitter_accounts'[\s\S]*action:\s*'select'/);
   assert.match(client, /table:\s*'twitter_stats'[\s\S]*action:\s*'select'/);
-  assert.doesNotMatch(client, /action:\s*'(insert|update|upsert|delete)'/);
+  assert.doesNotMatch(client, /action:\s*'(upsert|delete)'/);
+  assert.match(client, /syncAuthenticatedXCookiesToVaManager/);
+  assert.match(client, /AES-GCM/);
+  assert.match(client, /createHash\('sha256'\)/);
+  assert.match(client, /SPECTRA_COOKIES:v1/);
+  assert.match(client, /action:\s*'update'/);
+  assert.match(client, /fillMissingVaManagerAccountInformation/);
+  assert.match(client, /table:\s*'gmail_accounts'[\s\S]*action:\s*'insert'/);
+  assert.match(client, /currentXPasswordIsEmail/);
+  assert.match(client, /repairedMisplacedPasswords/);
+  assert.match(client, /currentNotes[\s\S]*\[2FA:\$\{twoFa\}\]/);
+  assert.match(client, /\['organization_id',\s*'eq',\s*account\.organizationId\]/);
+  assert.match(client, /\['id',\s*'eq',\s*account\.id\]/);
+  assert.match(main, /queueVaManagerCookieSync\(profileId, cookies\)/);
+  assert.match(main, /profileVaManagerLinks/);
+  assert.match(main, /vaManager:syncProfileCookies/);
+  assert.match(main, /authenticated_cookies\.json/);
+  assert.match(preload, /syncProfileCookies/);
+  assert.doesNotMatch(preload, /auth_token|ct0/);
   assert.match(preload, /vaManager:listAccounts/);
   assert.match(page, /findLinkedProfile/);
+  assert.match(page, /Cookies X synchronis/);
+  assert.match(page, /attemptedExistingCookieSyncs/);
   assert.match(page, /Plus d’abonnés/);
   assert.match(app, /case 'va-manager'/);
   assert.doesNotMatch(page, /Open post|onOpenTweetInFolder|targetTweetUrl/);
@@ -385,6 +510,7 @@ test('VA Manager audit separates Anto accounts without exposing decrypted creden
   assert.match(client, /passwordUsable/);
   assert.match(client, /hasTwoFa/);
   assert.match(client, /hasAuthToken/);
+  assert.match(client, /hasCookies/);
   assert.match(client, /hasEmailPassword/);
   assert.doesNotMatch(client, /return\s*\{[\s\S]{0,500}(password|twoFa|authToken):\s*(decrypted|notes)/i);
 
@@ -423,6 +549,7 @@ test('VA Manager creates ready instances idempotently without sending secrets to
   assert.match(app, /handleCreateVaManagerInstances/);
   assert.match(app, /proxyIdentityKey/);
   assert.match(app, /vaManagerAccountId:\s*account\.id/);
+  assert.match(app, /vaManagerOrganizationId:\s*account\.organizationId \|\| organizationId/);
   assert.match(app, /vaManagerLoginStatus:\s*'pending'/);
   assert.match(app, /vaManagerLoginStatus:\s*'connected'/);
   assert.match(app, /handleRetryVaManagerConnection/);
@@ -500,7 +627,9 @@ test('VA Manager links are explicit, reversible, and reject duplicate profile as
   assert.match(page, /Confirmer la liaison/);
   assert.match(page, /Lier une instance/);
   assert.match(page, /vaManagerAccountId:\s*account\.id/);
+  assert.match(page, /vaManagerOrganizationId:\s*account\.organizationId \|\| organizationId/);
   assert.match(page, /vaManagerAccountId:\s*null/);
+  assert.match(page, /vaManagerOrganizationId:\s*null/);
   assert.match(page, /Ce compte est déjà lié à l’instance/);
   assert.match(page, /est déjà liée à un autre compte/);
   assert.match(app, /handleUpdateVaManagerLink/);
@@ -580,10 +709,17 @@ test('super admins work inside one explicitly selected agency workspace', () => 
 test('Chrome launch waits for a visible window and repairs stale singleton files', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   assert.match(launcher, /waitForVisibleWindow/);
+  assert.match(launcher, /\$preferredPid = \$\{preferredPid\}/);
+  assert.match(launcher, /Get-Process -Id \$preferredPid/);
+  assert.match(launcher, /waitForVisibleWindow\(\s*profilePath,\s*12000,\s*chromeProcess\.pid/);
   assert.match(launcher, /terminateProfileProcesses/);
   assert.match(launcher, /stale process\(es\) without a visible window/);
   assert.match(launcher, /clearStaleSingletonFiles/);
   assert.match(launcher, /Chrome started but no visible window appeared/);
+  assert.match(launcher, /Browser handoff detected/);
+  assert.match(launcher, /monitorHandedOffBrowser/);
+  assert.match(launcher, /const profileProcessIds = process\.platform === 'win32'/);
+  assert.match(launcher, /if \(process\.platform === 'win32'\) \{\s+if \(!instance\?\.profilePath\)/);
 });
 
 test('cookie import targets the file consumed by the runtime importer', () => {
@@ -595,7 +731,9 @@ test('cookie import targets the file consumed by the runtime importer', () => {
 test('cross-device cookies are restored before navigation and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*'about:blank'\s*:\s*\(targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)\)/);
+  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*\(targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)\)/);
+  assert.match(launcher, /Promise\.race\(\[\s*chrome\.cookies\.set\(details\)/);
+  assert.match(launcher, /Cookie import timed out/);
   assert.match(launcher, /await importCookies\(\);\s+cookiesImported = true/);
   assert.match(launcher, /const tabId = await openStartUrl\(\)/);
   assert.match(launcher, /await reportLaunchStatus\('bootstrap-confirmed'[\s\S]*bootstrapComplete = true/);
@@ -604,7 +742,7 @@ test('cross-device cookies are restored before navigation and Chrome closes grac
   assert.match(profileSync, /profile\.cloudSyncChecksumRevision === expectedRevision/);
 });
 
-test('Open Selected resumes the saved VenusBot phase without resetting its timer', () => {
+test('Open Selected always starts a fresh VenusBot cycle on Requests', () => {
   const { resolveVenusAutostartState } = loadTypeScriptModule(
     'desktop-app/src/main/venus-autostart-state.ts'
   );
@@ -615,40 +753,21 @@ test('Open Selected resumes the saved VenusBot phase without resetting its timer
   assert.equal(firstStartup.phase, 'requests');
   assert.equal(firstStartup.phaseStartTime, now);
   assert.equal(firstStartup.updates.autonomousPhaseStartTime, now);
-
-  const requests = resolveVenusAutostartState({
-    autonomousPhase: 'requests',
-    autonomousPhaseStartTime: now - 260_000,
-    autonomousRequestsTime: 5,
-  }, now);
-  assert.equal(requests.valid, true);
-  assert.equal(requests.phase, 'requests');
-  assert.equal(requests.phaseStartTime, now - 260_000);
-  assert.equal(requests.remainingMilliseconds, 40_000);
-  assert.equal(requests.targetUrl, 'https://x.com/i/chat/requests');
-  assert.equal('autonomousPhase' in requests.updates, false);
-  assert.equal('autonomousPhaseStartTime' in requests.updates, false);
+  assert.equal(firstStartup.targetUrl, 'https://x.com/i/chat/requests');
 
   const dms = resolveVenusAutostartState({
     autonomousPhase: 'dms',
     autonomousPhaseStartTime: now - 120_000,
     autonomousDmsTime: 10,
   }, now);
-  assert.equal(dms.valid, true);
-  assert.equal(dms.phaseStartTime, now - 120_000);
-  assert.equal(dms.remainingMilliseconds, 480_000);
-  assert.equal(dms.targetUrl, 'https://x.com/i/chat');
-  assert.equal('autonomousPhaseStartTime' in dms.updates, false);
-
-  const expired = resolveVenusAutostartState({
-    autonomousPhase: 'requests',
-    autonomousPhaseStartTime: now - 600_000,
-    autonomousRequestsTime: 5,
-  }, now);
-  assert.equal(expired.valid, true);
-  assert.equal(expired.phaseStartTime, now - 600_000);
-  assert.equal(expired.remainingMilliseconds, 0);
-  assert.equal('autonomousPhaseStartTime' in expired.updates, false);
+  assert.equal(dms.valid, false);
+  assert.equal(dms.phase, 'requests');
+  assert.equal(dms.phaseStartTime, now);
+  assert.equal(dms.remainingMilliseconds, null);
+  assert.equal(dms.targetUrl, 'https://x.com/i/chat/requests');
+  assert.equal(dms.updates.autonomousPhase, 'requests');
+  assert.equal(dms.updates.autonomousPhaseStartTime, now);
+  assert.equal(dms.updates.requestsWasIdle, false);
 
   const isolatedPlans = Array.from({ length: 5 }, (_, index) =>
     resolveVenusAutostartState({
@@ -660,7 +779,7 @@ test('Open Selected resumes the saved VenusBot phase without resetting its timer
   );
   assert.deepEqual(
     isolatedPlans.map(plan => plan.phaseStartTime),
-    Array.from({ length: 5 }, (_, index) => now - index * 10_000)
+    Array.from({ length: 5 }, () => now)
   );
 
   const ownedCommand = resolveVenusAutostartState({
@@ -671,6 +790,105 @@ test('Open Selected resumes the saved VenusBot phase without resetting its timer
   assert.equal(ownedCommand.updates.spectraPendingLaunchId, 'launch-test');
 });
 
+test('Open Selected accepts the retained tab-id marker and stages one real VenusBot command', () => {
+  const launchId = 'launch-tab-contract';
+  const source = getVenusAutostartSource({
+    profileId: 'profile-tab-contract',
+    profileName: 'Tab Contract',
+    launchId,
+  });
+  const sessionValues = new Map([
+    [`spectra:startup-tabs-ready:${launchId}`, '321'],
+  ]);
+  const state = {};
+  const writes = [];
+  let reloadCount = 0;
+
+  const sessionStorage = {
+    getItem: key => sessionValues.has(key) ? sessionValues.get(key) : null,
+    setItem: (key, value) => sessionValues.set(key, String(value)),
+    removeItem: key => sessionValues.delete(key),
+  };
+  const location = {
+    href: 'https://x.com/i/chat/requests',
+    pathname: '/i/chat/requests',
+    reload: () => {
+      reloadCount++;
+    },
+  };
+  const chrome = {
+    runtime: { lastError: null },
+    storage: {
+      local: {
+        get: (_keys, callback) => callback({ ...state }),
+        set: (updates, callback) => {
+          Object.assign(state, updates);
+          writes.push({ ...updates });
+          callback?.();
+        },
+        remove: (keys, callback) => {
+          for (const key of Array.isArray(keys) ? keys : [keys]) delete state[key];
+          callback?.();
+        },
+      },
+    },
+  };
+  const document = {
+    readyState: 'complete',
+    querySelector: selector => {
+      if (selector.includes('autocomplete=') || selector.includes('loginButton')) return null;
+      if (selector.includes('AppTabBar_Home_Link')) return {};
+      if (selector.includes('#react-root')) return {};
+      return null;
+    },
+  };
+  const window = {
+    location,
+    setTimeout: callback => callback(),
+    twitterAutoReplyBot: null,
+    venusSecurityLabBot: null,
+  };
+  const context = {
+    chrome,
+    console,
+    document,
+    location,
+    sessionStorage,
+    window,
+    Date,
+    Math,
+    Set,
+    String,
+    Boolean,
+  };
+
+  vm.runInNewContext(source, context, { filename: 'spectra-autostart.js' });
+
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].pendingAutoStart, true);
+  assert.equal(writes[0].pendingMode, 'autonomous');
+  assert.equal(writes[0].spectraPendingLaunchId, launchId);
+  assert.equal(reloadCount, 1);
+  assert.equal(
+    sessionValues.get(`spectra:autostart-command-sent:${launchId}`),
+    '1'
+  );
+
+  state.isEnabled = true;
+  state.mode = 'autonomous';
+  window.twitterAutoReplyBot = {
+    isRunning: true,
+    autonomousCycleRunning: true,
+    isEnabled: true,
+  };
+  vm.runInNewContext(source, context, { filename: 'spectra-autostart-reload.js' });
+
+  assert.equal(
+    sessionValues.get(`spectra:autostart-confirmed:${launchId}`),
+    '1'
+  );
+});
+
 test('Open Selected coordinates one exact startup tab and one VenusBot start command', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const main = read('desktop-app/src/main/main.ts');
@@ -678,8 +896,25 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   const app = read('desktop-app/src/renderer/App.tsx');
   assert.match(launcher, /require\('crypto'\)\.randomUUID\(\)/);
   assert.match(launcher, /spectra:startup-tabs-ready:/);
+  assert.match(launcher, /if \(!sessionStorage\.getItem\(READY_MARKER\)\)/);
+  assert.doesNotMatch(launcher, /sessionStorage\.getItem\(READY_MARKER\) !== '1'/);
+  assert.match(launcher, /String\(tabId\)/);
   assert.match(launcher, /spectra:autostart-command-sent:/);
   assert.match(launcher, /spectra:autostart-confirmed:/);
+  assert.match(launcher, /manifest\.version_name = venusVersion/);
+  assert.match(launcher, /manifest\.version = this\.nextVenusRuntimeVersion/);
+  assert.match(launcher, /\.spectra-venus-runtime-version\.json/);
+  assert.doesNotMatch(launcher, /spectraBackgroundAutostartLaunchId/);
+  assert.doesNotMatch(launcher, /SPECTRA_VENUS_AUTOSTART_BEGIN/);
+  assert.match(launcher, /const pendingGuard = 'if\(e\.pendingAutoStart&&!e\.manualPause\)\{'/);
+  assert.match(
+    launcher,
+    /chrome\.storage\.local\.remove\(\['pendingAutoStart','pendingMode','autonomousPhase','spectraPendingLaunchId'\]\)/
+  );
+  assert.match(
+    launcher,
+    /bot && bot\.isRunning === true && bot\.autonomousCycleRunning === true/
+  );
   assert.match(launcher, /activationInFlight/);
   assert.match(launcher, /Duplicate start blocked/);
   assert.match(launcher, /Stale pending command replaced/);
@@ -691,6 +926,9 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(launcher, /Remaining time/);
   assert.match(launcher, /Saved timer expired; VenusBot will perform the normal phase transition/);
   assert.match(launcher, /AppTabBar_Home_Link/);
+  assert.match(launcher, /data-testid="primaryColumn"/);
+  assert.match(launcher, /input\[autocomplete="username"\]/);
+  assert.match(launcher, /X application ready in compact layout/);
   assert.match(app, /lastUrl:\s*'https:\/\/x\.com\/i\/chat\/requests'/);
   assert.match(app, /autoStartTwitterBot:\s*true/);
   assert.match(launcher, /chrome\.tabs\.create\(\{ url: startUrl, active: true \}\)/);
@@ -699,7 +937,9 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(launcher, /chrome\.tabs\.get\(retainedTabId\)/);
   assert.match(launcher, /target:\s*\{ tabId: retainedTabId \}/);
   assert.match(launcher, /return retainedTabId/);
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*'about:blank'/);
+  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl/);
+  assert.match(launcher, /startupTabsMarkerDeadline = Date\.now\(\) \+ 5000/);
+  assert.match(launcher, /Single-tab marker delayed; using Requests fallback/);
   assert.doesNotMatch(launcher, /createStartupTabCleanerExtension/);
   assert.match(launcher, /let bootstrapComplete = false/);
   assert.match(launcher, /BOOTSTRAP_ATTEMPTS = 5/);
@@ -723,24 +963,126 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(launcher, /getChromeExtensionId\(runtimePath\)/);
   assert.match(launcher, /shadowbanSetupUrl\s*=/);
   assert.match(launcher, /html\/initialSetup\.html/);
+  assert.match(launcher, /Shadowban Scanner skipped for Open Selected/);
+  assert.match(
+    launcher,
+    /\(targetTweetUrl \|\| options\.autoStartTwitterBot === true\)[\s\S]*extensionName\.includes\('shadowban scanner'\)/
+  );
   assert.match(launcher, /Opening the standard Shadowban setup tab/);
   assert.doesNotMatch(launcher, /Shadowban initial setup suppressed/);
   assert.doesNotMatch(launcher, /const spectraTabsCreate = chrome\.tabs\.create/);
   assert.match(launcher, /autonomousPhaseStartTime\|manualPause\|spectraPendingLaunchId/);
-  assert.match(launcher, /e\.spectraPendingLaunchId===/);
+  assert.doesNotMatch(launcher, /e\.spectraPendingLaunchId===/);
   assert.match(launcher, /spectra:autostart-initializing:\[\^"'\]\+/);
   assert.match(app, /!activeProfiles\.includes\(p\.id\)/);
   assert.doesNotMatch(launcher, /manualPause:\s*false/);
   assert.match(launcher, /Manual pause preserved; autostart skipped/);
+  assert.match(launcher, /VenusBot is unavailable or incompatible/);
   assert.match(launcher, /--disable-backgrounding-occluded-windows/);
   assert.match(launcher, /--disable-renderer-backgrounding/);
   assert.match(launcher, /--disable-background-timer-throttling/);
   assert.match(launcher, /pendingProfiles\.add\(options\.profileId\)/);
-  assert.match(launcher, /await launchConfirmationPromise/);
-  assert.match(launcher, /launchStatus !== 'venus-confirmed'/);
+  assert.match(launcher, /void launchConfirmationPromise\s*\.then\(launchStatus =>/);
+  assert.doesNotMatch(launcher, /await launchConfirmationPromise/);
+  assert.match(launcher, /closed before VenusBot confirmation/);
   assert.match(launcher, /running\.has\(id\) && !this\.pendingProfiles\.has\(id\)/);
   assert.match(urlServer, /req\.url === '\/api\/launch-status'/);
   assert.match(main, /internal:launch-status/);
+});
+
+test('manual cross-device launch replaces only the temporary blank tab after cookie import', async () => {
+  const tabs = [
+    { id: 1, url: 'about:blank', status: 'complete', active: true },
+    { id: 2, url: 'https://example.com/kept-by-user', status: 'complete', active: false },
+  ];
+  const updatedTabIds = [];
+  const removedTabIds = [];
+  const importedCookies = [];
+
+  const chrome = {
+    runtime: {
+      getURL: file => `chrome-extension://cookie-sync/${file}`,
+      onStartup: { addListener() {} },
+      onInstalled: { addListener() {} },
+      onSuspend: { addListener() {} },
+    },
+    cookies: {
+      set: async cookie => { importedCookies.push(cookie); },
+      getAll: async () => [],
+      onChanged: { addListener() {} },
+    },
+    tabs: {
+      query: async () => tabs.map(tab => ({ ...tab })),
+      update: async (tabId, properties) => {
+        const tab = tabs.find(candidate => candidate.id === tabId);
+        if (!tab) throw new Error('tab not found');
+        Object.assign(tab, properties, { status: 'complete' });
+        updatedTabIds.push(tabId);
+        return { ...tab };
+      },
+      remove: async tabId => {
+        removedTabIds.push(tabId);
+        const index = tabs.findIndex(tab => tab.id === tabId);
+        if (index >= 0) tabs.splice(index, 1);
+      },
+      onCreated: { addListener() {} },
+    },
+    alarms: {
+      clear: async () => true,
+      onAlarm: { addListener() {} },
+    },
+  };
+
+  const fetch = async url => {
+    if (String(url).endsWith('/cookies.json')) {
+      return {
+        ok: true,
+        json: async () => [{
+          name: 'auth_token',
+          value: 'portable-session',
+          domain: '.x.com',
+          path: '/',
+        }],
+      };
+    }
+    if (String(url).endsWith('/start_url.json')) {
+      return {
+        ok: true,
+        json: async () => ({ startUrl: 'https://x.com/home', closeOtherTabs: false }),
+      };
+    }
+    if (String(url).endsWith('/api/save-cookies')) return { ok: true };
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const source = getCookieSyncBackgroundSource({
+    profileId: 'manual_profile',
+    profileName: 'Manual Profile',
+    launchId: '',
+    hasStagedCookies: true,
+  });
+  vm.runInNewContext(source, {
+    chrome,
+    fetch,
+    console,
+    setTimeout: (callback, delay = 0) => setTimeout(callback, Math.min(delay, 5)),
+    clearTimeout,
+    setInterval: () => 0,
+    clearInterval() {},
+    Promise,
+    JSON,
+    RegExp,
+    String,
+    Error,
+  }, { filename: 'cookie-sync-manual-fast-start.js' });
+
+  await new Promise(resolve => setTimeout(resolve, 30));
+
+  assert.equal(importedCookies.length, 1);
+  assert.deepEqual(updatedTabIds, [1]);
+  assert.deepEqual(removedTabIds, []);
+  assert.equal(tabs[0].url, 'https://x.com/home');
+  assert.equal(tabs[1].url, 'https://example.com/kept-by-user');
 });
 
 test('five generated Open Selected bootstraps recover independently and retain one X tab', async () => {
@@ -954,6 +1296,8 @@ test('cookie and lock synchronization survive fast closes and app restarts', () 
   const app = read('desktop-app/src/renderer/App.tsx');
   const sync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
   assert.match(launcher, /chrome\.cookies\.onChanged\.addListener/);
+  assert.match(launcher, /Final window-close snapshot failed/);
+  assert.match(launcher, /setTimeout\(emitClosedProfile, 1500\)/);
   assert.match(launcher, /setInterval\(exportCookies, 1000\)/);
   assert.match(main, /function atomicWriteJson/);
   assert.match(main, /atomicWriteJson\(syncedPath, cookies\)/);
@@ -1023,4 +1367,40 @@ test('deleting proxies also detaches every assigned profile', () => {
   assert.match(firestore, /proxy:\s*null/);
   assert.match(firestore, /connectionType:\s*'system'/);
   assert.match(firestore, /connectionConfig:\s*\{\s*type:\s*'system'\s*\}/);
+});
+
+test('the instance table exposes a working per-profile proxy test', () => {
+  const dashboard = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+  assert.match(dashboard, /handleTestProfileProxy/);
+  assert.match(dashboard, /window\.electronAPI\.proxy\.test\(profile\.proxy\)/);
+  assert.match(dashboard, /Tester le proxy de cette instance/);
+  assert.match(dashboard, /proxy fonctionnel/);
+  assert.match(dashboard, /proxy inaccessible/);
+  assert.match(dashboard, /performance\.now\(\) - startedAt/);
+  assert.match(dashboard, /proxyTestResult\.country/);
+  assert.match(dashboard, /proxyTestResult\.ping/);
+});
+
+test('profile lifecycle telemetry records exits without changing OpenPost or VenusBot control', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const urlServer = read('desktop-app/src/main/url-server.ts');
+  const main = read('desktop-app/src/main/main.ts');
+
+  assert.match(launcher, /profile-lifecycle\.ndjson/);
+  assert.match(launcher, /'root-process-exit'/);
+  assert.match(launcher, /'browser-handoff-detected'/);
+  assert.match(launcher, /'profile-processes-gone'/);
+  assert.match(launcher, /'close-requested'/);
+  assert.match(launcher, /reportLifecycleEvent\('tab-removed'/);
+  assert.match(launcher, /reportLifecycleEvent\('window-removed'/);
+  assert.match(urlServer, /req\.url === '\/api\/lifecycle-event'/);
+  assert.match(main, /ipcMain\.on\('internal:lifecycle-event'/);
+  assert.match(
+    main,
+    /forceCloseProfile\(profileId, 'open-post-completed'\)/
+  );
+  assert.match(
+    launcher,
+    /if \(!OPEN_POST_MODE\) \{\s*throw new Error\('Profile close is only available in OpenPost mode'\)/
+  );
 });

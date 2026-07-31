@@ -30,6 +30,7 @@ import {
   getVaManagerConnectionStatus,
   listVaManagerAccounts,
   listVaManagerOrganizations,
+  syncAuthenticatedXCookiesToVaManager,
 } from './va-manager-client';
 
 const Store = require('electron-store');
@@ -75,6 +76,13 @@ const sessionImportWaiters = new Map<
   }
 >();
 let profileSyncBusy = false;
+const authenticatedSnapshotNotifications = new Set<string>();
+const profileVaManagerLinks = new Map<
+  string,
+  { accountId: string; organizationId?: string }
+>();
+const vaManagerCookieSyncQueues = new Map<string, Promise<void>>();
+const vaManagerLastCookiePayloadHashes = new Map<string, string>();
 let devRestartPending = false;
 let devRestartTimer: NodeJS.Timeout | null = null;
 let devRestartInProgress = false;
@@ -186,6 +194,34 @@ function createWindow() {
 
 async function launchProfileBrowser(profileId: string, profileData: any) {
   try {
+    authenticatedSnapshotNotifications.delete(profileId);
+    const vaManagerAccountId = String(profileData?.vaManagerAccountId || '');
+    const vaManagerOrganizationId = String(profileData?.vaManagerOrganizationId || '');
+    if (/^[A-Za-z0-9_-]{1,160}$/.test(vaManagerAccountId)) {
+      profileVaManagerLinks.set(profileId, {
+        accountId: vaManagerAccountId,
+        organizationId: /^[A-Za-z0-9_-]{1,160}$/.test(vaManagerOrganizationId)
+          ? vaManagerOrganizationId
+          : undefined,
+      });
+      const existingSnapshotPath = path.join(
+        getProfilesBaseDir(),
+        profileId,
+        'authenticated_cookies.json'
+      );
+      try {
+        const existingSnapshot = JSON.parse(
+          fs.readFileSync(existingSnapshotPath, 'utf8')
+        );
+        if (Array.isArray(existingSnapshot) && hasAuthenticatedXSession(existingSnapshot)) {
+          queueVaManagerCookieSync(profileId, existingSnapshot);
+        }
+      } catch {
+        // A newly created or logged-out profile may not have a protected snapshot yet.
+      }
+    } else {
+      profileVaManagerLinks.delete(profileId);
+    }
     // Profile data comes from the renderer (Firestore), use it directly
     console.log('Launching profile:', profileId);
     console.log('Profile lastUrl:', profileData.lastUrl);
@@ -404,7 +440,64 @@ function atomicWriteJson(filePath: string, value: unknown): void {
   fs.renameSync(tempPath, filePath);
 }
 
-ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
+function queueVaManagerCookieSync(profileId: string, cookies: unknown[]): void {
+  const link = profileVaManagerLinks.get(profileId);
+  if (!link) return;
+  const payloadHash = crypto
+    .createHash('sha256')
+    .update(JSON.stringify(cookies))
+    .digest('hex');
+  if (vaManagerLastCookiePayloadHashes.get(profileId) === payloadHash) return;
+
+  const previous = vaManagerCookieSyncQueues.get(profileId) || Promise.resolve();
+  const current = previous
+    .catch(() => {})
+    .then(async () => {
+      try {
+        const result = await syncAuthenticatedXCookiesToVaManager(
+          store,
+          link.accountId,
+          cookies,
+          link.organizationId
+        );
+        link.organizationId = result.organizationId;
+        profileVaManagerLinks.set(profileId, link);
+        vaManagerLastCookiePayloadHashes.set(profileId, payloadHash);
+        if (!result.unchanged && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('profile:vaManagerCookieSync', {
+            profileId,
+            success: true,
+            unchanged: result.unchanged,
+            cookieCount: result.cookieCount,
+          });
+        }
+        console.log(
+          `[VA Manager] ${result.unchanged ? 'Cookies already current' : 'Cookies synchronized'} ` +
+          `for profile ${profileId} (${result.cookieCount} X cookies)`
+        );
+      } catch (error: any) {
+        console.error(
+          `[VA Manager] Cookie synchronization failed for profile ${profileId}:`,
+          error?.message || error
+        );
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('profile:vaManagerCookieSync', {
+            profileId,
+            success: false,
+            error: error?.message || 'Synchronisation VA Manager impossible',
+          });
+        }
+      }
+    })
+    .finally(() => {
+      if (vaManagerCookieSyncQueues.get(profileId) === current) {
+        vaManagerCookieSyncQueues.delete(profileId);
+      }
+    });
+  vaManagerCookieSyncQueues.set(profileId, current);
+}
+
+ipcMain.on('internal:save-cookies', (_, profileId, cookies, acknowledge) => {
   try {
     if (typeof profileId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) {
       throw new Error('Invalid profile ID');
@@ -419,20 +512,42 @@ ipcMain.on('internal:save-cookies', (_, profileId, cookies) => {
     const syncedPath = path.join(profileDir, 'synced_cookies.json');
     atomicWriteJson(syncedPath, cookies);
     const authenticated = hasAuthenticatedXSession(cookies);
+    const notificationRequired =
+      authenticated && !authenticatedSnapshotNotifications.has(profileId);
     if (authenticated) {
       atomicWriteJson(path.join(profileDir, 'authenticated_cookies.json'), cookies);
+      authenticatedSnapshotNotifications.add(profileId);
+      queueVaManagerCookieSync(profileId, cookies);
     }
     console.log(
       `[CookieSync] Saved ${cookies.length} cookies for profile ${profileId}` +
       (authenticated ? ' (authenticated X snapshot protected)' : ' (protected X snapshot retained)')
     );
+    if (notificationRequired && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('profile:authenticatedXSnapshotSaved', profileId);
+    }
+    if (typeof acknowledge === 'function') {
+      acknowledge({
+        success: true,
+        count: cookies.length,
+        authenticated,
+        notificationRequired,
+      });
+    }
   } catch (e: any) {
     console.error('[CookieSync] Error saving cookies:', e.message);
+    if (typeof acknowledge === 'function') {
+      acknowledge({ success: false, error: e.message || 'Cookie snapshot write failed' });
+    }
   }
 });
 
 ipcMain.on('internal:launch-status', (_, payload) => {
   PuppeteerLauncher.reportLaunchStatus(payload);
+});
+
+ipcMain.on('internal:lifecycle-event', (_, payload) => {
+  PuppeteerLauncher.reportLifecycleEvent(payload);
 });
 
 ipcMain.on('internal:session-import-status', (_, payload) => {
@@ -453,8 +568,14 @@ ipcMain.on('internal:close-profile', (_, profileId) => {
     console.warn('[Spectra OpenPost] Ignored invalid close-profile request');
     return;
   }
+  if (!PuppeteerLauncher.canAcceptOpenPostClose(profileId)) {
+    console.warn(
+      `[Spectra OpenPost] Ignored stale close request for normal launch ${profileId}`
+    );
+    return;
+  }
   console.log(`[Spectra OpenPost] Forwarding forced close for ${profileId}`);
-  PuppeteerLauncher.forceCloseProfile(profileId).catch(error => {
+  PuppeteerLauncher.forceCloseProfile(profileId, 'open-post-completed').catch(error => {
     console.error(`[Spectra OpenPost] Failed to close profile ${profileId}:`, error);
   });
 });
@@ -483,6 +604,49 @@ ipcMain.handle('vaManager:listOrganizations', () => {
 ipcMain.handle('vaManager:listAccounts', (_, organizationId?: string) => {
   return listVaManagerAccounts(store, organizationId);
 });
+
+ipcMain.handle(
+  'vaManager:syncProfileCookies',
+  async (_, profileId: string, accountId: string, organizationId?: string) => {
+    assertSafeId(String(profileId || ''), 'profile ID');
+    assertSafeId(String(accountId || ''), 'VA Manager account ID');
+    if (organizationId) assertSafeId(String(organizationId), 'VA Manager organization ID');
+
+    const snapshotPath = path.join(
+      getProfilesBaseDir(),
+      profileId,
+      'authenticated_cookies.json'
+    );
+    if (!fs.existsSync(snapshotPath)) {
+      return { success: false, reason: 'no_authenticated_snapshot' };
+    }
+    const cookies = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    if (!Array.isArray(cookies) || !hasAuthenticatedXSession(cookies)) {
+      return { success: false, reason: 'no_authenticated_snapshot' };
+    }
+
+    profileVaManagerLinks.set(profileId, { accountId, organizationId });
+    const result = await syncAuthenticatedXCookiesToVaManager(
+      store,
+      accountId,
+      cookies,
+      organizationId
+    );
+    profileVaManagerLinks.set(profileId, {
+      accountId,
+      organizationId: result.organizationId,
+    });
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('profile:vaManagerCookieSync', {
+        profileId,
+        success: true,
+        unchanged: result.unchanged,
+        cookieCount: result.cookieCount,
+      });
+    }
+    return { success: true, ...result };
+  }
+);
 
 ipcMain.handle('diagnostics:environment', () => {
   return PuppeteerLauncher.diagnoseEnvironment();

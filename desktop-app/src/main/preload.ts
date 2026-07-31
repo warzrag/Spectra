@@ -13,6 +13,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     listOrganizations: () => ipcRenderer.invoke('vaManager:listOrganizations'),
     listAccounts: (organizationId?: string) =>
       ipcRenderer.invoke('vaManager:listAccounts', organizationId),
+    syncProfileCookies: (profileId: string, accountId: string, organizationId?: string) =>
+      ipcRenderer.invoke(
+        'vaManager:syncProfileCookies',
+        profileId,
+        accountId,
+        organizationId
+      ),
   },
 
   window: {
@@ -130,6 +137,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ) => callback(profileId, details);
       ipcRenderer.on('profile:closed', listener);
       return () => ipcRenderer.removeListener('profile:closed', listener);
+    },
+    onAuthenticatedXSnapshotSaved: (callback: (profileId: string) => void) => {
+      const listener = (_event: any, profileId: string) => callback(profileId);
+      ipcRenderer.on('profile:authenticatedXSnapshotSaved', listener);
+      return () => ipcRenderer.removeListener('profile:authenticatedXSnapshotSaved', listener);
+    },
+    onVaManagerCookieSync: (
+      callback: (payload: {
+        profileId: string;
+        success: boolean;
+        cookieCount?: number;
+        error?: string;
+      }) => void
+    ) => {
+      const listener = (_event: any, payload: any) => callback(payload);
+      ipcRenderer.on('profile:vaManagerCookieSync', listener);
+      return () => ipcRenderer.removeListener('profile:vaManagerCookieSync', listener);
     },
   },
 

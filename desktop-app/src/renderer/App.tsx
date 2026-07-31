@@ -81,6 +81,11 @@ declare global {
         disconnect: () => Promise<boolean>;
         listOrganizations: () => Promise<VaManagerOrganization[]>;
         listAccounts: (organizationId?: string) => Promise<VaManagerAccount[]>;
+        syncProfileCookies: (
+          profileId: string,
+          accountId: string,
+          organizationId?: string
+        ) => Promise<{ success: boolean; reason?: string }>;
       };
       window: {
         minimize: () => void;
@@ -204,6 +209,17 @@ declare global {
             }
           ) => void
         ) => () => void;
+        onAuthenticatedXSnapshotSaved: (
+          callback: (profileId: string) => void
+        ) => () => void;
+        onVaManagerCookieSync: (
+          callback: (payload: {
+            profileId: string;
+            success: boolean;
+            cookieCount?: number;
+            error?: string;
+          }) => void
+        ) => () => void;
       };
       browser?: {
         onDownloadProgress: (callback: (data: { percent: number; status: string }) => void) => () => void;
@@ -246,6 +262,7 @@ function App() {
   const [activePage, setActivePage] = useState<AppPage>('profiles');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
+  const confirmedXSessionProfilesRef = useRef<Set<string>>(new Set());
   const [sessionImportProgress, setSessionImportProgress] = useState<SessionImportProgress | null>(null);
   const sessionImportRunRef = useRef<{ cancelled: boolean; profileId?: string } | null>(null);
   const [currentDeviceName, setCurrentDeviceName] = useState<string | null>(null);
@@ -313,10 +330,49 @@ function App() {
   useEffect(() => {
     window.electronAPI.profiles.getActive().then(setActiveProfiles).catch(() => {});
     const cleanup = window.electronAPI.profiles.onActiveUpdate((nextActiveProfiles) => {
+      for (const profileId of nextActiveProfiles) {
+        confirmedXSessionProfilesRef.current.delete(profileId);
+      }
       setActiveProfiles(nextActiveProfiles);
     });
     return () => cleanup();
   }, []);
+
+  useEffect(() => {
+    const subscribe = window.electronAPI.profileSync?.onAuthenticatedXSnapshotSaved;
+    if (!subscribe) return;
+
+    return subscribe((profileId) => {
+      if (confirmedXSessionProfilesRef.current.has(profileId)) return;
+      confirmedXSessionProfilesRef.current.add(profileId);
+      const profile = profiles.find(candidate => candidate.id === profileId);
+      showToast(
+        `"${profile?.name || profileId}" : session X enregistrée`,
+        'success'
+      );
+    });
+  }, [profiles, showToast]);
+
+  useEffect(() => {
+    const subscribe = window.electronAPI.profileSync?.onVaManagerCookieSync;
+    if (!subscribe) return;
+
+    return subscribe((payload) => {
+      const profile = profiles.find(candidate => candidate.id === payload.profileId);
+      if (payload.success) {
+        window.dispatchEvent(new CustomEvent('spectra:va-manager-cookies-synced'));
+        showToast(
+          `"${profile?.name || payload.profileId}" : cookies envoyés à VA Manager`,
+          'success'
+        );
+      } else {
+        showToast(
+          `"${profile?.name || payload.profileId}" : ${payload.error || 'envoi VA Manager impossible'}`,
+          'error'
+        );
+      }
+    });
+  }, [profiles, showToast]);
 
   useEffect(() => {
     window.electronAPI.profileSync?.getHostname?.()
@@ -727,7 +783,7 @@ function App() {
         if (details.reason === 'missing-authenticated-x-snapshot') {
           const profile = profilesRef.current.find(p => p.id === profileId);
           showToast(
-            `"${profile?.name || profileId}" not synchronized: X login snapshot was not captured`,
+            `"${profile?.name || profileId}" non synchronisé : aucune session X connectée détectée`,
             'warning'
           );
         }
@@ -1156,6 +1212,7 @@ function App() {
           name: `X — ${account.username}`,
           platform: 'twitter',
           vaManagerAccountId: account.id,
+          vaManagerOrganizationId: account.organizationId || organizationId,
           vaManagerLoginStatus: 'pending',
           vaManagerLoginMessage: 'Première connexion en attente',
           userAgent: usFingerprint.userAgent || '',
@@ -1558,8 +1615,7 @@ function App() {
 
       if (enabledExtIds.length > 0 && window.electronAPI?.extensions) {
         const cloudExtensions = enabledExts.filter(e => e.storageUrl);
-        let extensionSyncFailed = false;
-        for (const ext of cloudExtensions) {
+        const extensionSyncResults = await Promise.allSettled(cloudExtensions.map(async ext => {
           try {
             await window.electronAPI.extensions.downloadAndInstall(
               ext.id,
@@ -1569,9 +1625,12 @@ function App() {
             );
           } catch (e) {
             console.error(`Failed to synchronize extension ${ext.name}:`, e);
-            extensionSyncFailed = true;
+            throw e;
           }
-        }
+        }));
+        const extensionSyncFailed = extensionSyncResults.some(
+          result => result.status === 'rejected'
+        );
         if (extensionSyncFailed) {
           showToast('Extension update failed - launch cancelled', 'error');
           if (user) {

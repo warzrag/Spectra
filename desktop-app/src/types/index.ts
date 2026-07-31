@@ -85,6 +85,7 @@ export interface Profile {
   lastUsed?: string;
   lastUrl?: string;
   vaManagerAccountId?: string | null;
+  vaManagerOrganizationId?: string | null;
   vaManagerLoginStatus?: 'pending' | 'connected' | 'manual' | 'failed';
   vaManagerLoginMessage?: string;
   vaManagerLastLoginAt?: string;
@@ -171,6 +172,7 @@ export interface VaManagerAccount {
   passwordUsable: boolean;
   hasTwoFa: boolean;
   hasAuthToken: boolean;
+  hasCookies: boolean;
   hasEmail: boolean;
   hasEmailPassword: boolean;
   emailPasswordUsable: boolean;
