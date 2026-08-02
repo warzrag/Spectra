@@ -52,8 +52,14 @@
   "mac": {
     "icon": "assets/icon.png",
     "category": "public.app-category.productivity",
-    "target": ["dmg"],
-    "identity": null
+    "target": [
+      {
+        "target": "dmg",
+        "arch": ["arm64"]
+      }
+    ],
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "identity": "-"
   },
   "linux": {
     "icon": "assets/icon.png",
