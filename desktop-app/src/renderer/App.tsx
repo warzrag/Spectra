@@ -262,6 +262,7 @@ function App() {
   const [activePage, setActivePage] = useState<AppPage>('profiles');
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [activeProfiles, setActiveProfiles] = useState<string[]>([]);
+  const runtimeDetectedProfilesRef = useRef<Set<string>>(new Set());
   const confirmedXSessionProfilesRef = useRef<Set<string>>(new Set());
   const [sessionImportProgress, setSessionImportProgress] = useState<SessionImportProgress | null>(null);
   const sessionImportRunRef = useRef<{ cancelled: boolean; profileId?: string } | null>(null);
@@ -333,7 +334,10 @@ function App() {
       for (const profileId of nextActiveProfiles) {
         confirmedXSessionProfilesRef.current.delete(profileId);
       }
-      setActiveProfiles(nextActiveProfiles);
+      setActiveProfiles(Array.from(new Set([
+        ...nextActiveProfiles,
+        ...runtimeDetectedProfilesRef.current,
+      ])));
     });
     return () => cleanup();
   }, []);
@@ -624,6 +628,73 @@ function App() {
     profileIdsRef.current = new Set(profiles.map(p => p.id));
     profilesRef.current = profiles;
   }, [profiles]);
+
+  const profileRuntimeScopeKey = profiles.map(profile => profile.id).sort().join('|');
+  useEffect(() => {
+    if (
+      !user ||
+      !currentDeviceName ||
+      profiles.length === 0 ||
+      !window.electronAPI.profiles.getRunning
+    ) return;
+
+    let disposed = false;
+
+    const reconcileLocalRuntimePresence = async () => {
+      const currentProfiles = profilesRef.current;
+      const profileIds = currentProfiles.map(profile => profile.id);
+      if (profileIds.length === 0) return;
+
+      try {
+        const [trackedProfileIds, detectedProfileIds] = await Promise.all([
+          window.electronAPI.profiles.getActive(),
+          window.electronAPI.profiles.getRunning!(profileIds),
+        ]);
+        if (disposed) return;
+
+        runtimeDetectedProfilesRef.current = new Set(detectedProfileIds);
+        setActiveProfiles(Array.from(new Set([
+          ...trackedProfileIds,
+          ...detectedProfileIds,
+        ])));
+
+        await Promise.allSettled(detectedProfileIds.map(async profileId => {
+          const profile = profilesRef.current.find(item => item.id === profileId);
+          if (!profile) return;
+
+          const lockOwnedByThisInstallation = profile.lockedBy === user.uid && (
+            profile.lockedByInstallationId
+              ? profile.lockedByInstallationId === currentInstallationId
+              : (!profile.lockedByDevice || profile.lockedByDevice === currentDeviceName)
+          );
+          if (lockOwnedByThisInstallation) return;
+          if (isLockedByOther(profile, user.uid, currentDeviceName, currentInstallationId)) return;
+
+          await acquireProfileLock(
+            profileId,
+            { uid: user.uid, email: user.email },
+            currentInstallationId
+          );
+          console.log(`[RuntimePresence] Restored cloud presence for "${profile.name}"`);
+        }));
+      } catch (error) {
+        console.error('[RuntimePresence] Could not reconcile local Chrome processes:', error);
+      }
+    };
+
+    reconcileLocalRuntimePresence();
+    const interval = window.setInterval(reconcileLocalRuntimePresence, 30000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    user?.uid,
+    user?.email,
+    currentDeviceName,
+    currentInstallationId,
+    profileRuntimeScopeKey,
+  ]);
 
   // Non-destructive migration: promote existing portable authenticated cookies
   // to the protected snapshot format. Cloud data is not changed here; the next
@@ -2046,6 +2117,7 @@ function App() {
             onEditProfile={(profile) => { setEditingProfile(profile); setShowCreateModal(true); }}
             onCloneProfile={handleCloneProfile}
             currentDeviceName={currentDeviceName}
+            currentInstallationId={currentInstallationId}
           />
         );
       case 'proxies':

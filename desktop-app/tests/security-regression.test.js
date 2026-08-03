@@ -1381,6 +1381,23 @@ test('the instance table exposes a working per-profile proxy test', () => {
   assert.match(dashboard, /proxyTestResult\.ping/);
 });
 
+test('the instance table distinguishes local and remote running profiles', () => {
+  const dashboard = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  assert.match(dashboard, /currentInstallationId\?: string \| null/);
+  assert.match(dashboard, /const remoteActive = !isActive && isLockedByOther/);
+  assert.match(dashboard, /Running locally/);
+  assert.match(dashboard, /Running on \{remoteDevice\}/);
+  assert.match(dashboard, /On \{remoteDevice\}/);
+  assert.match(app, /currentInstallationId=\{currentInstallationId\}/);
+  assert.match(app, /runtimeDetectedProfilesRef/);
+  assert.match(app, /reconcileLocalRuntimePresence/);
+  assert.match(app, /profiles\.getRunning!\(profileIds\)/);
+  assert.match(app, /Restored cloud presence/);
+  assert.match(app, /window\.setInterval\(reconcileLocalRuntimePresence, 30000\)/);
+});
+
 test('profile lifecycle telemetry records exits without changing OpenPost or VenusBot control', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const urlServer = read('desktop-app/src/main/url-server.ts');

@@ -36,6 +36,7 @@ interface DashboardProps {
   onEditProfile: (profile: Profile) => void;
   onCloneProfile: (profile: Profile) => void;
   currentDeviceName?: string | null;
+  currentInstallationId?: string | null;
 }
 
 const Dashboard: React.FC<DashboardProps> = ({
@@ -64,6 +65,7 @@ const Dashboard: React.FC<DashboardProps> = ({
   onEditProfile,
   onCloneProfile,
   currentDeviceName,
+  currentInstallationId,
 }) => {
   const { user, isAdmin, isVA } = useAuth();
   const { showToast } = useToast();
@@ -207,7 +209,7 @@ const Dashboard: React.FC<DashboardProps> = ({
 
   const launchableVisibleProfiles = filteredProfiles.filter(profile =>
     !activeProfiles.includes(profile.id) &&
-    !(user && isLockedByOther(profile, user.uid, currentDeviceName))
+    !(user && isLockedByOther(profile, user.uid, currentDeviceName, currentInstallationId))
   );
 
   const handleSelectProfile = (profileId: string) => {
@@ -1074,7 +1076,15 @@ const Dashboard: React.FC<DashboardProps> = ({
                 const isTestingProxy = testingProxyProfileIds.has(profile.id);
                 const proxyTestResult = proxyTestResults[profile.id];
                 const conn = getConnectionInfo(profile);
-                const locked = !isActive && isLockedByOther(profile, user?.uid || '', currentDeviceName);
+                const remoteActive = !isActive && isLockedByOther(
+                  profile,
+                  user?.uid || '',
+                  currentDeviceName,
+                  currentInstallationId
+                );
+                const locked = remoteActive;
+                const isRunning = isActive || remoteActive;
+                const remoteDevice = profile.lockedByDevice || 'another device';
 
                 const isDragTarget = dragOverId === profile.id && dragId !== profile.id;
                 const isDragging = dragId === profile.id;
@@ -1133,7 +1143,7 @@ const Dashboard: React.FC<DashboardProps> = ({
                         )}
                         <div
                           className="w-8 h-8 rounded-lg flex items-center justify-center text-[13px] font-bold shrink-0"
-                          style={{ background: isActive ? 'var(--success-subtle)' : 'var(--bg-overlay)', color: isActive ? 'var(--success)' : 'var(--text-muted)' }}
+                          style={{ background: isRunning ? 'var(--success-subtle)' : 'var(--bg-overlay)', color: isRunning ? 'var(--success)' : 'var(--text-muted)' }}
                         >
                           {profile.platform && platformInfo[profile.platform]
                             ? platformInfo[profile.platform].icon
@@ -1163,16 +1173,16 @@ const Dashboard: React.FC<DashboardProps> = ({
                       {isActive ? (
                         <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium" style={{ background: 'var(--success-subtle)', color: 'var(--success)' }}>
                           <Circle size={6} className="fill-current status-dot-active" />
-                          Running
+                          Running locally
                         </span>
-                      ) : locked ? (
+                      ) : remoteActive ? (
                         <span
                           className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium"
-                          style={{ background: 'rgba(245,158,11,0.12)', color: '#f59e0b' }}
-                          title={`Utilise par ${profile.lockedByEmail || '?'} sur ${profile.lockedByDevice || '?'}`}
+                          style={{ background: 'var(--success-subtle)', color: 'var(--success)' }}
+                          title={`Running for ${profile.lockedByEmail || '?'} on ${remoteDevice}`}
                         >
-                          <Lock size={10} />
-                          In use
+                          <Monitor size={10} />
+                          Running on {remoteDevice}
                         </span>
                       ) : (
                         <span className="text-[12px]" style={{ color: 'var(--text-muted)' }}>Idle</span>
@@ -1329,8 +1339,8 @@ const Dashboard: React.FC<DashboardProps> = ({
                         >
                           {isActive ? (
                             <><Circle size={10} className="fill-current status-dot-active" /> Active</>
-                          ) : locked ? (
-                            <><Lock size={12} /> Locked</>
+                          ) : remoteActive ? (
+                            <><Monitor size={12} /> On {remoteDevice}</>
                           ) : (
                             <><Play size={12} /> Open</>
                           )}
