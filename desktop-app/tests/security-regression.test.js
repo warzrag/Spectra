@@ -1398,6 +1398,17 @@ test('the instance table distinguishes local and remote running profiles', () =>
   assert.match(app, /window\.setInterval\(reconcileLocalRuntimePresence, 30000\)/);
 });
 
+test('the profile upload queue discards an already committed retry and avoids toast spam', () => {
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  assert.match(app, /const alreadyCommitted = hasNoActiveLock/);
+  assert.match(app, /localVersion === cloudVersion/);
+  assert.match(app, /localRevision === cloudRevision/);
+  assert.match(app, /Removed already committed queue item/);
+  assert.match(app, /const notifiedSyncFailures = new Set<string>\(\)/);
+  assert.match(app, /if \(!notifiedSyncFailures\.has\(profileId\)\)/);
+});
+
 test('profile lifecycle telemetry records exits without changing OpenPost or VenusBot control', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const urlServer = read('desktop-app/src/main/url-server.ts');

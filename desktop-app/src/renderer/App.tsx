@@ -754,6 +754,7 @@ function App() {
     } catch {}
     let isProcessing = false;
     let retryTimer: number | null = null;
+    const notifiedSyncFailures = new Set<string>();
 
     const persistQueue = () => {
       localStorage.setItem(queueStorageKey, JSON.stringify(uploadQueue));
@@ -769,6 +770,30 @@ function App() {
           const { profileId, profileName } = uploadQueue[0];
           try {
             const queuedProfile = profilesRef.current.find(p => p.id === profileId);
+            const localVersion = Number(
+              await window.electronAPI.profileSync.getLocalSyncVersion(profileId) || 0
+            );
+            const localRevision = await window.electronAPI.profileSync.getLocalSyncRevision(profileId);
+            const cloudVersion = Number(queuedProfile?.cloudSyncVersion || 0);
+            const cloudRevision = queuedProfile?.cloudSyncRevision || null;
+            const hasNoActiveLock = !queuedProfile?.lockedBy;
+            const alreadyCommitted = hasNoActiveLock &&
+              localVersion === cloudVersion &&
+              Boolean(localRevision) &&
+              localRevision === cloudRevision;
+
+            // A successful upload can be acknowledged by Firestore while the
+            // renderer misses the final queue cleanup (shutdown/network loss).
+            // Do not retry that stale item forever once local and cloud point
+            // to the exact same immutable revision and no device owns the lock.
+            if (alreadyCommitted) {
+              uploadQueue.shift();
+              persistQueue();
+              notifiedSyncFailures.delete(profileId);
+              setSyncProgress(null);
+              console.log(`[ProfileSync] Removed already committed queue item for ${profileId}`);
+              continue;
+            }
             const requiresPortableAuth = queuedProfile?.platform === 'twitter' ||
               /^https?:\/\/(?:www\.)?(?:x|twitter)\.com\//i.test(queuedProfile?.lastUrl || '');
             if (requiresPortableAuth) {
@@ -807,6 +832,7 @@ function App() {
             });
             uploadQueue.shift();
             persistQueue();
+            notifiedSyncFailures.delete(profileId);
             setSyncProgress(null);
             showToast(`"${profileName}" synchronized`, 'success');
           } catch (error) {
@@ -830,7 +856,10 @@ function App() {
               );
               continue;
             }
-            showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
+            if (!notifiedSyncFailures.has(profileId)) {
+              notifiedSyncFailures.add(profileId);
+              showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
+            }
             retryTimer = window.setTimeout(processQueue, 30000);
             break;
           }
