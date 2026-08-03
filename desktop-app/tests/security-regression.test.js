@@ -113,6 +113,15 @@ test('manual and managed browser launches use isolated startup policies', () => 
   assert.equal(shouldOpenSetupTab('open-post', false), false);
 });
 
+test('Open Selected window placement cycles through visible screen slots', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  assert.match(launcher, /const maxRows = Math\.max\(1, Math\.floor/);
+  assert.match(launcher, /const visibleCapacity = Math\.max\(1, columns \* maxRows\)/);
+  assert.match(launcher, /launchMode === 'automation'[\s\S]*rawSlot % visibleCapacity/);
+  assert.match(launcher, /7 overlays 1, 8 overlays 2/);
+});
+
 test('manual windows are fitted to smaller displays without changing valid layouts', () => {
   const { fitWindowToWorkArea } = loadTypeScriptModule(
     'desktop-app/src/shared/launch-policy.ts'

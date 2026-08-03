@@ -438,7 +438,17 @@ public class Win32 {
       : this.compactWindow;
     const maxColumns = Math.max(1, Math.floor((workArea.width - win.margin * 2 + win.gap) / (win.width + win.gap)));
     const columns = Math.max(1, maxColumns);
-    const slot = Math.max(0, layout?.index ?? this.activeProfiles.size);
+    const rawSlot = Math.max(0, layout?.index ?? this.activeProfiles.size);
+    const maxRows = Math.max(1, Math.floor(
+      (workArea.height - win.margin * 2 + win.gap) / (win.height + win.gap)
+    ));
+    const visibleCapacity = Math.max(1, columns * maxRows);
+    // Open Selected may launch more profiles than the display can tile. Cycle
+    // through the visible slots instead of placing later windows off-screen.
+    // On the VPS display this yields six slots: 7 overlays 1, 8 overlays 2, etc.
+    const slot = launchMode === 'automation'
+      ? rawSlot % visibleCapacity
+      : rawSlot;
     const col = slot % columns;
     const row = Math.floor(slot / columns);
     const left = workArea.x + win.margin + col * (win.width + win.gap);
