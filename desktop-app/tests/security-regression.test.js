@@ -26,6 +26,7 @@ const getCookieSyncBackgroundSource = ({
   profileName,
   launchId,
   hasStagedCookies = false,
+  openPostMode = false,
 }) => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts').replace(/\r\n/g, '\n');
   const marker = "fs.writeFileSync(path.join(cookieSyncPath, 'background.js'),\n`";
@@ -38,7 +39,7 @@ const getCookieSyncBackgroundSource = ({
     .replaceAll('${JSON.stringify(options.profileId)}', JSON.stringify(profileId))
     .replaceAll('${JSON.stringify(options.profileName)}', JSON.stringify(profileName))
     .replaceAll('${JSON.stringify(autoStartLaunchId)}', JSON.stringify(launchId))
-    .replaceAll('${JSON.stringify(Boolean(targetTweetUrl))}', 'false')
+    .replaceAll('${JSON.stringify(Boolean(targetTweetUrl))}', JSON.stringify(openPostMode))
     .replaceAll('${JSON.stringify(hasStagedCookies)}', JSON.stringify(hasStagedCookies))
     .replaceAll('${JSON.stringify(sessionImportAttemptId)}', JSON.stringify(''))
     .replaceAll('${this.localServerConfig?.port || 0}', '45678')
@@ -225,7 +226,7 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(launcher, /throw new Error\('Invalid X post URL'\)/);
   assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true \|\| Boolean\(targetTweetUrl\)/);
   assert.match(launcher, /likeTargetPost:\s*Boolean\(targetTweetUrl\)/);
-  assert.match(launcher, /targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)/);
+  assert.match(launcher, /hasStagedCookies \? 'about:blank' : startUrl/);
   assert.match(launcher, /!options\.autoStartTwitterBot && !targetTweetUrl/);
   assert.match(launcher, /js:\s*\['open-post-actions\.js'\]/);
   assert.match(launcher, /run_at:\s*'document_idle'/);
@@ -740,7 +741,9 @@ test('cookie import targets the file consumed by the runtime importer', () => {
 test('cross-device cookies are restored before navigation and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*\(targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)\)/);
+  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*\(hasStagedCookies \? 'about:blank' : startUrl\)/);
+  assert.doesNotMatch(launcher, /targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)/);
+  assert.match(launcher, /await importCookies\(\);\s+cookiesImported = true;\s+}\s+const tabId = await openStartUrl\(\)/);
   assert.match(launcher, /Promise\.race\(\[\s*chrome\.cookies\.set\(details\)/);
   assert.match(launcher, /Cookie import timed out/);
   assert.match(launcher, /await importCookies\(\);\s+cookiesImported = true/);
@@ -1092,6 +1095,111 @@ test('manual cross-device launch replaces only the temporary blank tab after coo
   assert.deepEqual(removedTabIds, []);
   assert.equal(tabs[0].url, 'https://x.com/home');
   assert.equal(tabs[1].url, 'https://example.com/kept-by-user');
+});
+
+test('Open Post imports staged cookies before its first navigation to X', async () => {
+  const sequence = [];
+  let fakeNow = 1_000_000;
+  class FastDate extends Date {
+    static now() {
+      fakeNow += 30_000;
+      return fakeNow;
+    }
+  }
+  const tabs = [{ id: 1, url: 'about:blank', status: 'complete', active: true }];
+  let nextTabId = 2;
+  const chrome = {
+    runtime: {
+      getURL: file => `chrome-extension://cookie-sync/${file}`,
+      onStartup: { addListener() {} },
+      onInstalled: { addListener() {} },
+      onSuspend: { addListener() {} },
+      onMessage: { addListener() {} },
+    },
+    cookies: {
+      set: async () => {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        sequence.push('cookie-imported');
+      },
+      getAll: async () => [],
+      onChanged: { addListener() {} },
+    },
+    tabs: {
+      query: async () => tabs.map(tab => ({ ...tab })),
+      create: async properties => {
+        sequence.push(`navigate:${properties.url}`);
+        const tab = { id: nextTabId++, url: properties.url, status: 'complete', active: true };
+        tabs.push(tab);
+        return { ...tab };
+      },
+      update: async (tabId, properties) => {
+        sequence.push(`navigate:${properties.url}`);
+        const tab = tabs.find(candidate => candidate.id === tabId);
+        Object.assign(tab, properties, { status: 'complete' });
+        return { ...tab };
+      },
+      remove: async tabId => {
+        const index = tabs.findIndex(tab => tab.id === tabId);
+        if (index >= 0) tabs.splice(index, 1);
+      },
+      get: async tabId => ({ ...tabs.find(tab => tab.id === tabId) }),
+      onCreated: { addListener() {} },
+    },
+    scripting: { executeScript: async () => [{ result: false }] },
+    alarms: {
+      create() {},
+      clear: async () => true,
+      onAlarm: { addListener() {} },
+    },
+    windows: { onRemoved: { addListener() {} } },
+  };
+  const fetch = async url => {
+    if (String(url).endsWith('/cookies.json')) {
+      return {
+        ok: true,
+        json: async () => [{
+          name: 'auth_token', value: 'test', domain: '.x.com', path: '/', secure: true,
+        }],
+      };
+    }
+    if (String(url).endsWith('/start_url.json')) {
+      return {
+        ok: true,
+        json: async () => ({
+          startUrl: 'https://x.com/example/status/123', closeOtherTabs: true,
+        }),
+      };
+    }
+    if (String(url).endsWith('/api/save-cookies')) return { ok: true, json: async () => ({}) };
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const source = getCookieSyncBackgroundSource({
+    profileId: 'open_post_cookie_order',
+    profileName: 'Open Post Cookie Order',
+    launchId: '',
+    hasStagedCookies: true,
+    openPostMode: true,
+  });
+  vm.runInNewContext(source, {
+    chrome,
+    fetch,
+    console,
+    Date: FastDate,
+    setTimeout: (callback, delay = 0) => setTimeout(callback, Math.min(delay, 5)),
+    clearTimeout,
+    setInterval: () => 0,
+    clearInterval() {},
+    Promise,
+    JSON,
+    RegExp,
+    String,
+    Error,
+  }, { filename: 'cookie-sync-open-post-order.js' });
+
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(sequence[0], 'cookie-imported');
+  assert.equal(sequence[1], 'navigate:https://x.com/example/status/123');
 });
 
 test('five generated Open Selected bootstraps recover independently and retain one X tab', async () => {

@@ -2886,7 +2886,7 @@ setTimeout(exportCookies, 1000);
       // On another PC, import the portable JSON cookies before navigating to X.
       const regularLaunchUrl = options.autoStartTwitterBot
         ? startUrl
-        : (targetTweetUrl || (hasStagedCookies ? 'about:blank' : startUrl));
+        : (hasStagedCookies ? 'about:blank' : startUrl);
       const launchUrl = sessionImportAttemptId ? startUrl : regularLaunchUrl;
       if (shouldAppendLaunchUrl(launchMode, hasRestorableSession)) {
         args.push(launchUrl);
