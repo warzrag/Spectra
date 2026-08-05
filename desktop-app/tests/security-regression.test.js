@@ -226,11 +226,18 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(launcher, /throw new Error\('Invalid X post URL'\)/);
   assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true \|\| Boolean\(targetTweetUrl\)/);
   assert.match(launcher, /likeTargetPost:\s*Boolean\(targetTweetUrl\)/);
-  assert.match(launcher, /hasStagedCookies \? 'about:blank' : startUrl/);
+  assert.match(launcher, /targetTweetUrl\s*\? openPostBootstrapUrl/);
   assert.match(launcher, /!options\.autoStartTwitterBot && !targetTweetUrl/);
-  assert.match(launcher, /js:\s*\['open-post-actions\.js'\]/);
-  assert.match(launcher, /run_at:\s*'document_idle'/);
+  assert.match(launcher, /key:\s*cookieSyncManifestKey/);
+  assert.match(launcher, /bootstrap\.html/);
+  assert.match(launcher, /spectra:open-post-bootstrap-page/);
+  assert.match(launcher, /chrome\.scripting\.executeScript\(\{\s*target:\s*\{ tabId \},\s*files:\s*\['open-post-actions\.js'\]/);
   assert.match(launcher, /window\.__spectraOpenPostActionsStarted/);
+  assert.match(launcher, /spectra:open-post-telemetry/);
+  assert.match(launcher, /reportStage\('content-loaded'/);
+  assert.match(launcher, /reportStage\('actions-started'/);
+  assert.match(launcher, /reportStage\('like-result'/);
+  assert.match(launcher, /reportStage\('repost-result'/);
   assert.match(launcher, /article\[data-testid="tweet"\]/);
   assert.match(launcher, /\[data-testid="unlike"\]/);
   assert.match(launcher, /\[data-testid="like"\]/);
@@ -357,7 +364,7 @@ test('manual profile launches do not inherit managed OpenPost tab behavior', () 
   );
   assert.match(
     launcher,
-    /if \(MANAGED_STARTUP_MODE\) \{[\s\S]*bootstrap\(\)\.then\(\(tabId\) => startSessionImport\(tabId\)\)/
+    /if \(MANAGED_STARTUP_MODE\) \{[\s\S]*bootstrap\(\)\.then\(async \(tabId\) => \{\s*await startSessionImport\(tabId\);\s*await startOpenPostActions\(tabId\);/
   );
   assert.match(
     launcher,
@@ -738,15 +745,16 @@ test('cookie import targets the file consumed by the runtime importer', () => {
   assert.doesNotMatch(main, /cookieStagingPath = path\.join\(profileDir, 'pending_cookies\.json'\)/);
 });
 
-test('cross-device cookies are restored before navigation and Chrome closes gracefully', () => {
+test('cross-device cookies are restored before Open Post actions and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*\(hasStagedCookies \? 'about:blank' : startUrl\)/);
-  assert.doesNotMatch(launcher, /targetTweetUrl \|\| \(hasStagedCookies \? 'about:blank' : startUrl\)/);
-  assert.match(launcher, /await importCookies\(\);\s+cookiesImported = true;\s+}\s+const tabId = await openStartUrl\(\)/);
+  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*targetTweetUrl\s*\?\s*openPostBootstrapUrl/);
+  assert.match(launcher, /async function ensureCookiesImported\(\)/);
+  assert.match(launcher, /await ensureCookiesImported\(\);\s+const tabId = await openStartUrl\(\)/);
   assert.match(launcher, /Promise\.race\(\[\s*chrome\.cookies\.set\(details\)/);
   assert.match(launcher, /Cookie import timed out/);
-  assert.match(launcher, /await importCookies\(\);\s+cookiesImported = true/);
+  assert.match(launcher, /spectra:open-post-bootstrap-page[\s\S]*bootstrap\(\)/);
+  assert.match(launcher, /bootstrap\(\)[\s\S]*startOpenPostActions\(tabId\)/);
   assert.match(launcher, /const tabId = await openStartUrl\(\)/);
   assert.match(launcher, /await reportLaunchStatus\('bootstrap-confirmed'[\s\S]*bootstrapComplete = true/);
   assert.match(launcher, /CloseMainWindow\(\)/);
@@ -1097,7 +1105,7 @@ test('manual cross-device launch replaces only the temporary blank tab after coo
   assert.equal(tabs[1].url, 'https://example.com/kept-by-user');
 });
 
-test('Open Post imports staged cookies before its first navigation to X', async () => {
+test('Open Post background bootstrap imports staged cookies before managed X navigation', async () => {
   const sequence = [];
   let fakeNow = 1_000_000;
   class FastDate extends Date {

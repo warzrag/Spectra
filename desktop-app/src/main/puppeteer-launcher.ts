@@ -1598,26 +1598,22 @@ public class Win32 {
         extensionVersionTime.getUTCHours() * 60 + extensionVersionTime.getUTCMinutes(),
         extensionVersionTime.getUTCSeconds(),
       ].join('.');
+      // A valid, fixed DER SubjectPublicKeyInfo keeps the unpacked runtime
+      // extension ID stable across profiles and launches. Chrome may reject an
+      // arbitrary byte string in manifest.key, which would leave Open Post on
+      // X without ever loading the action controller.
+      const cookieSyncManifestKey =
+        'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn1QtjQdz50DefJpeLaEMjPiR+NR/bpRV405aDQlabU0Rn7MNQAIb9QLUYFf5l5OF7z6GDlXcwnXjPGA3+EBUeJfvr7ETNsObyEa8t+8U8hC5znQZn/Q9aork0YMhhRI978yB759gT2DObLeu616XVzq/nvu0XOO/n0dUPqnhfMh6FcUy9241MxJGuyH0HiW5aOUTs2ewdiv+HfA8iybEmDn0kBCPB0vuveQxQsfduyteVd67IIet2JiyvoCbmh2Wbz7piYdfVM1cHtPnacGwFHVFwDfchxYiZ5CC35fCeSfMshUj/sNg8zVwjbsaLdnqJScpsZzdftZWkNT1duhXKwIDAQAB';
 
       fs.writeFileSync(path.join(cookieSyncPath, 'manifest.json'), JSON.stringify({
         manifest_version: 3,
         name: 'Cookie Sync',
         version: cookieSyncExtensionVersion,
+        key: cookieSyncManifestKey,
         permissions: ['cookies', 'tabs', 'scripting', 'alarms'],
         host_permissions: ['<all_urls>'],
         background: { service_worker: 'background.js' },
-        ...(targetTweetUrl ? {
-          content_scripts: [{
-            matches: [
-              'https://x.com/*',
-              'https://www.x.com/*',
-              'https://twitter.com/*',
-              'https://www.twitter.com/*',
-            ],
-            js: ['open-post-actions.js'],
-            run_at: 'document_idle',
-          }],
-        } : sessionImportAttemptId ? {
+        ...(sessionImportAttemptId ? {
           content_scripts: [{
             matches: [
               'https://x.com/*',
@@ -1630,8 +1626,24 @@ public class Win32 {
           }],
         } : {}),
       }));
+      const cookieSyncExtensionId = this.getChromeExtensionId(cookieSyncPath);
+      if (!cookieSyncExtensionId) {
+        throw new Error('Cookie Sync extension ID could not be derived');
+      }
+      const openPostBootstrapUrl = `chrome-extension://${cookieSyncExtensionId}/bootstrap.html`;
 
       if (targetTweetUrl) {
+        fs.writeFileSync(path.join(cookieSyncPath, 'bootstrap.html'),
+          '<!doctype html><meta charset="utf-8"><title>Spectra Open Post</title>' +
+          '<body style="margin:0;background:#0b0d12;color:#e5e7eb;font:16px system-ui;display:grid;' +
+          'place-items:center;min-height:100vh">Preparing authenticated session…' +
+          '<script src="bootstrap.js"></script></body>'
+        );
+        fs.writeFileSync(path.join(cookieSyncPath, 'bootstrap.js'),
+          `chrome.runtime.sendMessage({ type: 'spectra:open-post-bootstrap-page' }, () => {\n` +
+          `  void chrome.runtime.lastError;\n` +
+          `});\n`
+        );
         const targetStatusId = new URL(targetTweetUrl).pathname.match(/\/status\/(\d+)/)?.[1] || '';
         const closeFallbackUrl =
           `http://127.0.0.1:${this.localServerConfig?.port || 0}/api/close-profile` +
@@ -1645,6 +1657,16 @@ public class Win32 {
   const TARGET_STATUS_ID = ${JSON.stringify(targetStatusId)};
   const CLOSE_FALLBACK_URL = ${JSON.stringify(closeFallbackUrl)};
   const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+  function reportStage(stage, details = {}) {
+    try {
+      chrome.runtime.sendMessage({
+        type: 'spectra:open-post-telemetry',
+        stage,
+        details,
+      }, () => { void chrome.runtime.lastError; });
+    } catch {}
+  }
 
   function findTargetArticle() {
     const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
@@ -1865,12 +1887,17 @@ public class Win32 {
   }
 
   async function run() {
+    reportStage('content-loaded', { path: location.pathname });
+    reportStage('actions-started');
+
     const article = await waitForTargetArticle();
     if (!article) {
+      reportStage('target-not-found');
       console.warn('[Spectra OpenPost] Target post was not found');
       await finishInstance(false, false, false);
       return;
     }
+    reportStage('target-found');
 
     article.scrollIntoView({ block: 'center', inline: 'nearest' });
     await wait(100);
@@ -1899,6 +1926,7 @@ public class Win32 {
       }
     }
     console.log('[Spectra OpenPost] like: ' + likeStatus);
+    reportStage('like-result', { status: likeStatus });
 
     await wait(200);
 
@@ -1921,6 +1949,7 @@ public class Win32 {
       }
     }
     console.log('[Spectra OpenPost] repost: ' + repostStatus);
+    reportStage('repost-result', { status: repostStatus });
 
     const likeConfirmed = likeStatus === 'liked' || likeStatus === 'already-liked';
     const repostConfirmed = repostStatus === 'reposted' || repostStatus === 'already-reposted';
@@ -2171,6 +2200,7 @@ let authenticationRetryTimer = null;
 let authenticatedSnapshotConfirmed = false;
 let retainedTabId = null;
 let cookiesImported = false;
+let cookieImportPromise = null;
 let venusConfirmationReported = false;
 let openPostCompleted = false;
 let sessionImportStarted = false;
@@ -2336,6 +2366,20 @@ async function importCookies() {
   } catch (e) {}
 }
 
+async function ensureCookiesImported() {
+  if (cookiesImported) return;
+  if (!cookieImportPromise) {
+    cookieImportPromise = importCookies()
+      .then(() => {
+        cookiesImported = true;
+      })
+      .finally(() => {
+        cookieImportPromise = null;
+      });
+  }
+  await cookieImportPromise;
+}
+
 async function openStartUrl() {
   try {
     const response = await fetch(chrome.runtime.getURL('start_url.json'));
@@ -2455,10 +2499,7 @@ function bootstrap() {
       for (let attempt = 1; attempt <= BOOTSTRAP_ATTEMPTS; attempt++) {
         console.log('[Spectra AutoStart] Bootstrap attempt ' + attempt + '/' + BOOTSTRAP_ATTEMPTS);
         try {
-          if (!cookiesImported) {
-            await importCookies();
-            cookiesImported = true;
-          }
+          await ensureCookiesImported();
           const tabId = await openStartUrl();
           if (!tabId) throw new Error('openStartUrl returned no retainedTabId');
           retainedTabId = tabId;
@@ -2483,6 +2524,16 @@ function bootstrap() {
     });
   }
   return bootstrapPromise;
+}
+
+async function startOpenPostActions(tabId) {
+  if (!OPEN_POST_MODE || !tabId) return;
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['open-post-actions.js'],
+  });
+  await reportLifecycleEvent('open-post-actions-injected', { tabId });
+  console.log('[Spectra OpenPost] Action script injected explicitly into tab: ' + tabId);
 }
 
 async function runStartupWatchdog() {
@@ -2572,6 +2623,32 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.runtime.onMessage?.addListener((message, sender, sendResponse) => {
+  if (OPEN_POST_MODE && message?.type === 'spectra:open-post-telemetry') {
+    const stage = typeof message.stage === 'string'
+      ? message.stage.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48)
+      : '';
+    if (stage) {
+      reportLifecycleEvent('open-post-' + stage, {
+        tabId: sender.tab?.id,
+        ...(message.details && typeof message.details === 'object' ? message.details : {}),
+      });
+    }
+    sendResponse({ accepted: Boolean(stage) });
+    return;
+  }
+  if (OPEN_POST_MODE && message?.type === 'spectra:open-post-bootstrap-page') {
+    reportLifecycleEvent('open-post-bootstrap-page', { tabId: sender.tab?.id });
+    sendResponse({ accepted: true });
+    bootstrap()
+      .then((tabId) => startOpenPostActions(tabId))
+      .catch((error) => {
+        reportLifecycleEvent('open-post-bootstrap-page-failed', {
+          error: String(error?.message || error).slice(0, 240),
+        });
+        console.error('[Spectra OpenPost] Explicit bootstrap failed:', error);
+      });
+    return;
+  }
   if (message?.type === 'spectra:session-import-status' && SESSION_IMPORT_MODE) {
     reportSessionImportStatus(message.status, message.message)
       .then(() => sendResponse({ accepted: true }))
@@ -2710,7 +2787,10 @@ if (MANAGED_STARTUP_MODE) {
     delayInMinutes: 0.5,
     periodInMinutes: 0.5,
   });
-  bootstrap().then((tabId) => startSessionImport(tabId)).catch((error) => {
+  bootstrap().then(async (tabId) => {
+    await startSessionImport(tabId);
+    await startOpenPostActions(tabId);
+  }).catch((error) => {
     console.error('[Spectra AutoStart] Initial bootstrap exhausted:', error);
   });
   runStartupWatchdog();
@@ -2886,7 +2966,9 @@ setTimeout(exportCookies, 1000);
       // On another PC, import the portable JSON cookies before navigating to X.
       const regularLaunchUrl = options.autoStartTwitterBot
         ? startUrl
-        : (hasStagedCookies ? 'about:blank' : startUrl);
+        : targetTweetUrl
+          ? openPostBootstrapUrl
+          : (hasStagedCookies ? 'about:blank' : startUrl);
       const launchUrl = sessionImportAttemptId ? startUrl : regularLaunchUrl;
       if (shouldAppendLaunchUrl(launchMode, hasRestorableSession)) {
         args.push(launchUrl);
