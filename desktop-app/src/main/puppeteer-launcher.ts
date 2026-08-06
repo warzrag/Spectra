@@ -183,6 +183,58 @@ export class PuppeteerLauncher {
     );
   }
 
+  /**
+   * Chromium builds User-Agent Client Hints from the real OS and --user-agent does not
+   * regenerate them, so a Windows-fingerprinted profile opened on macOS advertises
+   * Sec-CH-UA-Platform: "macOS" while its User-Agent claims Windows. No CDP is available
+   * on this launcher by design, so the per-profile MV3 extension rewrites the headers.
+   */
+  private static buildClientHintsRules(clientHintsPlatform: string) {
+    return [
+      {
+        id: 1,
+        priority: 1,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            {
+              header: 'sec-ch-ua-platform',
+              operation: 'set',
+              value: `"${clientHintsPlatform}"`,
+            },
+            // High-entropy hints are only sent when a site opts in through Accept-CH.
+            // Removing them is a no-op when absent and never leaks the host OS, whereas
+            // forcing values would advertise them unsolicited on every request.
+            { header: 'sec-ch-ua-platform-version', operation: 'remove' },
+            { header: 'sec-ch-ua-arch', operation: 'remove' },
+            { header: 'sec-ch-ua-bitness', operation: 'remove' },
+            { header: 'sec-ch-ua-model', operation: 'remove' },
+            { header: 'sec-ch-ua-full-version', operation: 'remove' },
+            { header: 'sec-ch-ua-full-version-list', operation: 'remove' },
+          ],
+        },
+        condition: {
+          urlFilter: '*',
+          resourceTypes: [
+            'main_frame',
+            'sub_frame',
+            'stylesheet',
+            'script',
+            'image',
+            'font',
+            'object',
+            'xmlhttprequest',
+            'ping',
+            'csp_report',
+            'media',
+            'websocket',
+            'other',
+          ],
+        },
+      },
+    ];
+  }
+
   private static async getProfileProcessIds(profilePath: string): Promise<number[]> {
     if (process.platform !== 'win32') return [];
     const escapedPath = profilePath.replace(/'/g, "''");
@@ -1329,12 +1381,16 @@ public class Win32 {
       try {
         chromePath = await this.downloadChromeForTesting();
       } catch (downloadError: any) {
-        const systemChrome = this.findSystemChrome();
-        if (!systemChrome) {
-          throw new Error(`Managed browser unavailable and system Chrome was not found: ${downloadError.message}`);
-        }
-        console.warn(`[Browser] Managed browser unavailable, using system Chrome: ${downloadError.message}`);
-        chromePath = systemChrome;
+        // Stable Google Chrome refuses --load-extension ("--load-extension is not allowed
+        // in Google Chrome, ignoring"), so falling back to it would start the profile with
+        // the entire fingerprint runtime silently dropped: user agent, platform, client
+        // hints, WebGL and canvas. An unprotected launch is worse than no launch, so this
+        // now fails loudly instead of degrading without telling anyone.
+        throw new Error(
+          `Managed browser unavailable: ${downloadError.message}. `
+          + 'System Chrome cannot replace it because it ignores --load-extension, which '
+          + 'would disable fingerprint protection for this profile.'
+        );
       }
 
       // Build Chrome args — MINIMAL flags only
@@ -1419,6 +1475,9 @@ public class Win32 {
         const isWindows = userAgent.includes('Windows');
         const isMac = userAgent.includes('Macintosh');
         const platform = isWindows ? 'Win32' : isMac ? 'MacIntel' : 'Linux x86_64';
+        // Client Hints travel as HTTP headers built from the real OS, so --user-agent
+        // alone leaves them contradicting the fingerprint when a profile moves machines.
+        const clientHintsPlatform = isWindows ? 'Windows' : isMac ? 'macOS' : 'Linux';
 
         platformFixPath = path.join(profilePath, '__platform_fix_ext');
         if (fs.existsSync(platformFixPath)) {
@@ -1429,7 +1488,18 @@ public class Win32 {
         fs.writeFileSync(path.join(platformFixPath, 'manifest.json'), JSON.stringify({
           manifest_version: 3,
           name: 'Spectra Fingerprint Runtime',
-          version: '2.1',
+          version: '2.2',
+          permissions: ['declarativeNetRequest'],
+          host_permissions: ['<all_urls>'],
+          declarative_net_request: {
+            rule_resources: [
+              {
+                id: 'spectra_client_hints',
+                enabled: true,
+                path: 'client-hints-rules.json',
+              },
+            ],
+          },
           content_scripts: [
             {
               matches: ['<all_urls>'],
@@ -1451,6 +1521,11 @@ public class Win32 {
           ],
         }));
 
+        fs.writeFileSync(
+          path.join(platformFixPath, 'client-hints-rules.json'),
+          JSON.stringify(this.buildClientHintsRules(clientHintsPlatform), null, 2)
+        );
+
         const fp = { ...effectiveFingerprint, userAgent, platform };
         fs.writeFileSync(path.join(platformFixPath, 'fingerprint.js'), `
 (() => {
@@ -1470,8 +1545,34 @@ public class Win32 {
   define(Navigator.prototype, 'doNotTrack', fp.doNotTrack ? '1' : null);
 
   if (navigator.userAgentData) {
-    define(Object.getPrototypeOf(navigator.userAgentData), 'platform',
-      fp.platform === 'Win32' ? 'Windows' : fp.platform === 'MacIntel' ? 'macOS' : 'Linux');
+    const uaDataProto = Object.getPrototypeOf(navigator.userAgentData);
+    const hintPlatform =
+      fp.platform === 'Win32' ? 'Windows' : fp.platform === 'MacIntel' ? 'macOS' : 'Linux';
+    define(uaDataProto, 'platform', hintPlatform);
+
+    const originalHighEntropy = uaDataProto.getHighEntropyValues;
+    if (typeof originalHighEntropy === 'function') {
+      const spoofedHints = {
+        platform: hintPlatform,
+        platformVersion:
+          fp.platform === 'Win32' ? '10.0.0' : fp.platform === 'MacIntel' ? '14.6.1' : '',
+        architecture: 'x86',
+        bitness: '64',
+        model: '',
+        wow64: false,
+      };
+      uaDataProto.getHighEntropyValues = function(hints) {
+        return originalHighEntropy.call(this, hints).then((values) => {
+          const merged = Object.assign({}, values);
+          for (const hint of (hints || [])) {
+            if (Object.prototype.hasOwnProperty.call(spoofedHints, hint)) {
+              merged[hint] = spoofedHints[hint];
+            }
+          }
+          return merged;
+        });
+      };
+    }
   }
 
   const screenValues = {

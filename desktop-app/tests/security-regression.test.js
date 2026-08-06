@@ -1385,6 +1385,61 @@ test('managed Chrome and the advertised user-agent stay version-aligned', () => 
   assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform \}/);
 });
 
+test('client hints follow the profile fingerprint instead of the host OS', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  // The platform advertised over HTTP is derived from the fingerprint, not from process.platform.
+  assert.match(
+    launcher,
+    /const clientHintsPlatform = isWindows \? 'Windows' : isMac \? 'macOS' : 'Linux'/
+  );
+  assert.match(launcher, /buildClientHintsRules\(clientHintsPlatform\)/);
+  assert.match(launcher, /'client-hints-rules\.json'/);
+  assert.match(launcher, /header: 'sec-ch-ua-platform',\s*operation: 'set'/);
+
+  // Navigation requests carry the login, so main_frame must be covered.
+  assert.match(launcher, /resourceTypes: \[\s*'main_frame'/);
+
+  // High-entropy hints are dropped rather than forged, so the host OS never leaks.
+  for (const header of [
+    'sec-ch-ua-platform-version',
+    'sec-ch-ua-arch',
+    'sec-ch-ua-bitness',
+    'sec-ch-ua-model',
+    'sec-ch-ua-full-version-list',
+  ]) {
+    assert.match(launcher, new RegExp(`header: '${header}', operation: 'remove'`));
+  }
+
+  // The JS surface must agree with the headers.
+  assert.match(launcher, /uaDataProto\.getHighEntropyValues = function\(hints\)/);
+  assert.match(launcher, /const hintPlatform =/);
+
+  // The rules ship in the shared per-profile extension, so every launch mode and every
+  // tab is covered without per-target wiring.
+  assert.match(launcher, /declarative_net_request: \{/);
+  assert.match(launcher, /if \(platformFixPath\) extPaths\.push\(platformFixPath\)/);
+
+  // The fix must not reintroduce a debug port on this deliberately CDP-free launcher.
+  assert.doesNotMatch(launcher, /remote-debugging-port/);
+  assert.doesNotMatch(launcher, /setUserAgentOverride/);
+  assert.match(launcher, /SPAWN Chrome — no Puppeteer, no CDP, no debug port/);
+});
+
+test('a profile never launches with the fingerprint runtime silently disabled', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  // Stable Google Chrome ignores --load-extension, so it can never stand in for the
+  // managed browser: doing so would drop the whole fingerprint extension without warning.
+  assert.match(launcher, /Managed browser unavailable: \$\{downloadError\.message\}/);
+  assert.match(launcher, /ignores --load-extension/);
+  assert.doesNotMatch(launcher, /chromePath = systemChrome/);
+  assert.doesNotMatch(launcher, /Managed browser unavailable, using system Chrome/);
+
+  // The fingerprint runtime stays mandatory rather than best-effort.
+  assert.match(launcher, /if \(platformFixPath\) extPaths\.push\(platformFixPath\)/);
+});
+
 test('team deletion is targeted and refuses teams that still own resources', () => {
   const admin = read('desktop-app/src/renderer/pages/AdminPage.tsx');
   assert.match(admin, /TEAM_RESOURCE_COLLECTIONS/);
