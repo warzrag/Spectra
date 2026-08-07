@@ -184,12 +184,33 @@ export class PuppeteerLauncher {
   }
 
   /**
+   * Chromium derives Accept-Language from the browser locale. --lang is honoured on
+   * Windows but largely ignored on macOS, where the system language wins: a US profile
+   * opened on a French Mac announced "fr-FR" behind a US proxy. Build the header from
+   * the fingerprint so it stays identical on every host.
+   */
+  private static buildAcceptLanguage(fingerprint: any): string {
+    const languages: string[] = Array.isArray(fingerprint?.languages) && fingerprint.languages.length
+      ? fingerprint.languages
+      : [fingerprint?.language || 'en-US'];
+
+    return languages
+      .filter((language: string) => typeof language === 'string' && language.length > 0)
+      .map((language: string, index: number) => {
+        if (index === 0) return language;
+        const quality = Math.max(0.1, 1 - index * 0.1);
+        return `${language};q=${quality.toFixed(1)}`;
+      })
+      .join(',');
+  }
+
+  /**
    * Chromium builds User-Agent Client Hints from the real OS and --user-agent does not
    * regenerate them, so a Windows-fingerprinted profile opened on macOS advertises
    * Sec-CH-UA-Platform: "macOS" while its User-Agent claims Windows. No CDP is available
    * on this launcher by design, so the per-profile MV3 extension rewrites the headers.
    */
-  private static buildClientHintsRules(clientHintsPlatform: string) {
+  private static buildClientHintsRules(clientHintsPlatform: string, acceptLanguage: string) {
     return [
       {
         id: 1,
@@ -201,6 +222,11 @@ export class PuppeteerLauncher {
               header: 'sec-ch-ua-platform',
               operation: 'set',
               value: `"${clientHintsPlatform}"`,
+            },
+            {
+              header: 'accept-language',
+              operation: 'set',
+              value: acceptLanguage,
             },
             // High-entropy hints are only sent when a site opts in through Accept-CH.
             // Removing them is a no-op when absent and never leaks the host OS, whereas
@@ -1523,7 +1549,14 @@ public class Win32 {
 
         fs.writeFileSync(
           path.join(platformFixPath, 'client-hints-rules.json'),
-          JSON.stringify(this.buildClientHintsRules(clientHintsPlatform), null, 2)
+          JSON.stringify(
+            this.buildClientHintsRules(
+              clientHintsPlatform,
+              this.buildAcceptLanguage(effectiveFingerprint)
+            ),
+            null,
+            2
+          )
         );
 
         const fp = { ...effectiveFingerprint, userAgent, platform };

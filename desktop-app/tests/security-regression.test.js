@@ -1393,7 +1393,7 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
     launcher,
     /const clientHintsPlatform = isWindows \? 'Windows' : isMac \? 'macOS' : 'Linux'/
   );
-  assert.match(launcher, /buildClientHintsRules\(clientHintsPlatform\)/);
+  assert.match(launcher, /buildClientHintsRules\(\s*clientHintsPlatform,/);
   assert.match(launcher, /'client-hints-rules\.json'/);
   assert.match(launcher, /header: 'sec-ch-ua-platform',\s*operation: 'set'/);
 
@@ -1410,6 +1410,12 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
   ]) {
     assert.match(launcher, new RegExp(`header: '${header}', operation: 'remove'`));
   }
+
+  // Accept-Language follows the fingerprint too: --lang is ignored on macOS, so a US
+  // profile opened on a French Mac used to announce fr-FR behind a US proxy.
+  assert.match(launcher, /buildAcceptLanguage\(effectiveFingerprint\)/);
+  assert.match(launcher, /header: 'accept-language',\s*operation: 'set'/);
+  assert.match(launcher, /fingerprint\?\.language \|\| 'en-US'/);
 
   // The JS surface must agree with the headers.
   assert.match(launcher, /uaDataProto\.getHighEntropyValues = function\(hints\)/);
