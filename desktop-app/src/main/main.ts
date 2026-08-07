@@ -955,10 +955,28 @@ const proxyManager = ProxyManager.getInstance();
 ipcMain.handle('proxy:test', async (_, proxyConfig) => {
   try {
     const isHealthy = await proxyManager.testProxy(proxyConfig);
-    return { isHealthy, country: proxyConfig.country || null };
+    return {
+      isHealthy,
+      country: proxyConfig.country || null,
+      timezone: proxyConfig.timezone || null,
+      city: proxyConfig.city || null,
+      region: proxyConfig.region || null,
+      latitude: Number.isFinite(proxyConfig.latitude) ? proxyConfig.latitude : null,
+      longitude: Number.isFinite(proxyConfig.longitude) ? proxyConfig.longitude : null,
+      exitIp: proxyConfig.lastExitIp || null,
+    };
   } catch (error: any) {
     console.error('Proxy test error:', error);
-    return { isHealthy: false, country: null };
+    return {
+      isHealthy: false,
+      country: null,
+      timezone: null,
+      city: null,
+      region: null,
+      latitude: null,
+      longitude: null,
+      exitIp: null,
+    };
   }
 });
 

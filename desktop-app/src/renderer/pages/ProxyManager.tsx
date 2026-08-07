@@ -196,10 +196,22 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
         const res = result as any;
         const isHealthy = res && typeof res === 'object' ? res.isHealthy : res;
         const country = res && typeof res === 'object' ? res.country : undefined;
+        const timezone = res && typeof res === 'object' ? res.timezone : undefined;
+        const city = res && typeof res === 'object' ? res.city : undefined;
+        const region = res && typeof res === 'object' ? res.region : undefined;
+        const latitude = res && typeof res === 'object' ? res.latitude : undefined;
+        const longitude = res && typeof res === 'object' ? res.longitude : undefined;
+        const exitIp = res && typeof res === 'object' ? res.exitIp : undefined;
         const lastCheck = new Date().toISOString();
         // Save test results to Firestore
         const updateData: any = { isHealthy, lastCheck, responseTime };
         if (country) updateData.country = country;
+        if (timezone) updateData.timezone = timezone;
+        if (city) updateData.city = city;
+        if (region) updateData.region = region;
+        if (Number.isFinite(latitude)) updateData.latitude = latitude;
+        if (Number.isFinite(longitude)) updateData.longitude = longitude;
+        if (exitIp) updateData.lastExitIp = exitIp;
         await firestoreUpdateProxy(proxyId, updateData).catch(() => {});
       }
     } finally {
@@ -223,9 +235,21 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
           const res = result as any;
           const isHealthy = res && typeof res === 'object' ? res.isHealthy : res;
           const country = res && typeof res === 'object' ? res.country : undefined;
+          const timezone = res && typeof res === 'object' ? res.timezone : undefined;
+          const city = res && typeof res === 'object' ? res.city : undefined;
+          const region = res && typeof res === 'object' ? res.region : undefined;
+          const latitude = res && typeof res === 'object' ? res.latitude : undefined;
+          const longitude = res && typeof res === 'object' ? res.longitude : undefined;
+          const exitIp = res && typeof res === 'object' ? res.exitIp : undefined;
           const lastCheck = new Date().toISOString();
           const updateData: any = { isHealthy, lastCheck, responseTime };
           if (country) updateData.country = country;
+          if (timezone) updateData.timezone = timezone;
+          if (city) updateData.city = city;
+          if (region) updateData.region = region;
+          if (Number.isFinite(latitude)) updateData.latitude = latitude;
+          if (Number.isFinite(longitude)) updateData.longitude = longitude;
+          if (exitIp) updateData.lastExitIp = exitIp;
           await firestoreUpdateProxy(proxy.id, updateData).catch(() => {});
         } finally {
           setTestingProxies(prev => {

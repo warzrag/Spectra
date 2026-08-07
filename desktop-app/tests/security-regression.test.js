@@ -1382,7 +1382,7 @@ test('managed Chrome and the advertised user-agent stay version-aligned', () => 
   assert.match(launcher, /Correcting Chrome User-Agent mismatch/);
   assert.match(launcher, /normalizedPath\.startsWith\(`\$\{managedBrowserRoot\}\$\{path\.sep\}`\)/);
   assert.match(launcher, /browserVersions\.get\(normalizedPath\)/);
-  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform \}/);
+  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform, architecture, brands \}/);
 });
 
 test('client hints follow the profile fingerprint instead of the host OS', () => {
@@ -1416,10 +1416,37 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
   assert.match(launcher, /buildAcceptLanguage\(effectiveFingerprint\)/);
   assert.match(launcher, /header: 'accept-language',\s*operation: 'set'/);
   assert.match(launcher, /fingerprint\?\.language \|\| 'en-US'/);
+  assert.match(launcher, /header: 'sec-ch-ua',\s*operation: 'set'/);
+  assert.match(launcher, /brand: 'Google Chrome'/);
 
   // The JS surface must agree with the headers.
   assert.match(launcher, /uaDataProto\.getHighEntropyValues = function\(hints\)/);
   assert.match(launcher, /const hintPlatform =/);
+  assert.match(launcher, /architecture: fp\.architecture \|\| 'x86'/);
+  assert.match(launcher, /Apple M\\d\/i\.test\(effectiveFingerprint\.webglRenderer/);
+
+  // TZ is ignored by Chromium on Windows. Date and Intl are therefore virtualized in
+  // the shared runtime so the same profile keeps its IANA timezone on every device.
+  assert.match(launcher, /const DateTimeFormatProxy = new Proxy\(NativeDateTimeFormat/);
+  assert.match(launcher, /Object\.defineProperty\(Date\.prototype, 'getTimezoneOffset'/);
+  assert.match(launcher, /timeZone: targetTimezone/);
+  assert.match(launcher, /effectiveFingerprint\.timezone = proxy\.timezone/);
+  assert.match(launcher, /Based on IP:/);
+
+  // The actual exit is resolved through the proxy before the first browser page.
+  assert.match(launcher, /inspectProxyGeo\(proxy\)/);
+  assert.match(launcher, /alignFingerprintWithProxyGeo/);
+  assert.match(launcher, /proxy_runtime_geo\.json/);
+  assert.match(launcher, /language: locale\.language/);
+  assert.match(launcher, /latitude: geo\.latitude/);
+  assert.match(launcher, /longitude: geo\.longitude/);
+
+  // Geolocation keeps the native permission gate and only replaces coordinates after
+  // Chrome grants access, so sites never receive the host machine's real location.
+  assert.match(launcher, /nativeGetCurrentPosition\.call/);
+  assert.match(launcher, /nativeWatchPosition\.call/);
+  assert.match(launcher, /property === 'latitude'/);
+  assert.match(launcher, /property === 'longitude'/);
 
   // The rules ship in the shared per-profile extension, so every launch mode and every
   // tab is covered without per-target wiring.
@@ -1461,7 +1488,7 @@ test('profile-specific fingerprint repairs persist without changing other profil
 
   assert.match(launcher, /const fingerprintOverridePath = path\.join\(profilePath, 'fingerprint_override\.json'\)/);
   assert.match(launcher, /effectiveFingerprint = \{ \.\.\.effectiveFingerprint, \.\.\.override \}/);
-  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform \}/);
+  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform, architecture, brands \}/);
   assert.match(launcher, /'fingerprint_override\.json'/);
   assert.match(sync, /'fingerprint_override\.json'/);
 });
@@ -1565,6 +1592,21 @@ test('the instance table exposes a working per-profile proxy test', () => {
   assert.match(dashboard, /performance\.now\(\) - startedAt/);
   assert.match(dashboard, /proxyTestResult\.country/);
   assert.match(dashboard, /proxyTestResult\.ping/);
+});
+
+test('proxy checks persist a complete IP-based geography snapshot', () => {
+  const proxyManager = read('desktop-app/src/main/proxy-manager.ts');
+  const main = read('desktop-app/src/main/main.ts');
+  const page = read('desktop-app/src/renderer/pages/ProxyManager.tsx');
+
+  assert.match(proxyManager, /fields=status,message,countryCode,regionName,city,lat,lon,timezone,query/);
+  assert.match(proxyManager, /interface ProxyGeoSnapshot/);
+  assert.match(proxyManager, /new Intl\.DateTimeFormat\('en-US', \{ timeZone: data\.timezone \}\)/);
+  assert.match(main, /exitIp: proxyConfig\.lastExitIp \|\| null/);
+  assert.match(page, /updateData\.timezone = timezone/);
+  assert.match(page, /updateData\.latitude = latitude/);
+  assert.match(page, /updateData\.longitude = longitude/);
+  assert.match(page, /updateData\.lastExitIp = exitIp/);
 });
 
 test('the instance table distinguishes local and remote running profiles', () => {

@@ -402,6 +402,12 @@ export interface FirestoreProxy {
   password?: string;
   provider?: string;
   country?: string;
+  timezone?: string;
+  city?: string;
+  region?: string;
+  latitude?: number;
+  longitude?: number;
+  lastExitIp?: string;
   folderId?: string | null;
   isHealthy?: boolean;
   lastCheck?: string;

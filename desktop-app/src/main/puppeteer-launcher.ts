@@ -9,6 +9,7 @@ import { install, Browser, detectBrowserPlatform } from '@puppeteer/browsers';
 import { resolveVenusAutostartState } from './venus-autostart-state';
 import { normalizeTweetUrl } from '../shared/twitter-url';
 import { hasAuthenticatedXSession } from '../shared/x-auth-snapshot';
+import { ProxyGeoSnapshot, ProxyManager } from './proxy-manager';
 import {
   isManagedLaunch,
   fitWindowToWorkArea,
@@ -204,13 +205,54 @@ export class PuppeteerLauncher {
       .join(',');
   }
 
+  private static languagesForCountry(countryCode: string): { language: string; languages: string[] } {
+    const locales: Record<string, string> = {
+      US: 'en-US', GB: 'en-GB', CA: 'en-CA', AU: 'en-AU', NZ: 'en-NZ',
+      FR: 'fr-FR', BE: 'fr-BE', CH: 'de-CH', DE: 'de-DE', AT: 'de-AT',
+      ES: 'es-ES', MX: 'es-MX', AR: 'es-AR', BR: 'pt-BR', PT: 'pt-PT',
+      IT: 'it-IT', NL: 'nl-NL', PL: 'pl-PL', CZ: 'cs-CZ', SE: 'sv-SE',
+      NO: 'nb-NO', DK: 'da-DK', FI: 'fi-FI', JP: 'ja-JP', KR: 'ko-KR',
+      CN: 'zh-CN', TW: 'zh-TW', HK: 'zh-HK', IN: 'en-IN', SG: 'en-SG',
+      RU: 'ru-RU', UA: 'uk-UA', TR: 'tr-TR', ID: 'id-ID', TH: 'th-TH',
+    };
+    const language = locales[String(countryCode || '').toUpperCase()] || 'en-US';
+    const base = language.split('-')[0];
+    return { language, languages: base === language ? [language] : [language, base] };
+  }
+
+  private static alignFingerprintWithProxyGeo(fingerprint: any, geo: ProxyGeoSnapshot): any {
+    const locale = this.languagesForCountry(geo.countryCode);
+    return {
+      ...fingerprint,
+      timezone: geo.timezone,
+      language: locale.language,
+      languages: locale.languages,
+      proxyGeo: {
+        ip: geo.ip,
+        countryCode: geo.countryCode,
+        region: geo.region,
+        city: geo.city,
+        latitude: geo.latitude,
+        longitude: geo.longitude,
+        accuracy: 20000,
+        checkedAt: geo.checkedAt,
+      },
+    };
+  }
+
   /**
    * Chromium builds User-Agent Client Hints from the real OS and --user-agent does not
    * regenerate them, so a Windows-fingerprinted profile opened on macOS advertises
    * Sec-CH-UA-Platform: "macOS" while its User-Agent claims Windows. No CDP is available
    * on this launcher by design, so the per-profile MV3 extension rewrites the headers.
    */
-  private static buildClientHintsRules(clientHintsPlatform: string, acceptLanguage: string) {
+  private static buildClientHintsRules(
+    clientHintsPlatform: string,
+    acceptLanguage: string,
+    browserVersion: string
+  ) {
+    const majorVersion = /^\d+/.exec(browserVersion)?.[0] || '151';
+    const secChUa = `"Google Chrome";v="${majorVersion}", "Chromium";v="${majorVersion}", "Not_A Brand";v="24"`;
     return [
       {
         id: 1,
@@ -227,6 +269,11 @@ export class PuppeteerLauncher {
               header: 'accept-language',
               operation: 'set',
               value: acceptLanguage,
+            },
+            {
+              header: 'sec-ch-ua',
+              operation: 'set',
+              value: secChUa,
             },
             // High-entropy hints are only sent when a site opts in through Accept-CH.
             // Removing them is a no-op when absent and never leaks the host OS, whereas
@@ -1439,6 +1486,32 @@ public class Win32 {
           console.warn(`[Fingerprint] Invalid profile override ignored: ${error.message}`);
         }
       }
+      // AdsPower-style "Based on IP": resolve the real proxy exit before Chrome gets
+      // its first page, then align every geographical browser signal atomically.
+      if (proxy?.host) {
+        const liveGeo = await ProxyManager.getInstance().inspectProxyGeo(proxy);
+        if (liveGeo) {
+          effectiveFingerprint = this.alignFingerprintWithProxyGeo(effectiveFingerprint, liveGeo);
+          fs.writeFileSync(
+            path.join(profilePath, 'proxy_runtime_geo.json'),
+            JSON.stringify(liveGeo, null, 2),
+            'utf8'
+          );
+          console.log(
+            `[Fingerprint] Based on IP: ${liveGeo.countryCode} · ${liveGeo.city} · ${liveGeo.timezone}`
+          );
+        } else if (proxy.timezone && typeof proxy.timezone === 'string') {
+          try {
+            new Intl.DateTimeFormat('en-US', { timeZone: proxy.timezone }).format(new Date());
+            effectiveFingerprint.timezone = proxy.timezone;
+            console.log(`[Fingerprint] Live geo unavailable; using saved proxy timezone: ${proxy.timezone}`);
+          } catch {
+            console.warn(`[Fingerprint] Invalid saved proxy timezone ignored: ${proxy.timezone}`);
+          }
+        } else {
+          console.warn('[Fingerprint] Live proxy geo unavailable; preserving stored fingerprint geo');
+        }
+      }
       const configuredUserAgent = options.userAgent || effectiveFingerprint.userAgent || '';
       const userAgent = this.alignUserAgentToBrowser(configuredUserAgent, browserVersion);
       console.log(`[Browser] Executable version: ${browserVersion || 'unknown'}`);
@@ -1552,14 +1625,23 @@ public class Win32 {
           JSON.stringify(
             this.buildClientHintsRules(
               clientHintsPlatform,
-              this.buildAcceptLanguage(effectiveFingerprint)
+              this.buildAcceptLanguage(effectiveFingerprint),
+              browserVersion
             ),
             null,
             2
           )
         );
 
-        const fp = { ...effectiveFingerprint, userAgent, platform };
+        const architecture = effectiveFingerprint.architecture
+          || (isMac && /Apple M\d/i.test(effectiveFingerprint.webglRenderer || '') ? 'arm' : 'x86');
+        const majorVersion = /^\d+/.exec(browserVersion)?.[0] || '151';
+        const brands = [
+          { brand: 'Google Chrome', version: majorVersion },
+          { brand: 'Chromium', version: majorVersion },
+          { brand: 'Not_A Brand', version: '24' },
+        ];
+        const fp = { ...effectiveFingerprint, userAgent, platform, architecture, brands };
         fs.writeFileSync(path.join(platformFixPath, 'fingerprint.js'), `
 (() => {
   const fp = ${JSON.stringify(fp)};
@@ -1582,6 +1664,19 @@ public class Win32 {
     const hintPlatform =
       fp.platform === 'Win32' ? 'Windows' : fp.platform === 'MacIntel' ? 'macOS' : 'Linux';
     define(uaDataProto, 'platform', hintPlatform);
+    define(uaDataProto, 'brands', Object.freeze(fp.brands.map(brand => Object.freeze({ ...brand }))));
+    define(uaDataProto, 'mobile', false);
+
+    const originalToJSON = uaDataProto.toJSON;
+    if (typeof originalToJSON === 'function') {
+      uaDataProto.toJSON = function() {
+        return {
+          brands: fp.brands.map(brand => ({ ...brand })),
+          mobile: false,
+          platform: hintPlatform,
+        };
+      };
+    }
 
     const originalHighEntropy = uaDataProto.getHighEntropyValues;
     if (typeof originalHighEntropy === 'function') {
@@ -1589,7 +1684,7 @@ public class Win32 {
         platform: hintPlatform,
         platformVersion:
           fp.platform === 'Win32' ? '10.0.0' : fp.platform === 'MacIntel' ? '14.6.1' : '',
-        architecture: 'x86',
+        architecture: fp.architecture || 'x86',
         bitness: '64',
         model: '',
         wow64: false,
@@ -1605,6 +1700,124 @@ public class Win32 {
           return merged;
         });
       };
+    }
+  }
+
+  // Chromium does not honour the TZ child-process environment consistently on
+  // Windows. Keep Date and Intl aligned with the profile on every host.
+  if (fp.timezone && typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
+    try {
+      const targetTimezone = fp.timezone;
+      const NativeDateTimeFormat = Intl.DateTimeFormat;
+      // Validate the IANA identifier before installing any overrides.
+      new NativeDateTimeFormat('en-US', { timeZone: targetTimezone }).format(new Date());
+
+      const withTimezone = (options) => {
+        if (options && Object.prototype.hasOwnProperty.call(options, 'timeZone')) return options;
+        return Object.assign({}, options || {}, { timeZone: targetTimezone });
+      };
+      const DateTimeFormatProxy = new Proxy(NativeDateTimeFormat, {
+        apply(target, thisArg, args) {
+          return Reflect.apply(target, thisArg, [args[0], withTimezone(args[1])]);
+        },
+        construct(target, args, newTarget) {
+          return Reflect.construct(target, [args[0], withTimezone(args[1])], newTarget);
+        },
+      });
+      Object.defineProperty(Intl, 'DateTimeFormat', {
+        configurable: true,
+        writable: true,
+        value: DateTimeFormatProxy,
+      });
+
+      const offsetFormatter = new NativeDateTimeFormat('en-US', {
+        timeZone: targetTimezone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hourCycle: 'h23',
+      });
+      const offsetFor = (date) => {
+        if (!(date instanceof Date) || Number.isNaN(date.getTime())) return NaN;
+        const parts = Object.create(null);
+        for (const part of offsetFormatter.formatToParts(date)) {
+          if (part.type !== 'literal') parts[part.type] = Number(part.value);
+        }
+        const localAsUtc = Date.UTC(
+          parts.year, parts.month - 1, parts.day,
+          parts.hour === 24 ? 0 : parts.hour, parts.minute, parts.second
+        );
+        return Math.round((date.getTime() - localAsUtc) / 60000);
+      };
+      Object.defineProperty(Date.prototype, 'getTimezoneOffset', {
+        configurable: true,
+        writable: true,
+        value: function() { return offsetFor(this); },
+      });
+
+      for (const method of ['toLocaleString', 'toLocaleDateString', 'toLocaleTimeString']) {
+        const nativeMethod = Date.prototype[method];
+        Object.defineProperty(Date.prototype, method, {
+          configurable: true,
+          writable: true,
+          value: function(locales, options) {
+            return nativeMethod.call(this, locales, withTimezone(options));
+          },
+        });
+      }
+    } catch (error) {
+      console.warn('[Spectra] Invalid fingerprint timezone ignored:', fp.timezone);
+    }
+  }
+
+  // Preserve Chrome's native geolocation permission flow, but replace the real
+  // device coordinates with the proxy's coarse IP location after permission is granted.
+  if (fp.proxyGeo && navigator.geolocation) {
+    try {
+      const geoPrototype = Object.getPrototypeOf(navigator.geolocation);
+      const nativeGetCurrentPosition = geoPrototype.getCurrentPosition;
+      const nativeWatchPosition = geoPrototype.watchPosition;
+      const spoofPosition = (position) => {
+        const coords = new Proxy(position.coords, {
+          get(target, property) {
+            if (property === 'latitude') return fp.proxyGeo.latitude;
+            if (property === 'longitude') return fp.proxyGeo.longitude;
+            if (property === 'accuracy') return fp.proxyGeo.accuracy || 20000;
+            return Reflect.get(target, property, target);
+          },
+        });
+        return new Proxy(position, {
+          get(target, property) {
+            if (property === 'coords') return coords;
+            return Reflect.get(target, property, target);
+          },
+        });
+      };
+      Object.defineProperty(geoPrototype, 'getCurrentPosition', {
+        configurable: true,
+        writable: true,
+        value: function(success, error, options) {
+          return nativeGetCurrentPosition.call(
+            this,
+            position => success(spoofPosition(position)),
+            error,
+            options
+          );
+        },
+      });
+      Object.defineProperty(geoPrototype, 'watchPosition', {
+        configurable: true,
+        writable: true,
+        value: function(success, error, options) {
+          return nativeWatchPosition.call(
+            this,
+            position => success(spoofPosition(position)),
+            error,
+            options
+          );
+        },
+      });
+    } catch (error) {
+      console.warn('[Spectra] Proxy geolocation override failed');
     }
   }
 

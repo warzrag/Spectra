@@ -29,6 +29,7 @@ export interface GeneratedFingerprint {
   webrtcMode: 'real' | 'disabled' | 'fake';
   doNotTrack: boolean;
   platform: string;
+  architecture: 'x86' | 'arm';
   vendor: string;
   fonts: string[];
 }
@@ -456,6 +457,7 @@ export function generateFingerprint(
     webrtcMode: 'disabled',
     doNotTrack: false,
     platform: getOSPlatform(os),
+    architecture: os === 'macos' && /Apple M\d/i.test(webgl.renderer) ? 'arm' : 'x86',
     vendor: 'Google Inc.',
     fonts: randomizeFonts(os),
   };

@@ -60,6 +60,13 @@ export interface Profile {
     port: number;
     username?: string;
     password?: string;
+    country?: string;
+    timezone?: string;
+    city?: string;
+    region?: string;
+    latitude?: number;
+    longitude?: number;
+    lastExitIp?: string;
   };
   fingerprint?: any;
   hardwareConcurrency?: number;
