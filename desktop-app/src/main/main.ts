@@ -747,7 +747,7 @@ ipcMain.handle('branding:apply', async (_, profileData, placement) => {
 
   // Le tirage vit dans le processus principal : c'est lui qui lit le lot sur le
   // disque et retient qui a recu quoi.
-  const racine = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+  const racine = racineBranding();
   const tirage = attribuerBranding(
     racine,
     folderId,
@@ -841,7 +841,7 @@ ipcMain.handle('massPost:apply', async (_, profileData, placement) => {
   const folderId = 'tous';
   assertSafeId(profileId, 'profile ID');
 
-  const racine = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+  const racine = racineBranding();
   const tirage = tirerPublication(racine, folderId, profileId);
   if (!tirage.post && !tirage.media) {
     return { status: 'failed', message: 'Aucun post ni média à publier' };
@@ -1238,8 +1238,23 @@ ipcMain.handle('sessionImport:stop', async (_, profileId?: string) => {
  * Pas d'interface d'envoi de fichiers a construire ni a apprendre : on ouvre
  * l'explorateur, l'utilisateur depose ce qu'il veut, quand il veut.
  */
-const racineBranding = () =>
-  path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+/*
+ * Ou vit la reserve de branding et de publications.
+ *
+ * Windows range sous AppDataLocal, les autres systemes sous un dossier
+ * cache du dossier personnel -- meme convention que getProfilesRoot() dans
+ * puppeteer-launcher.ts. Le chemin Windows etait ecrit en dur ici et a trois
+ * autres endroits : sur le Mac d'un ami, le 20 aout 2026, la section
+ * Branding s'ouvrait donc entierement vide, sans rien dire.
+ *
+ * Declaree en `function` et non en `const` : elle est appelee plus haut dans
+ * le fichier, et une fonction declaree est connue partout.
+ */
+function racineBranding(): string {
+  return process.platform === 'win32'
+    ? path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser')
+    : path.join(os.homedir(), '.antidetect-browser');
+}
 
 ipcMain.handle('branding:read', async (_, folderId: string) => {
   assertSafeId(String(folderId || ''), 'folder ID');
@@ -1282,7 +1297,7 @@ ipcMain.handle('branding:clearImages', async (_, folderId: string, sorte: string
 
 ipcMain.handle('branding:openFolder', async (_, folderId: string) => {
   assertSafeId(String(folderId || ''), 'folder ID');
-  const racine = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+  const racine = racineBranding();
   const chemin = preparerDossierBranding(racine, String(folderId));
   await shell.openPath(chemin);
   return chemin;

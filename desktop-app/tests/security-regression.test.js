@@ -3197,6 +3197,21 @@ test('le navigateur Spectra est trouve sur macOS comme sur Windows', () => {
   // Windows ne doit pas changer de comportement : un seul candidat, chrome.exe.
   assert.ok(corps.includes("? ['chrome.exe']"));
 
+  // La reserve de branding et de publications se trouve elle aussi des deux
+  // cotes. Le 20 aout 2026, sur le Mac d'un ami, la section Branding s'est
+  // ouverte entierement vide : le chemin etait ecrit en dur pour Windows a
+  // quatre endroits, et AppData\Local n'existe pas sur macOS.
+  const principal = read('desktop-app/src/main/main.ts');
+  assert.match(
+    principal,
+    /function racineBranding\(\)[\s\S]{0,200}process\.platform === 'win32'[\s\S]{0,200}'\.antidetect-browser'/
+  );
+  // Plus une seule copie ecrite en dur : elles ne suivraient pas la correction.
+  assert.doesNotMatch(
+    principal,
+    /const racine = path\.join\(os\.homedir\(\), 'AppData'/
+  );
+
   // Le fichier nu reste accepte en dernier recours, pour Linux et pour un
   // paquet deja deballe a la main.
   assert.ok(corps.includes("'chrome',"));
