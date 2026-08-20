@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Wand2, ChevronDown, Monitor, Globe, Fingerprint, Settings2, Tag as TagIcon, Loader2, Check, Shuffle } from 'lucide-react';
-import { Folder as FolderType, Platform, Profile, ProfileStatus } from '../../types';
+import { BotStatus, Folder as FolderType, Platform, Profile, ProfileStatus } from '../../types';
 import ConnectionSelector from './ConnectionSelector';
 
 interface CreateProfileModalProps {
@@ -62,6 +62,7 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
   const [tagInput, setTagInput] = useState('');
   const [notes, setNotes] = useState(editProfile?.notes || '');
   const [status, setStatus] = useState<ProfileStatus>(editProfile?.status || 'none');
+  const [botStatus, setBotStatus] = useState<BotStatus>(editProfile?.botStatus || 'none');
   const [canvasNoise, setCanvasNoise] = useState(editProfile?.fingerprint?.canvasNoise ?? true);
   const [audioNoise, setAudioNoise] = useState(editProfile?.fingerprint?.audioNoise ?? true);
   const [webrtcMode, setWebrtcMode] = useState<'real' | 'disabled' | 'fake'>(editProfile?.fingerprint?.webrtcMode || 'fake');
@@ -69,6 +70,20 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
   const [cookieImport, setCookieImport] = useState('');
   const [generating, setGenerating] = useState(false);
   const [generated, setGenerated] = useState(false);
+
+  // Sur une nouvelle creation, partir du systeme de la machine hote. Un profil
+  // existant garde le sien : changer le systeme d'un compte deja utilise est en
+  // soi un signal suspect pour X.
+  useEffect(() => {
+    if (editProfile) return;
+    let cancelled = false;
+    (window.electronAPI as any)?.profileSync?.getFingerprintOS?.()
+      .then((hostOS: 'windows' | 'macos' | 'linux') => {
+        if (!cancelled && hostOS) setOs(hostOS);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [editProfile]);
   const [showCountryPicker, setShowCountryPicker] = useState(false);
 
   useEffect(() => {
@@ -225,6 +240,7 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
       tags,
       notes,
       status: status !== 'none' ? status : null,
+      botStatus: botStatus !== 'none' ? botStatus : null,
       preset: selectedPreset,
       fingerprint: {
         ...(fingerprint || {}),
@@ -337,6 +353,8 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
                 <div className="flex gap-2 flex-wrap">
                   {([
                     { id: 'none' as ProfileStatus, label: 'None', color: 'var(--text-muted)', bg: 'var(--bg-elevated)' },
+                    { id: 'loggedIn' as ProfileStatus, label: 'Compte connecté', color: '#3b82f6', bg: 'rgba(59,130,246,0.1)' },
+                    { id: 'toLogIn' as ProfileStatus, label: 'À connecter', color: '#eab308', bg: 'rgba(234,179,8,0.1)' },
                     { id: 'active' as ProfileStatus, label: 'Active', color: '#22c55e', bg: 'rgba(34,197,94,0.1)' },
                     { id: 'shadowBanned' as ProfileStatus, label: 'Shadow Ban', color: '#f97316', bg: 'rgba(249,115,22,0.1)' },
                     { id: 'banned' as ProfileStatus, label: 'Banned', color: '#ef4444', bg: 'rgba(239,68,68,0.1)' },
@@ -347,6 +365,28 @@ const CreateProfileModal: React.FC<CreateProfileModalProps> = ({ onClose, onCrea
                         background: status === s.id ? s.bg : 'var(--bg-elevated)',
                         border: `1px solid ${status === s.id ? s.color : 'var(--border-default)'}`,
                         color: status === s.id ? s.color : 'var(--text-secondary)',
+                      }}>
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Bot Status */}
+              <div>
+                <label className="block text-[12px] font-medium mb-1.5" style={labelStyle}>Bot Status</label>
+                <div className="flex gap-2 flex-wrap">
+                  {([
+                    { id: 'none' as BotStatus, label: 'None', color: 'var(--text-muted)', bg: 'var(--bg-elevated)' },
+                    { id: 'botConnected' as BotStatus, label: 'Bot connecté', color: '#22c55e', bg: 'rgba(34,197,94,0.1)' },
+                    { id: 'botDisconnected' as BotStatus, label: 'Bot non connecté', color: '#ef4444', bg: 'rgba(239,68,68,0.1)' },
+                  ]).map(s => (
+                    <button key={s.id} type="button" onClick={() => setBotStatus(s.id)}
+                      className="px-3 py-1.5 rounded-lg text-[12px] font-medium transition-all"
+                      style={{
+                        background: botStatus === s.id ? s.bg : 'var(--bg-elevated)',
+                        border: `1px solid ${botStatus === s.id ? s.color : 'var(--border-default)'}`,
+                        color: botStatus === s.id ? s.color : 'var(--text-secondary)',
                       }}>
                       {s.label}
                     </button>

@@ -46,9 +46,35 @@ function assertOk(response: Response, message: string): Promise<any> {
   });
 }
 
+/**
+ * Repli en memoire quand le coffre du systeme est indisponible.
+ *
+ * `safeStorage` s'appuie sur DPAPI sur Windows et sur le **trousseau** sur
+ * macOS. Le trousseau se refuse a une application lancee depuis son image
+ * disque, encore en quarantaine, ou dont la signature ad-hoc vient de changer
+ * -- constate le 18 aout 2026 sur le premier Mac a faire tourner Spectra :
+ * « Le chiffrement securise Windows est indisponible », et la connexion VA
+ * Manager restait impossible.
+ *
+ * Refuser la connexion pour autant est excessif : les jetons peuvent tres bien
+ * vivre le temps de la session. Ce qu'on ne fera jamais, en revanche, c'est les
+ * ecrire en clair sur le disque -- ils ouvrent VA Manager, qui detient les mots
+ * de passe et les cles 2FA de tous les comptes X.
+ */
+let sessionEnMemoire: StoredSession | null = null;
+
+export function coffreSystemeDisponible(): boolean {
+  try {
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
+  }
+}
+
 function parseEncryptedSession(store: StoreLike): StoredSession | null {
+  if (!coffreSystemeDisponible()) return sessionEnMemoire;
   const encrypted = store.get(SESSION_STORE_KEY);
-  if (!encrypted || typeof encrypted !== 'string' || !safeStorage.isEncryptionAvailable()) return null;
+  if (!encrypted || typeof encrypted !== 'string') return null;
   try {
     const json = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
     const parsed = JSON.parse(json);
@@ -61,9 +87,13 @@ function parseEncryptedSession(store: StoreLike): StoredSession | null {
 }
 
 function saveEncryptedSession(store: StoreLike, session: StoredSession): void {
-  if (!safeStorage.isEncryptionAvailable()) {
-    throw new Error('Le chiffrement sécurisé Windows est indisponible');
+  if (!coffreSystemeDisponible()) {
+    // Rien sur le disque : la session ne survivra pas a la fermeture, et c'est
+    // le prix a payer pour ne pas laisser trainer ces jetons en clair.
+    sessionEnMemoire = session;
+    return;
   }
+  sessionEnMemoire = null;
   const encrypted = safeStorage.encryptString(JSON.stringify(session));
   store.set(SESSION_STORE_KEY, encrypted.toString('base64'));
 }
@@ -104,6 +134,7 @@ async function ensureSession(store: StoreLike): Promise<StoredSession> {
     saveEncryptedSession(store, session);
     return session;
   } catch (error) {
+    sessionEnMemoire = null;
     store.delete(SESSION_STORE_KEY);
     throw error;
   }
@@ -578,10 +609,12 @@ export async function connectVaManager(
     connected: true,
     email: session.email,
     primaryOrganizationId: session.primaryOrganizationId,
+    memorisee: coffreSystemeDisponible(),
   };
 }
 
 export function disconnectVaManager(store: StoreLike): void {
+  sessionEnMemoire = null;
   store.delete(SESSION_STORE_KEY);
 }
 
@@ -592,6 +625,7 @@ export function getVaManagerConnectionStatus(store: StoreLike): VaManagerConnect
         connected: true,
         email: session.email,
         primaryOrganizationId: session.primaryOrganizationId,
+        memorisee: coffreSystemeDisponible(),
       }
     : { connected: false };
 }
@@ -614,14 +648,17 @@ export async function listVaManagerAccounts(
     ? [['organization_id', 'eq', organizationId]]
     : [];
 
-  const [accountPayload, statsPayload, gmailPayload, organizationKey] = await Promise.all([
+  const [accountPayload, statsPayload, gmailPayload, vaPayload, organizationKey] = await Promise.all([
     callVaManagerApi(session, '/api/db', {
       table: 'twitter_accounts',
       action: 'select',
       filters,
       options: {
+        // va_id et assigned_va_id : c'est ce qui dit quel assistant tient le
+        // compte. VA Manager les affiche, Spectra ne les demandait pas -- d'ou
+        // l'impossibilite de creer les instances d'un seul VA a la fois.
         columns:
-          'id,username,status,organization_id,encrypted_password,notes,gmail_id,created_at,last_scanned_at,last_scan_error',
+          'id,username,status,organization_id,encrypted_password,notes,gmail_id,va_id,assigned_va_id,created_at,last_scanned_at,last_scan_error',
         order: 'created_at.desc',
         limit: 5000,
       },
@@ -645,8 +682,24 @@ export async function listVaManagerAccounts(
         limit: 5000,
       },
     }),
+    // Les assistants eux-memes, pour afficher un nom plutot qu'un identifiant.
+    callVaManagerApi(session, '/api/db', {
+      table: 'vas',
+      action: 'select',
+      filters,
+      options: {
+        columns: 'id,name,organization_id',
+        limit: 5000,
+      },
+    }).catch(() => null),
     getOrganizationPasswordKey(session, organizationId),
   ]);
+
+  const vaById = new Map<string, string>(
+    (Array.isArray(vaPayload?.data) ? vaPayload.data : [])
+      .filter((va: any) => va?.id)
+      .map((va: any) => [String(va.id), String(va.name || '').trim()] as [string, string])
+  );
 
   const gmailById = new Map(
     (Array.isArray(gmailPayload?.data) ? gmailPayload.data : [])
@@ -682,10 +735,16 @@ export async function listVaManagerAccounts(
       const emailPasswordUsable = gmail?.encrypted_password
         ? await canDecryptCredential(gmail.encrypted_password, organizationKey)
         : Boolean(noteEmailPassword);
+      // Meme regle de priorite que VA Manager lui-meme
+      // (api/scan-shadowban.js : `acc.assigned_va_id || acc.va_id`).
+      // assigned_va_id sert au multi-VA et l'emporte quand il est rempli.
+      const vaId = account.assigned_va_id || account.va_id || null;
       return {
         id: String(account.id),
         organizationId: account.organization_id || undefined,
         username,
+        vaId: vaId ? String(vaId) : undefined,
+        vaName: vaId ? (vaById.get(String(vaId)) || undefined) : undefined,
         status: normalizeVaManagerStatus(account.status),
         followers: Number.isFinite(Number(stat?.followers)) ? Number(stat.followers) : null,
         followersUpdatedAt: stat?.date || undefined,

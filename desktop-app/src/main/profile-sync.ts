@@ -106,11 +106,44 @@ function isAllowedArchivePath(entryName: string): boolean {
  * Syncs: cookies, local storage, sessions, login data, preferences, extensions.
  * Skips: caches, service workers, GPU data, blob storage, etc.
  */
+// Ce que la restauration exige, l'envoi doit le verifier. Sans cette symetrie
+// Spectra fabrique une archive qu'il refusera lui-meme d'ouvrir : constate le
+// 13 aout 2026 sur trois profils, dont annlindabuckin2, ouvert quatre secondes
+// par l'Auto Post puis ferme de force avant que Chrome ait ecrit ses
+// preferences. L'archive incomplete avait ecrase la bonne version, et le profil
+// etait devenu impossible a retelecharger sur toutes les machines.
+export const CHEMIN_REQUIS_DANS_ARCHIVE = 'Default/Preferences';
+
+export const CODE_ARCHIVE_INCOMPLETE = 'profile-sync/incomplete-local';
+
+// Le passage entre les deux processus ne transporte que le message : la
+// propriete `code` d'une erreur est perdue en route, comme le montre le
+// libelle affiche a l'ecran ("Error invoking remote method ..."). Le code est
+// donc inscrit dans le message lui-meme, pour rester reconnaissable de l'autre
+// cote.
+export class ArchiveLocaleIncomplete extends Error {
+  code = CODE_ARCHIVE_INCOMPLETE;
+  constructor(profileId: string) {
+    super(
+      `[${CODE_ARCHIVE_INCOMPLETE}] Le profil ${profileId} est incomplet en local ` +
+      `(${CHEMIN_REQUIS_DANS_ARCHIVE} absent). Envoi annule : la version du cloud est conservee.`
+    );
+    this.name = 'ArchiveLocaleIncomplete';
+  }
+}
+
 export async function zipProfileDir(profileId: string): Promise<{ buffer: Buffer; size: number }> {
   const profilePath = getProfilePath(profileId);
 
   if (!fs.existsSync(profilePath)) {
     throw new Error(`Profile directory not found: ${profilePath}`);
+  }
+
+  // Chrome n'ecrit ses preferences qu'a la fermeture propre. Un profil tue
+  // avant cette ecriture ne doit pas partir : mieux vaut un envoi refuse
+  // qu'une sauvegarde detruite.
+  if (!fs.existsSync(path.join(profilePath, ...CHEMIN_REQUIS_DANS_ARCHIVE.split('/')))) {
+    throw new ArchiveLocaleIncomplete(profileId);
   }
 
   console.log(`[ProfileSync] Zipping profile (essential-only): ${profileId}`);
@@ -163,8 +196,35 @@ export async function unzipProfileDir(profileId: string, zipBuffer: Buffer): Pro
   if (entries.length === 0) {
     throw new Error('Cloud profile archive is empty');
   }
-  if (!entries.some(entry => entry.entryName.replace(/\\/g, '/') === 'Default/Preferences')) {
-    throw new Error('Cloud profile archive is incomplete (missing Default/Preferences)');
+  // Refuser une archive sans preferences condamnait le profil : impossible de
+  // l'ouvrir, donc impossible de le refermer proprement, donc impossible de
+  // reparer l'archive. Trois instances etaient bloquees ainsi depuis le 9 aout.
+  //
+  // Or ce fichier n'est pas vital a la restauration : Chrome le recree au
+  // demarrage. Ce qui compte vraiment, c'est la session. On exige donc de quoi
+  // la retablir, et l'absence des preferences n'est plus qu'un avertissement.
+  //
+  // L'envoi, lui, refuse desormais de produire une telle archive : voir
+  // ArchiveLocaleIncomplete plus haut. Les deux regles se completent -- on ne
+  // fabrique plus d'archive incomplete, et celles qui existent restent ouvrables.
+  const chemins = new Set(entries.map(entry => entry.entryName.replace(/\\/g, '/')));
+  const porteUneSession = [
+    'Default/Network/Cookies',
+    'Default/Cookies',
+    'Local State',
+    'authenticated_cookies.json',
+    'synced_cookies.json',
+  ].some(chemin => chemins.has(chemin));
+  if (!porteUneSession) {
+    throw new Error(
+      "Cloud profile archive is unusable (no session data: cookies or Local State missing)"
+    );
+  }
+  if (!chemins.has(CHEMIN_REQUIS_DANS_ARCHIVE)) {
+    console.warn(
+      `[ProfileSync] ${profileId}: archive sans ${CHEMIN_REQUIS_DANS_ARCHIVE}, ` +
+      'restauration poursuivie (Chrome recreera ce fichier au demarrage)'
+    );
   }
   for (const entry of entries) {
     if (!isAllowedArchivePath(entry.entryName)) {

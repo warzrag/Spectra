@@ -1,3 +1,13 @@
+/**
+ * Nombre de comptes qu'un meme proxy peut porter.
+ *
+ * La valeur etait recopiee a quatre endroits du code et dans un texte affiche,
+ * ou elle valait 3. Florent l'a corrigee le 16 aout 2026 : c'est 4. Une regle
+ * ecrite cinq fois est une regle qui finit par differer d'un endroit a l'autre,
+ * d'ou cette constante unique.
+ */
+export const COMPTES_MAX_PAR_PROXY = 4;
+
 export type ProxyIdentityInput = {
   type?: string;
   host?: string;

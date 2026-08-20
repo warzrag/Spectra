@@ -56,6 +56,17 @@ const UA_TEMPLATES: Record<string, string> = {
   linux: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{VERSION} Safari/537.36',
 };
 
+// Ecrans reellement rencontres sur Mac, en pixels CSS. Tous sont Retina : un Mac
+// qui annonce 1366x768 en ratio 1 se signale tout seul.
+const MAC_SCREEN_RESOLUTIONS = [
+  { width: 1512, height: 982, weight: 25 },  // MacBook Pro 14" / Air 13,6"
+  { width: 1440, height: 900, weight: 22 },  // MacBook Air M1 / Pro 13"
+  { width: 1728, height: 1117, weight: 15 }, // MacBook Pro 16"
+  { width: 1470, height: 956, weight: 12 },  // MacBook Air 15"
+  { width: 2560, height: 1440, weight: 14 }, // Studio Display / ecran externe
+  { width: 1920, height: 1080, weight: 12 }, // ecran externe courant
+];
+
 const SCREEN_RESOLUTIONS = [
   { width: 1920, height: 1080, weight: 30 },
   { width: 1366, height: 768, weight: 15 },
@@ -84,6 +95,16 @@ const WEBGL_CONFIGS: Record<string, { vendor: string; renderer: string; weight: 
     { vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)', weight: 6 },
     { vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)', weight: 5 },
   ],
+  // Mac Intel (avant 2021) : la puce graphique n'a rien d'Apple Silicon. Servir
+  // un "Apple M2" sur ces machines recreerait exactement la contradiction qu'on
+  // cherche a eliminer.
+  macos_intel: [
+    { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(TM) Plus Graphics 640, OpenGL 4.1)', weight: 25 },
+    { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) UHD Graphics 630, OpenGL 4.1)', weight: 25 },
+    { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Intel(R) Iris(TM) Graphics 6100, OpenGL 4.1)', weight: 15 },
+    { vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon Pro 5300M OpenGL Engine, OpenGL 4.1)', weight: 20 },
+    { vendor: 'Google Inc. (AMD)', renderer: 'ANGLE (AMD, AMD Radeon Pro 560X OpenGL Engine, OpenGL 4.1)', weight: 15 },
+  ],
   macos: [
     { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)', weight: 20 },
     { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)', weight: 15 },
@@ -91,6 +112,12 @@ const WEBGL_CONFIGS: Record<string, { vendor: string; renderer: string; weight: 
     { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)', weight: 10 },
     { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)', weight: 12 },
     { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)', weight: 8 },
+    // La liste s'arretait au M3 Pro. En 2026 les M4 sont vendus depuis deux ans :
+    // un parc de profils macOS sans un seul M4 est en soi une anomalie, et il
+    // vieillit un peu plus a chaque generation. Poids volontairement modestes,
+    // le parc installe reste majoritairement compose des generations anterieures.
+    { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)', weight: 10 },
+    { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M4 Pro, Unspecified Version)', weight: 6 },
   ],
   linux: [
     { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)', weight: 15 },
@@ -372,6 +399,21 @@ export async function getCountryFromIP(proxyHost?: string, proxyPort?: number, p
 
 // --- Main generator ---
 
+/**
+ * Systeme a annoncer par defaut : celui de la machine qui execute Spectra.
+ *
+ * Une empreinte Windows servie depuis un Mac se fait reperer : Spectra ne
+ * masque ni les polices systeme, ni la largeur des barres de defilement (nulle
+ * sur macOS), ni le detail de la carte graphique. Faire correspondre le systeme
+ * annonce a la machine reelle supprime ces contradictions a la racine, sans
+ * avoir a falsifier chacun de ces signaux.
+ */
+export function hostDefaultOS(): 'windows' | 'macos' | 'linux' {
+  if (process.platform === 'darwin') return 'macos';
+  if (process.platform === 'win32') return 'windows';
+  return 'linux';
+}
+
 export function generateFingerprint(
   requestedOS?: 'windows' | 'macos' | 'linux',
   _browserType?: 'chrome',
@@ -384,17 +426,23 @@ export function generateFingerprint(
   const chromeVersion = weightedRandom(CHROME_VERSIONS).version;
   const userAgent = UA_TEMPLATES[os].replace('{VERSION}', chromeVersion);
 
-  // Screen
-  const screen = weightedRandom(SCREEN_RESOLUTIONS);
+  // Screen — les Mac ont leur propre jeu d'ecrans, tous Retina (ratio 2).
+  const isMac = os === 'macos';
+  const screen = weightedRandom(isMac ? MAC_SCREEN_RESOLUTIONS : SCREEN_RESOLUTIONS);
   const { availWidth, availHeight } = getAvailDimensions(screen.width, screen.height, os);
-  const devicePixelRatio = getDevicePixelRatio(screen.width);
-  const colorDepth = screen.width >= 3840 ? 30 : 24;
+  const devicePixelRatio = isMac ? 2 : getDevicePixelRatio(screen.width);
+  // Chrome sous Windows renvoie toujours 24, meme sur une dalle 10 bits ou HDR.
+  // La valeur 30 mesuree le 11 aout 2026 sur les profils 4K n'existe sur aucun
+  // Windows reel et se reperait immediatement.
+  const colorDepth = 24;
 
   // Hardware
   const hw = weightedRandom(HARDWARE_CONFIGS);
 
-  // WebGL
-  const webglConfigs = WEBGL_CONFIGS[os] || WEBGL_CONFIGS.windows;
+  // WebGL — sur un Mac Intel, annoncer une puce Apple Silicon serait incoherent.
+  const macIsIntel = isMac && process.platform === 'darwin' && process.arch !== 'arm64';
+  const webglConfigs = (macIsIntel ? WEBGL_CONFIGS.macos_intel : WEBGL_CONFIGS[os])
+    || WEBGL_CONFIGS.windows;
   const webgl = weightedRandom(webglConfigs);
 
   // Timezone & Language — always pick from a coherent country profile

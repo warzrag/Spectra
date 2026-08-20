@@ -17,9 +17,21 @@ const loadTypeScriptModule = relativePath => {
     },
   }).outputText;
   const module = { exports: {} };
-  new Function('exports', 'module', compiled)(module.exports, module);
+  // `require` est fourni : un module qui lit des fichiers importe fs et path.
+  // Sans lui, il echouait sur « require is not defined » -- une panne du banc
+  // d'essai, pas du code teste.
+  new Function('exports', 'module', 'require', compiled)(module.exports, module, require);
   return module.exports;
 };
+
+// Le script genere est un service worker : il s'installe en prenant la main
+// tout de suite, sans attendre la version precedente. Le bac a sable doit donc
+// fournir ce que tout worker possede, sinon il refuse de demarrer.
+const fauxWorker = () => ({
+  addEventListener() {},
+  skipWaiting() {},
+  clients: { claim: async () => {} },
+});
 
 const getCookieSyncBackgroundSource = ({
   profileId,
@@ -27,6 +39,7 @@ const getCookieSyncBackgroundSource = ({
   launchId,
   hasStagedCookies = false,
   openPostMode = false,
+  cookieImportMode = 'remplacer',
 }) => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts').replace(/\r\n/g, '\n');
   const marker = "fs.writeFileSync(path.join(cookieSyncPath, 'background.js'),\n`";
@@ -41,6 +54,7 @@ const getCookieSyncBackgroundSource = ({
     .replaceAll('${JSON.stringify(autoStartLaunchId)}', JSON.stringify(launchId))
     .replaceAll('${JSON.stringify(Boolean(targetTweetUrl))}', JSON.stringify(openPostMode))
     .replaceAll('${JSON.stringify(hasStagedCookies)}', JSON.stringify(hasStagedCookies))
+    .replaceAll('${JSON.stringify(modeImportCookies)}', JSON.stringify(cookieImportMode))
     .replaceAll('${JSON.stringify(sessionImportAttemptId)}', JSON.stringify(''))
     .replaceAll('${this.localServerConfig?.port || 0}', '45678')
     .replaceAll("${JSON.stringify(this.localServerConfig?.token || '')}", JSON.stringify('test-token'))
@@ -179,9 +193,14 @@ test('manual launches preserve the user window while managed launches keep equal
     launcher,
     /launchMode === 'automation'\s*\?\s*this\.openSelectedWindow\s*:\s*this\.compactWindow/
   );
+  // Les fenetres de branding sont plus petites : personne ne travaille dedans,
+  // on les regarde s'executer, et il en tient davantage a l'ecran. Une
+  // publication en masse est du meme ordre.
+  assert.match(launcher, /brandingWindow = \{\s*width: 460,\s*height: 420/);
+  assert.match(launcher, /branding\s*\?\s*this\.brandingWindow/);
   assert.match(
     launcher,
-    /getWindowPlacement\(options\.windowLayout, launchMode\)/
+    /getWindowPlacement\(\s*options\.windowLayout, launchMode,\s*Boolean\(options\.branding \|\| options\.massPost\)\s*\)/
   );
   assert.match(
     launcher,
@@ -191,6 +210,7 @@ test('manual launches preserve the user window while managed launches keep equal
     launcher,
     /if \(managedLaunch\) \{\s*this\.enforceWindowPlacement\(chromeProcess\.pid, placement\);\s*\}/
   );
+  // Le script de consentement ne se charge que sur un lancement pilote.
   assert.match(
     launcher,
     /\.\.\.\(managedLaunch \? \[\{[\s\S]*js: \['x-cookie-consent\.js'\][\s\S]*\}\] : \[\]\)/
@@ -226,7 +246,11 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(launcher, /throw new Error\('Invalid X post URL'\)/);
   assert.match(launcher, /closeOtherTabs:\s*options\.autoStartTwitterBot === true \|\| Boolean\(targetTweetUrl\)/);
   assert.match(launcher, /likeTargetPost:\s*Boolean\(targetTweetUrl\)/);
-  assert.match(launcher, /targetTweetUrl\s*\? openPostBootstrapUrl/);
+  // Un Open Post ne demarre plus sur la page interne de l'extension : Chrome
+  // la refuse en navigation directe, et la declarer publique la rendrait
+  // detectable par n'importe quel site.
+  assert.match(launcher, /targetTweetUrl\s*\?\s*'about:blank'/);
+  assert.doesNotMatch(launcher, /\?\s*openPostBootstrapUrl/);
   assert.match(launcher, /!options\.autoStartTwitterBot && !targetTweetUrl/);
   assert.match(launcher, /key:\s*cookieSyncManifestKey/);
   assert.match(launcher, /bootstrap\.html/);
@@ -305,6 +329,96 @@ test('folder post launch is isolated from Open Selected and retains one target t
   assert.match(app, /ignored: proxy too slow/);
   assert.match(app, /window\.electronAPI\.profiles\.forceClose\(profileId\)/);
   assert.match(app, /ignored \(timeout\)/);
+  // Un tour rend compte de ce que chaque instance a fait, pas de ce qu'elle a
+  // ouvert. Le 17 aout 2026, 47 instances tournaient toutes les vingt minutes
+  // et 17 n'avaient jamais retweete -- invisible depuis l'application, il
+  // fallait lire les journaux du VPS en session distante.
+  const principalRt = read('desktop-app/src/main/main.ts');
+  assert.match(principalRt, /const EVENEMENTS_TOUR = \[/);
+  assert.match(principalRt, /'open-post-repost-result'/);
+  assert.match(principalRt, /webContents\.send\('openPost:event'/);
+  // Le retweet se lit sur le champ status, une chaine -- pas un booleen. Et
+  // « deja retweete » est une reussite : ne compter que « reposted » faisait
+  // passer pour rates tous les comptes qui l'avaient deja fait.
+  assert.match(app, /\['reposted', 'already-reposted'\]\.includes/);
+  assert.match(app, /\['liked', 'already-liked'\]\.includes/);
+
+  // Le verdict est relu sur la page et envoye en direct au serveur local, sans
+  // le relais par le service worker qui perdait des messages : le 17 aout
+  // 2026, le tweet affichait 24 retweets quand le recapitulatif en comptait 7.
+  assert.match(launcher, /function rapportDirect\(stage, details = \{\}\)/);
+  assert.match(launcher, /await rapportDirect\('open-post-verdict'/);
+  assert.match(launcher, /article\.querySelector\('\[data-testid="unretweet"\]'\)\)/);
+  assert.match(app, /case 'open-post-verdict':/);
+  // Le resultat monte sur la fiche : le tour se joue sur le VPS et se regarde
+  // depuis le PC.
+  assert.match(app, /lastOpenPost: \{/);
+  assert.match(read('desktop-app/src/types/index.ts'), /lastOpenPost\?: \{/);
+  // Et le recapitulatif montre les echecs en premier : c'est la liste sur
+  // laquelle on agit.
+  assert.ok(
+    app.indexOf("bloc('N’ont pas retweeté'") < app.indexOf("bloc('Ont retweeté'"),
+    'les echecs doivent venir avant les reussites'
+  );
+
+  // « Tweet introuvable » recouvrait trois pannes qui se reparent
+  // differemment : verification humaine, compte deconnecte, compte suspendu.
+  // Le bot dit maintenant ce qu'il avait a l'ecran.
+  assert.match(launcher, /reportStage\('target-not-found', \{/);
+  assert.match(launcher, /'verification-humaine'/);
+  assert.match(launcher, /'compte-suspendu'/);
+  assert.match(app, /'X demande une vérification humaine'/);
+  assert.match(app, /'Compte suspendu par X'/);
+
+  // La chaine qui mene au tweet compte trois etapes et aucune n'etait tracee :
+  // une instance qui echoue restait 52 secondes sur un ecran muet -- soit le
+  // temps cumule des delais d'attente. Chaque etape se raconte maintenant, a
+  // l'ecran et dans la telemetrie.
+  assert.match(launcher, /function noterEtape\(texte, ton = 'info'\)/);
+  assert.match(launcher, /noterEtape\(nom \+ ' : début'/);
+  assert.match(launcher, /noterEtape\(\s*\n?\s*nom \+ ' : ÉCHEC après '/);
+  assert.match(launcher, /'spectra:journal-demarrage'/);
+  assert.match(launcher, /id="spectra-etapes"/);
+  // Le journal vit dans le service worker ; la page ne fait que l'afficher.
+  assert.match(launcher, /sendResponse\(\{ lignes: journalDemarrage \}\)/);
+
+  // Le registre : une ligne par instance et par tweet, gardee sur le disque.
+  // Rien n'etait ecrit a un seul endroit -- le bot savait qu'il avait
+  // retweete mais son message se perdait, Spectra ignorait qui avait deja
+  // travaille, et au redemarrage tout etait oublie. Le 18 aout 2026, un tweet
+  // a ete rouvert 25 fois en 90 minutes par des instances qui l'avaient deja
+  // retweete, pendant qu'un post plus recent attendait.
+  const registre = read('desktop-app/src/main/registre-openpost.ts');
+  assert.match(registre, /export function dejaRetweete\(tweet: string\): Set<string>/);
+  // Une ligne ajoutee, jamais un fichier reecrit : deux instances qui
+  // finissent ensemble ne peuvent pas s'ecraser.
+  assert.match(registre, /fs\.appendFileSync/);
+  assert.doesNotMatch(registre, /fs\.writeFileSync/);
+  // Le tweet voyage avec le verdict, sinon le registre ne sait pas a quel
+  // post rattacher le resultat.
+  assert.match(launcher, /tweet: TARGET_STATUS_ID/);
+  // Un echec se note aussi : sans cela le tour rouvrirait l'instance sans fin.
+  assert.equal((launcher.match(/rapportDirect\('open-post-verdict'/g) || []).length, 2);
+  assert.match(read('desktop-app/src/main/main.ts'), /noterResultat\(\{/);
+  // Et le tour saute celles qui ont deja fait le travail.
+  assert.match(app, /disponibles\.filter\(p => !dejaFaits\.includes\(p\.id\)\)/);
+
+  // Un proxy tombe rarement pour toujours : il devient injoignable puis
+  // revient une heure plus tard. Le remplacer au premier echec ferait
+  // changer l'adresse de sortie d'un compte pour rien -- et pour X, un
+  // compte qui demenage sans raison se remarque.
+  const sante = read('desktop-app/src/main/sante-proxys.ts');
+  assert.match(sante, /export const HEURES_AVANT_REMPLACEMENT = 6;/);
+  assert.match(sante, /export const ECHECS_AVANT_REMPLACEMENT = 6;/);
+  // Un proxy qui revient efface son ardoise.
+  assert.match(sante, /fiche.echecs = 0;/);
+  // Le test passe par CONNECT, comme le navigateur pour une page en https.
+  assert.match(sante, /method: 'CONNECT'/);
+  // Et les instances d'un proxy en panne sont sautees, pas reaffectees :
+  // 65 secondes perdues par instance et par tour, sinon.
+  assert.match(app, /proxy injoignable/);
+  assert.match(app, /proxysSante.tester/);
+
   assert.match(app, /const handleStopOpenPost = async/);
   assert.match(app, /run\.cancelled = true/);
   assert.match(app, /__shouldCancel: \(\) => runState\.cancelled/);
@@ -422,8 +536,8 @@ test('authenticated X sessions survive fast closes and cross-device sync', () =>
   assert.match(launcher, /if \(authenticationCookieChanged\) \{\s*exportCookies\(\)/);
   assert.match(launcher, /chrome\.windows\?\.onRemoved\?\.addListener/);
   assert.match(preload, /profile:hasAuthenticatedXSnapshot/);
-  assert.match(app, /not synchronized: authenticated X snapshot is missing/);
-  assert.match(app, /non synchronisé : aucune session X connectée détectée/);
+  assert.match(app, /non envoyé : pas de session X dans ce profil/);
+  assert.match(app, /La version du cloud est préservée/);
   assert.match(launcher, /const syncedIsAuthenticated =/);
   assert.match(launcher, /const protectedIsAuthenticated =/);
   assert.match(launcher, /const syncedIsNewer =/);
@@ -531,12 +645,44 @@ test('VA Manager audit separates Anto accounts without exposing decrypted creden
   assert.match(client, /hasEmailPassword/);
   assert.doesNotMatch(client, /return\s*\{[\s\S]{0,500}(password|twoFa|authToken):\s*(decrypted|notes)/i);
 
-  assert.match(page, /Instances déjà créées/);
-  assert.match(page, /Instances à créer/);
-  assert.match(page, /Informations manquantes/);
-  assert.match(page, /Prêts à créer et connecter/);
+  // Quatre compteurs qui ne se recouvrent pas : chaque compte tombe dans une
+  // seule categorie, et le total des quatre fait le nombre de comptes.
+  assert.match(page, /label: 'À créer'/);
+  assert.match(page, /label: 'À compléter'/);
+  assert.match(page, /label: 'À finir'/);
+  assert.match(page, /label: 'En place'/);
+  assert.doesNotMatch(page, /Prêts à créer et connecter/);
   assert.match(page, /getMissingInformation\(account\)/);
-  assert.match(page, /auditFilter === 'ready'\) return !linked && complete/);
+  // Compteurs, filtres et lignes lisent le meme calcul.
+  assert.match(page, /etatParCompte\.get\(account\.id\)\?\.categorie === categorie/);
+  assert.match(page, /etatParCompte\.get\(account\.id\)\?\.categorie === auditFilter/);
+
+  // La page a deux filtres : les cartes du haut et une liste deroulante. Le
+  // 16 aout 2026 la liste envoyait encore d'anciennes valeurs -- elle ne
+  // filtrait plus rien, en silence. Les deux doivent proposer exactement les
+  // memes categories que celles calculees.
+  const categories = ['a-creer', 'a-completer', 'a-finir', 'en-place'];
+  const valeursListe = Array.from(
+    page.matchAll(/<option value="([a-z-]+)">(?:Tous les comptes|À créer|À compléter|À finir|En place)</g),
+    found => found[1]
+  );
+  assert.deepEqual(
+    valeursListe,
+    ['all', ...categories],
+    'la liste deroulante doit proposer les memes categories que les cartes'
+  );
+  for (const categorie of categories) {
+    assert.match(
+      page,
+      new RegExp(`filter: '${categorie}' as AuditFilter`),
+      `la carte ${categorie} doit filtrer sur cette categorie`
+    );
+    assert.match(
+      page,
+      new RegExp(`categorie: '${categorie}'`),
+      `aucune categorie ne doit exister sans etre attribuee a un compte`
+    );
+  }
   assert.match(page, /Mot de passe X illisible/);
   assert.match(page, /Mot de passe email illisible/);
   const missingAudit = page.slice(
@@ -571,7 +717,12 @@ test('VA Manager creates ready instances idempotently without sending secrets to
   assert.match(app, /vaManagerLoginStatus:\s*'connected'/);
   assert.match(app, /handleRetryVaManagerConnection/);
   assert.match(app, /existingAccountIds\.has\(account\.id\)/);
-  assert.match(app, /Math\.max\(0,\s*3 - \(usageByProxy\.get\(key\) \|\| 0\)\)/);
+  // La capacite restante d'un proxy se calcule a partir de la constante
+  // partagee, jamais d'un nombre recopie sur place.
+  assert.match(
+    app,
+    /Math\.max\(\s*0,\s*COMPTES_MAX_PAR_PROXY - \(usageByProxy\.get\(proxyIdentityKey\(proxy\)\) \|\| 0\)\s*\)/
+  );
   assert.match(app, /pendingAccounts\.slice\(0,\s*validSlots\.length\)/);
   assert.match(app, /en attente de proxy/);
   assert.match(app, /window\.electronAPI\.proxy\.test\(proxy\)/);
@@ -640,9 +791,13 @@ test('VA Manager links are explicit, reversible, and reject duplicate profile as
   const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
   const app = read('desktop-app/src/renderer/App.tsx');
 
-  assert.match(page, /vaManagerAccountId === account\.id \? 'Liaison confirmée' : 'Correspondance détectée'/);
+  // Une instance trouvee par le nom n'est qu'une hypothese : elle doit etre
+  // confirmee a la main avant de compter comme une liaison.
+  assert.match(page, /profile\.vaManagerAccountId !== account\.id/);
+  assert.match(page, /Une instance semble correspondre/);
+  assert.match(page, /action: 'confirmer'/);
   assert.match(page, /Confirmer la liaison/);
-  assert.match(page, /Lier une instance/);
+  assert.match(page, />\s*Lier\s*<\/button>/);
   assert.match(page, /vaManagerAccountId:\s*account\.id/);
   assert.match(page, /vaManagerOrganizationId:\s*account\.organizationId \|\| organizationId/);
   assert.match(page, /vaManagerAccountId:\s*null/);
@@ -651,6 +806,858 @@ test('VA Manager links are explicit, reversible, and reject duplicate profile as
   assert.match(page, /est déjà liée à un autre compte/);
   assert.match(app, /handleUpdateVaManagerLink/);
   assert.match(app, /firestoreUpdateProfile\(profileId, profileData\)/);
+});
+
+test('automatic X login works on the dialog X actually serves', () => {
+  // Le 16 aout 2026, X a servi x.com/i/jf/onboarding/web : une boite de
+  // dialogue posee par-dessus une page qui contenait deja un champ
+  // identifiant. Le script ecrivait dans le champ du dessous et cherchait un
+  // bouton « Next » alors que celui-ci s'appelle « Continue ». La connexion
+  // s'arretait sur le premier ecran, sans erreur visible.
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const debut = lanceur.indexOf(
+    "fs.writeFileSync(path.join(cookieSyncPath, 'session-import-login.js')"
+  );
+  // Le script va jusqu'a l'ecriture du fichier suivant : s'arreter avant
+  // laisserait la moitie des etapes hors du controle.
+  const script = lanceur.slice(debut, lanceur.indexOf('fs.writeFileSync(', debut + 40));
+  assert.ok(script.includes('entering-totp'), 'le script doit etre lu en entier');
+
+  // On agit dans la boite de dialogue du dessus, pas dans la page du dessous.
+  assert.match(script, /const racineActive = \(\) => \{/);
+  assert.match(script, /document\.querySelectorAll\('\[role="dialog"\]'\)/);
+  assert.match(script, /dialogues\[dialogues\.length - 1\]/);
+  assert.match(script, /for \(const racine of \[racineActive\(\), document\]\)/);
+
+  // Et on connait les trois libelles que X emploie pour avancer.
+  assert.match(script, /\['next', 'suivant', 'continue', 'continuer'\]/);
+  assert.match(script, /'se connecter', 'connexion', 'continue', 'continuer'/);
+
+  // X affiche le champ avant de l'activer. Ecrire trop tot ne laisse rien, et
+  // la connexion s'arretait sans erreur. On attend qu'il soit actif, on ecrit,
+  // puis on relit pour verifier que le texte est bien entre.
+  assert.match(script, /const champPret = \(input\) =>[\s\S]{0,160}!input\.disabled && !input\.readOnly/);
+  assert.match(script, /aria-disabled'\) !== 'true'/);
+  // On retrouve le champ a chaque essai. X change de page entre deux etapes :
+  // s'accrocher au premier champ trouve, c'est attendre qu'un element mort
+  // redevienne actif. Mesure du 16 aout 2026 : le mot de passe etait saisi sur
+  // la page qu'on venait de quitter, puis abandonne au bout de cinq secondes.
+  assert.match(script, /async function saisirEtVerifier\(trouver, value, nom/);
+  assert.match(script, /typeof trouver === 'function' \? trouver\(\) : trouver/);
+  assert.match(script, /document\.contains\(input\)/);
+  assert.match(script, /if \(input\.value === value\) \{/);
+  for (const champs of ['CHAMPS_IDENTIFIANT', 'CHAMPS_MOT_DE_PASSE', 'CHAMPS_CODE']) {
+    assert.match(
+      script,
+      new RegExp('saisirEtVerifier\\(\\s*\\(\\) => findVisible\\(' + champs),
+      `${champs} doit etre reevalue a chaque essai`
+    );
+  }
+  assert.ok(
+    script.indexOf('const champPret') < script.indexOf('const findVisible'),
+    'champPret doit etre defini avant d etre utilise par findVisible'
+  );
+
+  // Les trois saisies passent par la verification, pas seulement la premiere.
+  assert.equal(
+    (script.match(/await saisirEtVerifier\(/g) || []).length,
+    3,
+    'identifiant, mot de passe et code 2FA doivent tous etre verifies'
+  );
+  assert.doesNotMatch(script, /setInputValue\((?:username|passwordState|afterPassword)/);
+
+  // Un panneau dans la page raconte chaque etape, et un point rouge marque
+  // chaque endroit touche. « Rien ne se passe » ne disait pas a quel moment.
+  assert.match(script, /id = 'spectra-journal'/);
+  assert.match(script, /function pointRouge\(element\)/);
+
+  // Le journal se copie : bouton dedie, et texte selectionnable a la souris.
+  assert.match(script, /id = 'spectra-journal-copier'/);
+  assert.match(script, /navigator\.clipboard\.writeText\(texte\)/);
+  assert.match(script, /document\.execCommand\('copy'\)/);
+  assert.match(script, /user-select:text/);
+
+  // Devenu cliquable, le panneau ne doit jamais etre confondu avec la page de
+  // X : sinon le robot clique sur son propre bouton Copier.
+  assert.match(script, /!element\.closest\('#spectra-journal'\)/);
+  assert.match(script, /pointRouge\(button\)/);
+  assert.match(script, /pointRouge\(input\)/);
+  assert.match(script, /sessionStorage\.setItem\(CLE_JOURNAL/);
+
+  // Le bandeau de consentement masque le formulaire. Le script de connexion
+  // l'ecarte lui-meme : compter sur une autre extension laissait la fenetre
+  // attendre 45 s devant un formulaire invisible -- constate le 16 aout 2026.
+  assert.match(script, /function ecarterBandeauCookies\(\)/);
+  assert.match(script, /ecarterBandeauCookies\(\);/);
+
+  // X ne nomme pas son champ de la meme facon selon l'ecran servi : on part du
+  // plus precis et on elargit, au lieu de ne connaitre que deux selecteurs.
+  assert.match(script, /const CHAMPS_IDENTIFIANT = \[/);
+  assert.match(script, /'input\[autocomplete="email"\]'/);
+  assert.match(script, /'input\[type="text"\]'/);
+  // Le mot de passe souffrait du meme defaut : deux noms connus seulement.
+  assert.match(script, /const CHAMPS_MOT_DE_PASSE = \[/);
+  assert.match(script, /'input\[type="password"\]'/);
+  assert.match(script, /J’attends le mot de passe/);
+
+  // L'ecran du code 2FA se reconnait d'abord a son adresse : le texte affiche
+  // change avec la langue et avec les versions de X. Exiger « authentication
+  // code » a fait manquer cet ecran le 16 aout 2026.
+  // La derniere etape fait changer de page : le script qui suivait la connexion
+  // meurt avec l'ancienne. C'est celui recharge sur /home qui annonce la
+  // reussite -- sinon Spectra attend trois minutes et conclut a un echec, alors
+  // que le compte est connecte. Mesure du 16 aout 2026.
+  assert.match(script, /if \(isHome\(\)\) \{[\s\S]{0,200}report\('success'/);
+
+  assert.match(script, /const ecranDuCode = \(\) =>/);
+  assert.match(script, /two\[_-\]\?factor\|login_verification/);
+  assert.match(script, /test\(location\.href\)/);
+  assert.match(script, /if \(otp && ecranDuCode\(\)\)/);
+  assert.match(script, /J’attends la suite/);
+  // Et pendant l'attente, le panneau dit ce qu'il voit dans la page.
+  assert.match(script, /champ\(s\) visible\(s\)/);
+  assert.match(script, /aucun champ de saisie dans la page/);
+  assert.match(script, /je refuse les cookies non nécessaires/);
+  // Toujours le choix le plus protecteur, jamais l'acceptation.
+  assert.match(script, /refuser\.click\(\)/);
+  assert.doesNotMatch(script, /accepter\.click\(\)|ACCEPTE[^)]*\)\.click\(\)/);
+
+  // Le journal est visible dans la page : ni le mot de passe ni la cle 2FA n'y
+  // apparaissent. Le code a six chiffres, lui, ne vaut que trente secondes et
+  // sert a comparer avec un generateur exterieur.
+  assert.doesNotMatch(script, /journal\([^)]*credentials\.password/);
+  assert.doesNotMatch(script, /journal\([^)]*credentials\.totpSecret\b(?!\)\.length)/);
+
+  // Une cle 2FA arrive en minuscules, avec des espaces, ou en lien otpauth://.
+  // Le decodeur n'acceptait que des majuscules collees : tout le reste levait
+  // une erreur remontee en « echec inattendu », sans nommer la cause.
+  assert.match(script, /function nettoyerSecret\(secret\)/);
+  assert.match(script, /toUpperCase\(\)/);
+  assert.match(script, /otpauth/);
+  assert.match(script, /searchParams\.get\('secret'\)/);
+  assert.match(script, /for \(const character of nettoyerSecret\(secret\)\)/);
+  assert.match(script, /Clé 2FA illisible/);
+
+  // Une connexion part de l'accueil de X : /i/flow/login redirige vers un
+  // ecran d'onboarding qui ne presente plus le formulaire au meme endroit.
+  const principal = read('desktop-app/src/main/main.ts');
+  assert.match(lanceur, /sessionImportAttemptId\s*\?\s*'https:\/\/x\.com\/'/);
+  assert.match(principal, /lastUrl: 'https:\/\/x\.com\/',\s*\n\s*launchMode: 'session-import'/);
+  assert.doesNotMatch(lanceur, /i\/flow\/login/);
+  assert.doesNotMatch(principal, /i\/flow\/login/);
+
+  // Le script est injecte dans l'onglet avant qu'on lui parle : sa declaration
+  // dans le manifeste ne garantit pas qu'il soit deja en place.
+  const demarrage = lanceur.slice(
+    lanceur.indexOf('async function startSessionImport(tabId)'),
+    lanceur.indexOf('async function requestProfileClose(')
+  );
+  assert.match(demarrage, /chrome\.scripting\.executeScript\(\{[\s\S]{0,160}session-import-login\.js/);
+  assert.ok(
+    demarrage.indexOf('executeScript') < demarrage.indexOf('sendMessage'),
+    "l'injection doit precede l'envoi des identifiants"
+  );
+  // Et l'echec doit dire lequel : serveur, jeton, ou onglet muet.
+  assert.match(demarrage, /'serveur ' \+ response\.status/);
+  assert.match(demarrage, /String\(error\?\.message \|\| error\)/);
+
+  // Une connexion ratee laisse la fenetre ouverte le temps de lire l'ecran :
+  // message de X, compte suspendu, journal. Elle etait fermee sur-le-champ,
+  // c'est-a-dire au moment precis ou il fallait regarder.
+  assert.match(
+    principal,
+    /result\.status === 'failed'\)[\s\S]{0,600}setTimeout\([\s\S]{0,200}forceCloseProfile\(profileId\)[\s\S]{0,80}90_000/,
+    'un echec doit laisser la fenetre visible avant de fermer'
+  );
+
+  // Les identifiants restent lisibles pendant la tentative : un service worker
+  // arrete par Chrome les redemande en repartant.
+  const serveur = read('desktop-app/src/main/url-server.ts');
+  const routeIdentifiants = serveur.slice(
+    serveur.indexOf("requestUrl.pathname === '/api/session-import-credentials'"),
+    serveur.indexOf("if (\n          req.method === 'POST'")
+  );
+  assert.doesNotMatch(
+    routeIdentifiants.slice(routeIdentifiants.indexOf('res.writeHead(200')),
+    /sessionImportCredentials\.delete/
+  );
+  assert.match(serveur, /expiresAt: Date\.now\(\) \+ 5 \* 60 \* 1000/);
+});
+
+test('the cookie banner is dismissed wherever X puts it', () => {
+  // Mesure du 16 aout 2026 sur https://x.com/ : la page n'expose plus aucun
+  // data-testid, et la banniere vit dans un simple [role="region"]. Le script
+  // ne cherchait que dans [data-testid="BottomBar"] : il ne trouvait rien, la
+  // banniere restait, et le formulaire de connexion n'apparaissait jamais.
+  // Une connexion automatique attendait alors 45 s dans le vide.
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const debut = lanceur.indexOf("'x-cookie-consent.js'), `");
+  const script = lanceur.slice(debut, lanceur.indexOf('`);', debut));
+
+  // On cherche par ce que la banniere contient, pas par l'endroit ou elle est.
+  assert.match(script, /document\.querySelectorAll\('button, \[role="button"\]'\)/);
+  assert.match(script, /closest\('\[role="region"\]'\)/);
+  assert.doesNotMatch(
+    script,
+    /const bottomBar = document\.querySelector\('\[data-testid="BottomBar"\]'\);\s*\n\s*if \(!bottomBar\) return false;/,
+    'la banniere ne doit plus etre cherchee uniquement dans BottomBar'
+  );
+
+  // Deux boutons opposes dans le meme bloc : c'est ce qui distingue une
+  // banniere de consentement d'un « refuser » situe ailleurs dans la page.
+  assert.match(script, /const acceptPattern =/);
+  assert.match(script, /if \(!accompagne\) return false;/);
+
+  // Et on refuse toujours ce qui n'est pas necessaire.
+  assert.match(script, /rejectButton\.click\(\)/);
+  assert.doesNotMatch(script, /acceptButton\.click\(\)/);
+});
+
+test('every launch option asked for actually reaches the browser', () => {
+  // `launchProfileBrowser` reconstruit les options champ par champ : tout ce
+  // qui n'y figure pas est perdu en silence. Le 17 aout 2026, le branding et le
+  // modele de robot etaient demandes, transmis, puis jetes ici -- la fenetre
+  // s'ouvrait et il ne se passait rien, sans la moindre erreur.
+  const principal = read('desktop-app/src/main/main.ts');
+  const appel = principal.slice(
+    principal.indexOf('const result = await PuppeteerLauncher.launch({'),
+    principal.indexOf('if (result.alreadyRunning)')
+  );
+
+  for (const champ of ['branding', 'folderId', 'botTemplate', 'botTemplateApplied']) {
+    assert.match(
+      appel,
+      new RegExp(`${champ}: profileData\\.${champ}`),
+      `${champ} doit etre transmis au lanceur`
+    );
+  }
+  // Les options historiques ne doivent pas disparaitre au passage.
+  for (const champ of ['sessionImport', 'targetTweetUrl', 'lastUrl', 'proxy']) {
+    assert.match(appel, new RegExp(`${champ}:`), `${champ} doit rester transmis`);
+  }
+});
+
+test('branding clears a field before writing the new value', () => {
+  // Un compte a souvent deja une bio ou un nom. Ecrire par-dessus sans vider
+  // laisse la page dans un etat que X ne prend pas toujours : la valeur d'avant
+  // revient, ou les deux se melangent.
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const debut = lanceur.indexOf("cookieSyncPath, 'spectra-branding.js'");
+  const script = lanceur.slice(debut, lanceur.indexOf('const cookieSyncExtensionId', debut));
+
+  // On vide, on laisse la page enregistrer ce vide, puis on ecrit lettre par
+  // lettre : cinq champs remplis a la milliseconde pres sont une signature.
+  assert.match(script, /poserValeur\(champ, ''\);\s*\n\s*await pause\(\d+, \d+\);/);
+  assert.match(script, /for \(const lettre of String\(valeur\)\)/);
+  assert.match(script, /poserValeur\(champ, ecrit\)/);
+  assert.match(script, /setSelectionRange\(0, String\(champ\.value \|\| ''\)\.length\)/);
+
+  // Les pauses ne sont jamais deux fois les memes.
+  assert.match(script, /const hasardEntre = \(min, max\) =>/);
+  assert.ok(
+    (script.match(/await pause\(/g) || []).length >= 6,
+    'chaque etape doit marquer un temps, pas seulement la saisie'
+  );
+
+  // Et on relit le champ : sans cette verification, un effacement refuse
+  // passerait pour une reussite.
+  assert.match(script, /if \(champ\.value === valeur\)/);
+
+  // Un element absent du lot ne touche a rien : on ne vide pas une bio pour la
+  // remplacer par du vide.
+  assert.match(script, /if \(!valeur\) return true;/);
+
+  // Poser une photo sur X se fait en trois temps : choisir le fichier, valider
+  // le recadrage, enregistrer. Sans le clic sur « Appliquer », l'image est
+  // deposee puis perdue -- l'enregistrement ne la voit meme pas.
+  assert.match(script, /async function validerRecadrage\(nom\)/);
+  assert.match(script, /'apply', 'appliquer'/);
+  assert.match(script, /await validerRecadrage\('Photo'\)/);
+  assert.match(script, /await validerRecadrage\('Bannière'\)/);
+  // Et la validation vient apres le depot, jamais avant.
+  assert.ok(
+    script.indexOf("deposerImage(champsFichier[1]") < script.indexOf("validerRecadrage('Photo')"),
+    'le recadrage se valide apres le depot du fichier'
+  );
+
+  // Une page rouverte la ou on l'avait laissee ne convient pas : un branding
+  // impose la page des reglages, une publication celle du composeur.
+  const lanceurEntier = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.match(
+    lanceurEntier,
+    /!options\.branding && !options\.massPost && fs\.existsSync\(lastUrlPath\)/
+  );
+});
+
+test('branding never gives two accounts the same face', () => {
+  const os = require('os');
+  const { analyserLieu, lireLotBranding, attribuerBranding } = loadTypeScriptModule(
+    'desktop-app/src/main/branding-manager.ts'
+  );
+
+  // Le pays devant un lieu est facultatif : « US | Miami, FL » ou « Paris ».
+  assert.deepEqual(analyserLieu('US | Miami, FL'), { pays: 'US', valeur: 'Miami, FL' });
+  assert.deepEqual(analyserLieu('Paris'), { pays: null, valeur: 'Paris' });
+  // Une ligne mal formee reste un lieu, elle ne disparait pas.
+  assert.deepEqual(analyserLieu('Rio | de Janeiro'), { pays: null, valeur: 'Rio | de Janeiro' });
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'branding-'));
+  const lot = path.join(base, 'Branding', 'madison');
+  fs.mkdirSync(path.join(lot, 'photos'), { recursive: true });
+  fs.mkdirSync(path.join(lot, 'bannieres'), { recursive: true });
+  for (let index = 1; index <= 3; index++) {
+    fs.writeFileSync(path.join(lot, 'photos', `p${index}.jpg`), 'x');
+  }
+  fs.writeFileSync(path.join(lot, 'bios.txt'), '# ignore\nbio A\nbio B\n\nbio C\n');
+  fs.writeFileSync(path.join(lot, 'noms.txt'), 'Madison\n');
+  fs.writeFileSync(path.join(lot, 'liens.txt'), 'https://exemple.test/a\n');
+  fs.writeFileSync(path.join(lot, 'lieux.txt'), 'US | Miami, FL\nUS | Austin, TX\nGB | London\n');
+
+  // Les commentaires et les lignes vides ne comptent pas comme des bios.
+  assert.deepEqual(lireLotBranding(base, 'madison').bios, ['bio A', 'bio B', 'bio C']);
+
+  let graine = 7;
+  const hasard = () => {
+    graine = (graine * 9301 + 49297) % 233280;
+    return graine / 233280;
+  };
+
+  // Trois photos, trois comptes : aucune ne doit se repeter.
+  const photos = ['a', 'b', 'c'].map(
+    (identifiant) => attribuerBranding(base, 'madison', identifiant, 'US', hasard).attribution.photo
+  );
+  assert.equal(new Set(photos).size, 3, 'deux comptes ne doivent jamais partager une photo');
+
+  // Le quatrieme epuise le lot : on reprend, mais on le dit.
+  const quatrieme = attribuerBranding(base, 'madison', 'd', 'US', hasard);
+  assert.ok(quatrieme.doublons.includes('photo'), 'un doublon doit etre annonce, pas subi');
+
+  // Un lieu coherent avec la sortie du proxy : Miami derriere un proxy
+  // allemand, c'est la contradiction qui se repere.
+  for (const identifiant of ['a', 'b', 'c', 'd']) {
+    const lieu = attribuerBranding(base, 'madison', identifiant, 'US', hasard).attribution.lieu;
+    assert.ok(['Miami, FL', 'Austin, TX'].includes(lieu), `lieu hors pays : ${lieu}`);
+  }
+  assert.equal(attribuerBranding(base, 'madison', 'gb', 'GB', hasard).attribution.lieu, 'London');
+
+  // Une instance deja servie garde ce qu'elle a recu : sinon les comptes
+  // changeraient de visage a chaque ouverture.
+  const repete = attribuerBranding(base, 'madison', 'a', 'US', hasard);
+  assert.equal(repete.deja, true);
+  assert.equal(repete.attribution.photo, photos[0]);
+
+  // Le lien du profil est tire comme le reste. Il etait collecte dans le
+  // panneau et jamais utilise : le champ Website restait vide.
+  assert.equal(repete.attribution.lien, 'https://exemple.test/a');
+
+  // Une fiche ecrite avant qu'un element existe doit se completer, pas rester
+  // amputee. Le 17 aout 2026, le lien a ete ajoute apres coup : toutes les
+  // instances deja servies gardaient une fiche sans lien, et le champ Website
+  // n'etait jamais rempli -- sans la moindre erreur.
+  const fiches = path.join(lot, 'attributions.json');
+  const avant = JSON.parse(fs.readFileSync(fiches, 'utf8'));
+  delete avant.a.lien;
+  delete avant.a.bio;
+  fs.writeFileSync(fiches, JSON.stringify(avant));
+
+  const complete = attribuerBranding(base, 'madison', 'a', 'US', hasard);
+  assert.equal(complete.deja, true, 'une fiche completee reste la meme fiche');
+  assert.equal(complete.attribution.photo, photos[0], 'le visage ne doit pas changer');
+  assert.ok(complete.attribution.lien, 'le lien manquant doit etre ajoute');
+  assert.ok(complete.attribution.bio, 'la bio manquante doit etre ajoutee');
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.match(lanceur, /'input\[name="url"\]'/);
+  assert.match(lanceur, /BRANDING\.lien, 'Lien'/);
+  assert.match(read('desktop-app/src/main/main.ts'), /lien: choix\.lien/);
+
+  // X renomme ses champs au fil des versions : un selecteur perime laissait le
+  // champ vide sans rien dire. Chaque champ a donc un repli par libelle, et un
+  // echec dit ce qu'il y avait dans la page.
+  assert.match(lanceur, /function chercherParLibelle\(motif\)/);
+  assert.equal((lanceur.match(/i\) && complet/g) || []).length, 4);
+  assert.match(lanceur, /champ introuvable — présents : /);
+
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('a mass post never says the same thing twice', () => {
+  const os = require('os');
+  const { tirerPublication } = loadTypeScriptModule(
+    'desktop-app/src/main/branding-manager.ts'
+  );
+
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-'));
+  const lot = path.join(base, 'Branding', 'tous');
+  fs.mkdirSync(path.join(lot, 'medias'), { recursive: true });
+  fs.writeFileSync(lot + '/posts.txt', '# ignore\npost A\npost B\n\npost C\n');
+  for (const nom of ['m1.jpg', 'm2.mp4']) {
+    fs.writeFileSync(path.join(lot, 'medias', nom), 'x');
+  }
+
+  let graine = 11;
+  const hasard = () => {
+    graine = (graine * 9301 + 49297) % 233280;
+    return graine / 233280;
+  };
+
+  // Trois posts, trois comptes : vingt comptes disant la meme phrase a la meme
+  // minute, c'est la trace la plus lisible qui soit.
+  const textes = ['a', 'b', 'c'].map(
+    (identifiant) => tirerPublication(base, 'tous', identifiant, hasard).post
+  );
+  assert.equal(new Set(textes).size, 3, 'deux comptes ne doivent pas publier le meme texte');
+
+  // Le fichier .txt garde ses commentaires pour l'utilisateur, pas pour le
+  // tirage.
+  assert.ok(!textes.includes('# ignore'));
+
+  // Un post porte souvent ses propres retours a la ligne, et une ligne vide au
+  // milieu fait partie du texte : une ligne --- separe alors deux posts.
+  // Decouper par ligne aurait fait partir chaque morceau comme un post entier.
+  const multi = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-multi-'));
+  const lotMulti = path.join(multi, 'Branding', 'tous');
+  fs.mkdirSync(lotMulti, { recursive: true });
+  fs.writeFileSync(
+    path.join(lotMulti, 'posts.txt'),
+    '# entete\nmayyy i dm you??\n\n(answer quickly)\n---\ndeuxieme post\n'
+  );
+  const doubles = ['x', 'y'].map(
+    (identifiant) => tirerPublication(multi, 'tous', identifiant, hasard).post
+  );
+  assert.deepEqual(
+    doubles.slice().sort(),
+    ['deuxieme post', 'mayyy i dm you??\n\n(answer quickly)'],
+    'un post sur plusieurs lignes doit rester entier'
+  );
+  fs.rmSync(multi, { recursive: true, force: true });
+
+  // Le coller transmet le texte entier, retours a la ligne compris.
+  assert.match(
+    read('desktop-app/src/main/puppeteer-launcher.ts'),
+    /new ClipboardEvent\('paste', \{/
+  );
+
+  // Un compte ne se repete pas : le deuxieme envoi lui donne autre chose.
+  const secondPourA = tirerPublication(base, 'tous', 'a', hasard).post;
+  assert.notEqual(secondPourA, textes[0], 'un compte ne doit pas republier son propre texte');
+
+  // Une video est un media comme un autre : la reserve accepte les deux.
+  // La part de media est forcee a 1 ici : depuis le 20 aout 2026 le tirage la
+  // saute une fois sur deux, et cette ligne parle de la reserve, pas du hasard.
+  const avecMedia = tirerPublication(base, 'tous', 'd', hasard, 1);
+  assert.ok(/m1\.jpg|m2\.mp4/.test(String(avecMedia.media)));
+
+  // Toutes les publications ne portent pas un media.
+  //
+  // Une timeline ou chaque post a une photo se reconnait de loin : personne
+  // n'ecrit comme ca. Le bot VENUS tire deja au sort de son cote -- 55 % de
+  // texte seul -- et le mass post collait un media a chaque fois.
+  const tirages = Array.from({ length: 60 }, (_, i) =>
+    tirerPublication(base, 'tous', 'ratio' + i, hasard)
+  );
+  const sansMedia = tirages.filter((t) => !t.media).length;
+  assert.ok(sansMedia > 8, 'des publications doivent partir en texte seul');
+  assert.ok(sansMedia < 52, 'des publications doivent porter un media');
+  assert.ok(
+    tirages.every((t) => t.post),
+    'un tirage sans media doit quand meme rendre un texte'
+  );
+
+  // Un dossier qui n'a que des medias continue d'en envoyer : sans cette
+  // reserve, un post vide et un media saute laisseraient l'instance sans rien.
+  const seulsMedias = fs.mkdtempSync(path.join(os.tmpdir(), 'publication-media-'));
+  const lotMedias = path.join(seulsMedias, 'Branding', 'tous');
+  fs.mkdirSync(path.join(lotMedias, 'medias'), { recursive: true });
+  fs.writeFileSync(path.join(lotMedias, 'medias', 'seul.jpg'), 'x');
+  for (let i = 0; i < 8; i++) {
+    const t = tirerPublication(seulsMedias, 'tous', 'm' + i, hasard);
+    assert.ok(t.media, 'sans texte, le media doit toujours partir');
+  }
+  fs.rmSync(seulsMedias, { recursive: true, force: true });
+
+  // Quand le compte a tout publie, on recommence -- mais on le dit, plutot que
+  // de n'envoyer rien.
+  tirerPublication(base, 'tous', 'a', hasard);
+  const epuise = tirerPublication(base, 'tous', 'a', hasard);
+  assert.equal(epuise.epuise, true, 'une reserve epuisee doit etre annoncee');
+  assert.ok(epuise.post, 'une reserve epuisee ne doit pas rendre un post vide');
+
+  // L'historique survit au redemarrage : il est sur le disque, pas en memoire.
+  const historique = JSON.parse(fs.readFileSync(path.join(lot, 'publications.json'), 'utf8'));
+  assert.ok(historique.a.posts.length >= 3);
+
+  // Un post qui n'est pas parti revient dans la reserve. Le tirage est
+  // enregistre a l'ouverture du navigateur, avant qu'on sache si ca aboutira :
+  // sans ce retour, une serie d'echecs viderait la reserve sans qu'une seule
+  // publication soit envoyee.
+  const { rendrePublication, lireResultats, ecrireResultat } = loadTypeScriptModule(
+    'desktop-app/src/main/branding-manager.ts'
+  );
+  const avantRetour = tirerPublication(base, 'tous', 'z', hasard);
+  const compteAvant = JSON.parse(
+    fs.readFileSync(path.join(lot, 'publications.json'), 'utf8')
+  ).z.posts.length;
+  rendrePublication(base, 'tous', 'z', avantRetour.post, avantRetour.media);
+  const compteApres = JSON.parse(
+    fs.readFileSync(path.join(lot, 'publications.json'), 'utf8')
+  ).z.posts.length;
+  assert.equal(compteApres, compteAvant - 1, 'un post rate doit revenir dans la reserve');
+
+  // Le resultat dit ce qui a abouti, pas ce qui a ete tire : un compte peut
+  // avoir sa photo attribuee et n'avoir jamais rien recu.
+  ecrireResultat(base, 'tous', 'a', 'post', {
+    statut: 'echoue', quand: '2026-08-17T04:00:00.000Z', message: 'Bouton Poster éteint',
+  });
+  ecrireResultat(base, 'tous', 'a', 'branding', {
+    statut: 'reussi', quand: '2026-08-17T03:00:00.000Z', message: 'Branding posé',
+  });
+  const traces = lireResultats(base, 'tous');
+  assert.equal(traces.a.post.statut, 'echoue');
+  assert.equal(traces.a.branding.statut, 'reussi', 'les deux actions se suivent separement');
+
+  // Une instance mise de cote sort des lots sans etre supprimee, et revient
+  // d'un clic. Sans cela, une instance que X refuse revient en echec a chaque
+  // tour et noie les vrais echecs dans le bilan.
+  const { marquerEcartee } = loadTypeScriptModule('desktop-app/src/main/branding-manager.ts');
+  marquerEcartee(base, 'tous', 'a', true, 'Vérification humaine');
+  assert.equal(lireResultats(base, 'tous').a.ecartee.raison, 'Vérification humaine');
+  assert.equal(
+    lireResultats(base, 'tous').a.branding.statut, 'reussi',
+    'la mise de cote ne doit pas effacer ce qui a deja abouti'
+  );
+  marquerEcartee(base, 'tous', 'a', false);
+  assert.equal(lireResultats(base, 'tous').a.ecartee, null);
+
+  // Le tableau saute ces instances, et dit combien il en a sautees : un lot
+  // qui traite moins d'instances que coche doit s'expliquer.
+  const tableau = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+  assert.match(tableau, /cibles\.filter\(profil => !resultatsActions\[profil\.id\]\?\.ecartee\)/);
+  assert.match(tableau, /mise\(s\) de côté — sautée\(s\)/);
+
+  // Et l'ecriture du resultat suit le verdict du script, pas le tirage.
+  const principal = read('desktop-app/src/main/main.ts');
+  assert.match(principal, /statut: fin\.status === 'success' \? 'reussi' : 'echoue'/);
+  assert.match(principal, /rendrePublication\(racine, folderId, profileId, tirage\.post, tirage\.media\)/);
+
+  // L'editeur de X reaffiche son propre etat apres chaque changement. Ecrire
+  // lettre par lettre posait le caractere dans la page, puis l'editeur
+  // reaffichait par-dessus : les deux s'additionnaient et le texte doublait a
+  // chaque frappe -- « if » devenait « ifi », puis « ifi ifi ». Le coller ne
+  // touche pas a la page, l'editeur l'intercepte et se reaffiche une fois.
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.doesNotMatch(lanceur, /execCommand\('insertText'/);
+  assert.match(lanceur, /transfert\.setData\('text\/plain', contenu\)/);
+  assert.match(lanceur, /'\[data-testid="tweetTextarea_0"\]'/);
+  // Et le texte obtenu est relu avant tout clic : un texte abime ne doit pas
+  // partir. C'est ce qui a empeche six publications ratees le 17 aout 2026.
+  assert.match(lanceur, /if \(ecrit !== attendu\) \{/);
+  // Mais elle doit relire l'editeur ligne par ligne : textContent colle les
+  // lignes bout a bout, et un post en deux paragraphes se relisait
+  // « ... 2 HOURS !Guysss onlyyyy » sans l'espace attendu -- refuse alors que
+  // le texte etait juste.
+  // Une seule etiquette a la fois : les demander ensemble ramenait le bloc
+  // exterieur ET le bloc interieur qu'il contient, donc chaque ligne lue deux
+  // fois. Et les emoji sont des images, pas du texte : sans leur attribut alt
+  // la relecture croit le texte ampute.
+  assert.doesNotMatch(lanceur, /'\[data-block="true"\], \.public-DraftStyleDefault-block'/);
+  assert.match(lanceur, /if \(blocs\.length === 0\) blocs = editeur\.querySelectorAll/);
+  assert.match(lanceur, /image\.getAttribute\('alt'\)/);
+  assert.match(lanceur, /const sansEspaces = /);
+  // Le repli ne rejoue que sur un editeur vide : recoller par-dessus un texte
+  // deja pose le doublait.
+  assert.match(lanceur, /if \(!String\(lireEditeur\(editeur\)\)\.trim\(\)\) \{/);
+
+  // X pose ses annonces par-dessus la page -- « Introducing Downloadable
+  // Videos » et son bouton Got it recouvraient le bouton Poster, et le bot
+  // attendait un bouton qu'il ne pouvait pas atteindre.
+  assert.match(lanceur, /function ecarterAnnonce\(\)/);
+  assert.match(lanceur, /'got it', 'not now', 'maybe later'/);
+  // Jamais un OK ni un Fermer : trop ambigus pour etre cliques a l'aveugle.
+  const libelles = lanceur.slice(
+    lanceur.indexOf('LIBELLES_ECARTER = ['),
+    lanceur.indexOf('function ecarterAnnonce()')
+  );
+  for (const interdit of ["'ok'", "'okay'", "'close'", "'fermer'", "'dismiss'"]) {
+    assert.ok(!libelles.includes(interdit), `${interdit} ne doit pas etre clique a l'aveugle`);
+  }
+  // Et jamais la fenetre de redaction elle-meme.
+  assert.match(lanceur, /!estRedaction\(zone\)/);
+
+  // Une verification humaine s'arrete net et se signale : rien d'automatique
+  // n'a a s'en meler, et attendre dix minutes un editeur qui n'arrivera pas
+  // n'apprend rien a personne.
+  assert.match(lanceur, /const verificationHumaine = \(\) =>/);
+  assert.equal(
+    (lanceur.match(/X demande une vérification humaine/g) || []).length, 3,
+    'la publication et le branding doivent tous deux s\'arreter'
+  );
+  assert.match(lanceur, /challenges\.cloudflare\.com/);
+
+  // Le journal se tient replie : deplie, il recouvrait l'editeur et le media,
+  // et on ne voyait plus rien de ce que le bot faisait. Il reste consultable
+  // d'un clic -- c'est lui qui a trouve chacun des defauts du 17 aout 2026.
+  assert.equal((lanceur.match(/const CLE_OUVERT = 'spectraJournalOuvert';/g) || []).length, 2);
+  assert.match(lanceur, /\(clic pour replier\)/);
+  assert.match(lanceur, /boite\.textContent = 'Spectra — ' \+ \(derniere \? derniere\.texte/);
+  assert.ok(
+    lanceur.indexOf('Le texte n’est pas passé dans l’éditeur') <
+      lanceur.indexOf("journal('Clic sur Poster'"),
+    'la relecture du texte doit precer le clic'
+  );
+  // Poster avant la fin de l'envoi publierait le texte sans son media.
+  assert.ok(
+    lanceur.indexOf('Média prêt') < lanceur.indexOf("journal('Clic sur Poster'"),
+    'le media doit avoir fini de se charger avant le clic'
+  );
+  // Mais on ne cherche la barre de progression que dans l'apercu du media : le
+  // compteur de caracteres de X est lui aussi un [role="progressbar"], et il ne
+  // disparait jamais tant qu'il y a du texte. Le chercher dans la page entiere
+  // bloquait la publication pour toujours.
+  assert.match(lanceur, /conteneur\.querySelector\('\[role="progressbar"\]'\)/);
+  assert.doesNotMatch(lanceur, /document\.querySelector\('\[role="progressbar"\]'\)/);
+  // Et le meme oubli que pour le branding : un champ calcule puis jete en
+  // silence par la reconstruction des options.
+  assert.match(read('desktop-app/src/main/main.ts'), /massPost: profileData\.massPost/);
+
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+test('a model instance passes its bot settings on, never its identity', () => {
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const tableau = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+
+  // La licence est propre a chaque compte -- verifie dans la base des licences,
+  // une par compte X. La recopier ferait tourner deux instances sous la meme
+  // identite, et melangerait les compteurs des deux comptes.
+  const exclues = lanceur.slice(
+    lanceur.indexOf('CLES_PROPRES_AU_COMPTE = ['),
+    lanceur.indexOf('cheminModeleBot')
+  );
+  for (const cle of ['licenseKey', 'currentAccount', 'deviceId']) {
+    assert.match(exclues, new RegExp(`'${cle}'`), `${cle} ne doit jamais etre recopie`);
+  }
+  // L'historique des conversations appartient aussi au compte.
+  assert.match(exclues, /'processedConversations'/);
+  assert.match(exclues, /'conversationStates'/);
+
+  // Le script tourne dans le contexte de l'extension du robot : c'est le seul
+  // endroit d'ou son stockage est lisible.
+  assert.match(lanceur, /const modeleFile = 'spectra-bot-template\.js';/);
+  assert.match(lanceur, /chrome\.storage\.local\.get\(null, \(tout\)/);
+  assert.match(lanceur, /if \(CLES_PROPRES\.includes\(cle\)\) continue;/);
+  // Le filtre s'applique aux deux sens : a la publication comme a la copie.
+  assert.equal((lanceur.match(/CLES_PROPRES\.includes\(cle\)/g) || []).length, 2);
+
+  // On ne reecrit pas a chaque ouverture : sinon un reglage ajuste sur place
+  // serait ecrase sans prevenir.
+  assert.match(lanceur, /empreinteDuDossier !== options\.botTemplateApplied/);
+  assert.match(lanceur, /empreinte: require\('crypto'\)/);
+
+  // Un dossier n'a qu'un seul modele : en designer un demarque le precedent.
+  assert.match(tableau, /const definirModeleBot = \(profil: any\)/);
+  assert.match(tableau, /if \(autre\.botTemplate\) onUpdateProfile\(autre\.id, \{ botTemplate: false \}\)/);
+  assert.match(tableau, /Utiliser comme modèle/);
+});
+
+test('accounts can be ticked and connected one after another', () => {
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+
+  // On coche, et le bouton obeit a la selection. Sans selection il retombe sur
+  // « tout ce qui est pret » : une liste vide ne doit pas bloquer le bouton.
+  assert.match(page, /const \[comptesCoches, setComptesCoches\]/);
+  assert.match(page, /Connecter la sélection \(\$\{selectionTraitable\.length\}\)/);
+  assert.match(page, /Créer et connecter les prêts \(\$\{readyCount\}\)/);
+
+  // Seul ce qui a quelque chose a faire est cochable.
+  assert.match(page, /categorie === 'a-creer' \|\| categorie === 'a-finir'/);
+  assert.match(page, /disabled=\{!estTraitable\(account\)\}/);
+
+  // Tout cocher ne touche qu'aux lignes affichees : selectionner de l'invisible
+  // est un piege.
+  assert.match(page, /const cochablesVisibles = visibleAccounts\.filter\(estTraitable\)/);
+  assert.match(page, /for \(const compte of cochablesVisibles\)/);
+
+  // Deux cas dans une meme selection, deux chemins : creer puis connecter, ou
+  // seulement reprendre la connexion. Melanger les deux enverrait les comptes
+  // deja crees dans une creation qui les ignore en silence.
+  assert.match(page, /const aCreer = cibles\.filter\(/);
+  assert.match(page, /const aFinir = cibles\.filter\(/);
+  assert.match(page, /await onCreateAndConnect\(aCreer, organizationId, dossierChoisi\)/);
+  assert.match(page, /for \(const compte of aFinir\)[\s\S]{0,320}await onRetryConnection\(/);
+
+  // Un compte a la fois : deux connexions X simultanees se genent.
+  assert.doesNotMatch(page, /Promise\.all\([\s\S]{0,120}onRetryConnection/);
+
+  // Le branding, lui, peut aller a plusieurs : chaque instance a son profil et
+  // son proxy, elles sont independantes. Le nombre se choisit dans le panneau.
+  const tableau = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+  // Un reglage par action depuis le 20 aout 2026 : un branding pose une photo
+  // et deux champs, un mass post televerse une video de 40 Mo et attend X
+  // pendant des minutes. Et les deux tiennent au redemarrage.
+  assert.match(tableau, /const \[parallelesBranding, setParallelesBranding\] = useState\(\(\) =>/);
+  assert.match(tableau, /const \[parallelesPost, setParallelesPost\] = useState\(\(\) =>/);
+  assert.match(tableau, /localStorage\.setItem\('spectra-paralleles-post'/);
+  assert.match(tableau, /Fenêtres en même temps/);
+  // Le mass post ouvre le nombre de fenetres qui lui est propre, pas celui du
+  // branding : les deux listes deroulantes doivent commander deux valeurs.
+  assert.match(tableau, /total: parallelesPost/);
+  assert.match(tableau, /\(fenetres \?\? parallelesBranding\)/);
+  // Une file partagee, pas des paquets fixes : personne n'attend pour rien.
+  assert.match(tableau, /const profil = enAttente\.shift\(\);/);
+  assert.match(tableau, /Promise\.all\(Array\.from\(\{ length: postes \}/);
+  // L'arret coupe la file sans tuer ce qui est en cours.
+  assert.match(tableau, /while \(!arretBrandingRef\.current\)/);
+});
+
+test('a confirmed X login turns the account status to Active', () => {
+  // La colonne Account etait posee a la main. Quand Spectra vient d'authentifier
+  // le compte lui-meme, il le sait : il n'y a aucune raison de le faire dire par
+  // l'utilisateur.
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  // Creation en lot comme reprise de connexion : meme consequence, et nulle
+  // part ailleurs.
+  assert.equal((app.match(/status: 'active'/g) || []).length, 2);
+  assert.match(app, /vaManagerLoginStatus: 'connected',[\s\S]{0,400}status: 'active'/);
+  assert.match(app, /result\.status === 'success' \? \{ status: 'active' as const \} : \{\}/);
+
+  // Un echec ne touche pas au statut : il ne dit pas que le compte est mauvais,
+  // seulement que la connexion n'a pas abouti cette fois.
+  const brancheEchec = app.slice(
+    app.indexOf("vaManagerLoginStatus: 'failed',"),
+    app.indexOf("vaManagerLoginStatus: 'failed',") + 300
+  );
+  assert.doesNotMatch(brancheEchec, /status: '(banned|toLogIn|none)'/);
+});
+
+test('proxy capacity is gathered in parallel and stops when it is enough', () => {
+  // Les proxys etaient testes un par un, tous, avant d'ouvrir la moindre
+  // fenetre : 65 proxys, dix secondes d'attente maximum chacun, pour un besoin
+  // d'une seule place. Creer un compte demandait plusieurs minutes d'immobilite.
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const fonction = app.slice(
+    app.indexOf('const rassemblerPlacesProxy = async'),
+    app.indexOf('const handleImportSessions = async')
+  );
+
+  // Les tests partent par lots : ils sont independants les uns des autres.
+  assert.match(fonction, /await Promise\.all\(lot\.map\(/);
+  assert.match(fonction, /const TAILLE_LOT = \d+;/);
+
+  // On remplit un proxy avant d'en entamer un autre : les plus charges
+  // passent en premier. Sans ce tri, l'ordre venait de la base et le parc se
+  // consommait bien plus vite que necessaire.
+  assert.match(fonction, /const parRemplissage = \[\.\.\.candidats\]\.sort/);
+  assert.match(
+    fonction,
+    /usageByProxy\.get\(proxyIdentityKey\(b\)\) \|\| 0\) -\s*\(usageByProxy\.get\(proxyIdentityKey\(a\)\) \|\| 0\)/
+  );
+  assert.match(fonction, /parRemplissage\.slice\(debut, debut \+ TAILLE_LOT\)/);
+
+  // Le tri ne dispense pas du test : un proxy muet reste ecarte, si rempli
+  // soit-il.
+  assert.match(fonction, /window\.electronAPI\.proxy\.test\(proxy\)/);
+  assert.match(fonction, /if \(!sain\) continue;/);
+  // Et on s'arrete des qu'il y a assez de places.
+  assert.match(fonction, /places\.length >= placesVoulues/);
+  // Une annulation reste possible entre deux lots.
+  assert.match(fonction, /if \(estAnnule\(\) \|\| places\.length >= placesVoulues\) break;/);
+
+  // Les deux chemins de creation passent par cette fonction : aucun ne doit
+  // garder sa propre boucle sequentielle.
+  assert.equal((app.match(/await rassemblerPlacesProxy\(/g) || []).length, 2);
+  assert.doesNotMatch(app, /for \(const proxy of candidates\) \{/);
+  assert.doesNotMatch(app, /for \(const proxy of uniqueCandidates\.values\(\)\) \{/);
+});
+
+test('the accounts-per-proxy limit is written once', () => {
+  // La limite valait 3 a quatre endroits du code et dans un texte affiche.
+  // Florent l'a corrigee le 16 aout 2026 : c'est 4. Une regle recopiee cinq
+  // fois finit par differer d'un endroit a l'autre.
+  const partage = read('desktop-app/src/shared/proxy-identity.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+
+  assert.match(partage, /export const COMPTES_MAX_PAR_PROXY = 4;/);
+  assert.match(app, /COMPTES_MAX_PAR_PROXY/);
+  assert.match(page, /limite de \{COMPTES_MAX_PAR_PROXY\} comptes par proxy/);
+
+  // Plus aucune valeur en dur, ni dans le calcul ni dans les textes.
+  assert.doesNotMatch(app, /usageByProxy\.get\(key\) \|\| 0\) < \d/);
+  assert.doesNotMatch(app, /Math\.max\(0, \d - \(usageByProxy/);
+  assert.doesNotMatch(page, /trois comptes par proxy/);
+});
+
+test('Chrome never offers to save the account password', () => {
+  // Le 16 aout 2026, la fenetre « Save password? » de Chrome s'ouvrait pile au
+  // moment ou X demande le code 2FA. Elle appartient au navigateur, pas a la
+  // page : aucun script ne peut la fermer, et elle prend le focus du clavier.
+  // La session voyage par les cookies, jamais par le gestionnaire : on demande
+  // donc a Chrome de ne plus poser la question.
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const fonction = lanceur.slice(
+    lanceur.indexOf('private static desactiverGestionnaireMotsDePasse'),
+    lanceur.indexOf('private static assertSafeId')
+  );
+
+  assert.match(fonction, /credentials_enable_service = false/);
+  assert.match(fonction, /credentials_enable_autosignin = false/);
+  assert.match(fonction, /password_manager_enabled: false/);
+  assert.match(fonction, /password_manager_leak_detection: false/);
+
+  // Les autres reglages du profil sont conserves.
+  assert.match(fonction, /\.\.\.\(preferences\.profile \|\| \{\}\)/);
+  // Un fichier illisible n'est pas remplace par un profil vide.
+  assert.match(fonction, /catch \{\s*return;\s*\}/);
+
+  // Et la preference est posee avant chaque ouverture, pas seulement a la
+  // creation : un profil deja existant doit en beneficier aussi.
+  assert.match(lanceur, /this\.desactiverGestionnaireMotsDePasse\(profilePath\);/);
+});
+
+test('creating a VA Manager instance asks only where to put it', () => {
+  // Un compte sans instance n'offrait qu'un bouton : lier une instance
+  // existante. Or le but est justement d'en creer une, vite. Et le dossier
+  // n'etait jamais demande : l'instance atterrissait dans celui qui se trouvait
+  // selectionne ailleurs dans l'application.
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+  const app = read('desktop-app/src/renderer/App.tsx');
+
+  // Creer est propose compte par compte, sans passer par une instance existante.
+  assert.match(page, /Créer l’instance/);
+  assert.match(page, /setComptesACreer\(\[account\]\)/);
+
+  // Et la seule question posee est celle du dossier.
+  assert.match(page, /Où ranger/);
+  assert.match(page, /folders\.map\(folder =>/);
+  assert.match(page, /value="__none__">Aucun dossier/);
+
+  // Un compte incomplet n'offre aucune action : la connexion echouerait. Cela
+  // vaut aussi pour une instance deja creee dont la connexion a echoue --
+  // proposer « Reessayer » sans le mot de passe, c'est promettre un echec.
+  assert.match(page, /const ilManque = \(\): EtatCompte => \(\{[\s\S]{0,400}?action: null/);
+  assert.match(page, /if \(informationsManquantes\.length > 0\) return ilManque\(\);/);
+  const apresConnecte = page.slice(page.indexOf("if (profile.vaManagerLoginStatus === 'connected')"));
+  assert.match(
+    apresConnecte.slice(0, 600),
+    /informationsManquantes\.length > 0\) return ilManque\(\)/,
+    'le controle des informations doit passer avant de proposer une reprise'
+  );
+
+  // Une ligne, une phrase, une action : trois colonnes, plus six.
+  assert.match(page, /<span>Où ça en est<\/span>/);
+  // Une case a cocher, puis les trois colonnes.
+  assert.match(page, /grid-cols-\[34px_minmax\(220px,1\.4fr\)_minmax\(240px,1fr\)_190px\]/);
+  assert.doesNotMatch(page, /minmax\(180px,1\.5fr\)_130px_120px/);
+
+  // Le dossier choisi doit vraiment arriver jusqu'a la creation.
+  assert.match(page, /onCreateAndConnect\(aCreer, organizationId, dossierChoisi\)/);
+  assert.match(app, /folderId: folderId === '__none__' \? undefined : \(folderId \|\| undefined\)/);
+  assert.doesNotMatch(
+    app.slice(app.indexOf('const handleCreateVaManagerInstances'), app.indexOf('const handleRetryVaManagerConnection')),
+    /folderId: selectedFolderId/,
+    "le dossier ne doit plus etre pris dans la barre laterale"
+  );
 });
 
 test('session import accepts TXT, JSONL and JSON without exposing secrets', () => {
@@ -682,7 +1689,7 @@ test('session import accepts TXT, JSONL and JSON without exposing secrets', () =
   const app = read('desktop-app/src/renderer/App.tsx');
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const server = read('desktop-app/src/main/url-server.ts');
-  assert.match(app, /3 - \(usageByProxy\.get\(key\) \|\| 0\)/);
+  assert.match(app, /COMPTES_MAX_PAR_PROXY - \(usageByProxy\.get\(proxyIdentityKey\(proxy\)\) \|\| 0\)/);
   assert.match(app, /window\.electronAPI\.proxy\.test\(proxy\)/);
   assert.match(app, /account\.password = ''/);
   assert.doesNotMatch(app, /localStorage\.setItem\([^)]*session/i);
@@ -748,14 +1755,21 @@ test('cookie import targets the file consumed by the runtime importer', () => {
 test('cross-device cookies are restored before Open Post actions and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*targetTweetUrl\s*\?\s*openPostBootstrapUrl/);
+  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*targetTweetUrl\s*\?\s*'about:blank'/);
   assert.match(launcher, /async function ensureCookiesImported\(\)/);
-  assert.match(launcher, /await ensureCookiesImported\(\);\s+const tabId = await openStartUrl\(\)/);
+  // Les cookies restent restaures avant la navigation, mais chaque etape porte
+  // desormais un delai : un blocage silencieux laissait le profil inerte une
+  // minute entiere sans rien inscrire nulle part.
+  assert.match(
+    launcher,
+    /avecDelai\('import-cookies', ensureCookiesImported\(\)[\s\S]{0,200}avecDelai\('ouverture-adresse', openStartUrl\(\)/
+  );
+  assert.match(launcher, /Etape "' \+ nom \+ '" bloquee au-dela de/);
   assert.match(launcher, /Promise\.race\(\[\s*chrome\.cookies\.set\(details\)/);
   assert.match(launcher, /Cookie import timed out/);
   assert.match(launcher, /spectra:open-post-bootstrap-page[\s\S]*bootstrap\(\)/);
   assert.match(launcher, /bootstrap\(\)[\s\S]*startOpenPostActions\(tabId\)/);
-  assert.match(launcher, /const tabId = await openStartUrl\(\)/);
+  assert.match(launcher, /const tabId = await avecDelai\('ouverture-adresse', openStartUrl\(\)/);
   assert.match(launcher, /await reportLaunchStatus\('bootstrap-confirmed'[\s\S]*bootstrapComplete = true/);
   assert.match(launcher, /CloseMainWindow\(\)/);
   assert.match(profileSync, /cloudSyncChecksumRevision:\s*revisionId/);
@@ -965,6 +1979,8 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(launcher, /BOOTSTRAP_ATTEMPTS = 5/);
   assert.match(launcher, /RETRY_DELAYS = \[1000, 2000, 4000, 8000, 12000\]/);
   assert.match(launcher, /WATCHDOG_DEADLINE = Date\.now\(\) \+ \(OPEN_POST_MODE \? 120000 : 60000\)/);
+  // Strict necessaire. 'storage' n'a servi qu'aux journaux de diagnostic du
+  // 13 aout 2026 ; ceux-ci retires le 15 aout, la permission part avec eux.
   assert.match(launcher, /permissions: \['cookies', 'tabs', 'scripting', 'alarms'\]/);
   assert.match(launcher, /chrome\.alarms\.create\('spectra-startup-watchdog'/);
   assert.match(launcher, /Bootstrap attempt/);
@@ -1048,6 +2064,7 @@ test('manual cross-device launch replaces only the temporary blank tab after coo
       onCreated: { addListener() {} },
     },
     alarms: {
+      create() {},
       clear: async () => true,
       onAlarm: { addListener() {} },
     },
@@ -1082,6 +2099,7 @@ test('manual cross-device launch replaces only the temporary blank tab after coo
     hasStagedCookies: true,
   });
   vm.runInNewContext(source, {
+    self: fauxWorker(),
     chrome,
     fetch,
     console,
@@ -1103,6 +2121,378 @@ test('manual cross-device launch replaces only the temporary blank tab after coo
   assert.deepEqual(removedTabIds, []);
   assert.equal(tabs[0].url, 'https://x.com/home');
   assert.equal(tabs[1].url, 'https://example.com/kept-by-user');
+});
+
+test('a rewritten worker replaces the previous one immediately', () => {
+  // Le 15 aout 2026, quatre instances tournaient encore avec le script d'une
+  // session precedente, adressant un port de Spectra ferme depuis. Le
+  // navigateur etait neuf et le fichier sur disque correct : seule la version
+  // en memoire etait perimee. Un service worker reecrit s'installe en effet
+  // mais attend, et l'ancien reessayait son envoi chaque seconde -- il se
+  // maintenait donc en vie et empechait son propre remplacement.
+  const source = getCookieSyncBackgroundSource({
+    profileId: 'profil_relais',
+    profileName: 'Relais',
+    launchId: '',
+    hasStagedCookies: false,
+  });
+
+  assert.match(
+    source,
+    /addEventListener\('install', \(\) => self\.skipWaiting\(\)\)/,
+    'la nouvelle version doit prendre la main sans attendre'
+  );
+  assert.match(
+    source,
+    /addEventListener\('activate'[\s\S]{0,80}clients\.claim\(\)/,
+    'elle doit aussi reprendre les clients de l ancienne'
+  );
+
+  // L'adresse du serveur est propre a chaque demarrage de Spectra : c'est
+  // precisement ce qui rend une version perimee inoffensive en apparence et
+  // muette en pratique.
+  assert.match(source, /const SERVER = 'http:\/\/127\.0\.0\.1:\d+'/);
+});
+
+test('no startup step can hang silently', () => {
+  // Le 15 aout 2026, quatre instances ne faisaient plus aucun RT. Le demarrage
+  // n'echouait pas -- il restait suspendu, sans erreur ni trace, jusqu'a la
+  // fermeture forcee a soixante secondes. Un blocage muet ne laisse rien
+  // derriere lui : chaque etape doit donc porter un delai et son nom, pour se
+  // transformer en echec, qui lui est enregistre.
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  assert.match(launcher, /async function avecDelai\(nom, promesse, millisecondes = \d+\)/);
+  assert.match(launcher, /Etape "' \+ nom \+ '" bloquee au-dela de/);
+  assert.match(launcher, /clearTimeout\(minuteur\)/, 'le minuteur doit etre annule');
+
+  for (const etape of [
+    'lecture-adresse',
+    'liste-onglets',
+    'creation-onglet',
+    'navigation-onglet',
+    'import-cookies',
+    'ouverture-adresse',
+  ]) {
+    assert.match(
+      launcher,
+      new RegExp(`avecDelai\\(\\s*'${etape}'`),
+      `l'etape ${etape} doit porter un delai`
+    );
+  }
+
+  // Le delai le plus long doit rester sous la minute apres laquelle Spectra
+  // ferme l'instance : au-dela, il ne servirait a rien.
+  const delais = [...launcher.matchAll(/avecDelai\(\s*'[a-z-]+',[\s\S]{0,160}?,\s*(\d+)\s*\)/g)]
+    .map(m => Number(m[1]));
+  assert.ok(delais.length >= 5, 'chaque etape doit declarer son delai');
+  assert.ok(
+    Math.max(...delais) <= 40000,
+    'un delai plus long que la fermeture forcee ne protegerait de rien'
+  );
+});
+
+test('startup no longer depends on reading a file', async () => {
+  // Le 15 aout 2026, cinq instances echouaient a chaque tour d'Auto Post sur
+  // "Failed to fetch" en relisant start_url.json -- page chargee, un seul
+  // onglet. Le demarrage n'aboutissait jamais, donc le script qui aime et
+  // republie n'etait jamais injecte. L'adresse est desormais inscrite dans le
+  // script lui-meme ; la lecture du fichier n'est plus qu'un secours.
+  const adresse = 'https://x.com/georgegould53/status/2087621068882161866';
+  const ouverts = [];
+
+  const chrome = {
+    runtime: {
+      getURL: file => `chrome-extension://cookie-sync/${file}`,
+      onStartup: { addListener() {} },
+      onInstalled: { addListener() {} },
+      onSuspend: { addListener() {} },
+    },
+    cookies: { set: async () => {}, getAll: async () => [], onChanged: { addListener() {} } },
+    tabs: {
+      query: async () => [{ id: 1, url: 'about:blank', status: 'complete', active: true }],
+      update: async (tabId, properties) => { ouverts.push(properties.url); return { id: tabId }; },
+      remove: async () => {},
+      onCreated: { addListener() {} },
+    },
+    alarms: { create() {}, clear: async () => true, onAlarm: { addListener() {} } },
+  };
+
+  // Le fichier est injoignable : c'est exactement la panne observee.
+  const fetch = async url => {
+    if (String(url).endsWith('/start_url.json')) throw new Error('Failed to fetch');
+    if (String(url).endsWith('/cookies.json')) {
+      return { ok: true, json: async () => [{ name: 'a', value: '1', domain: '.x.com', path: '/' }] };
+    }
+    if (String(url).endsWith('/api/save-cookies')) return { ok: true };
+    return { ok: true, json: async () => ({}) };
+  };
+
+  const source = getCookieSyncBackgroundSource({
+    profileId: 'profil_demarrage',
+    profileName: 'Demarrage',
+    launchId: '',
+    hasStagedCookies: true,
+  }).replace(
+    '/*SPECTRA_DEMARRAGE*/null',
+    JSON.stringify({ startUrl: adresse, closeOtherTabs: false, likeTargetPost: false, launchId: '' })
+  );
+
+  vm.runInNewContext(source, {
+    self: fauxWorker(),
+    chrome, fetch, console,
+    setTimeout: (callback, delay = 0) => setTimeout(callback, Math.min(delay, 5)),
+    clearTimeout, setInterval: () => 0, clearInterval() {},
+    Promise, JSON, RegExp, String, Error,
+  }, { filename: 'cookie-sync-demarrage-integre.js' });
+
+  await new Promise(resolve => setTimeout(resolve, 30));
+
+  assert.ok(
+    ouverts.includes(adresse),
+    "le demarrage doit aboutir meme si le fichier d'adresse est injoignable"
+  );
+
+  // Et Spectra doit reellement inscrire la valeur : sans cela le repere
+  // resterait tel quel et le secours serait le seul chemin.
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  assert.match(launcher, /const repere = '\/\*SPECTRA_DEMARRAGE\*\/null'/);
+  assert.match(launcher, /script\.replace\(repere, JSON\.stringify\(donneesDemarrage\)\)/);
+  assert.match(launcher, /Repere SPECTRA_DEMARRAGE introuvable/);
+});
+
+test('a stale snapshot never overwrites the live browser session', async () => {
+  // Le 12 aout 2026, une sauvegarde du 10 aout etait reinjectee sur une session
+  // ouverte le jour meme : l'auth_token frais etait remplace par l'ancien et le
+  // compte se retrouvait deconnecte. Quand la base du navigateur est plus
+  // recente que l'instantane, Spectra passe en mode "completer" et ne remet que
+  // les cookies absents.
+  const lancer = async (cookieImportMode) => {
+    const poses = [];
+    const chrome = {
+      runtime: {
+        getURL: file => `chrome-extension://cookie-sync/${file}`,
+        onStartup: { addListener() {} },
+        onInstalled: { addListener() {} },
+        onSuspend: { addListener() {} },
+      },
+      cookies: {
+        set: async cookie => { poses.push(cookie.name); },
+        // Ce que le navigateur possede deja : la session du jour.
+        getAll: async () => [
+          { name: 'auth_token', value: 'session-du-jour', domain: '.x.com', path: '/' },
+          { name: 'ct0', value: 'jeton-du-jour', domain: '.x.com', path: '/' },
+        ],
+        onChanged: { addListener() {} },
+      },
+      tabs: {
+        query: async () => [],
+        update: async () => ({}),
+        remove: async () => {},
+        onCreated: { addListener() {} },
+      },
+      alarms: { create() {}, clear: async () => true, onAlarm: { addListener() {} } },
+    };
+
+    const fetch = async url => {
+      if (String(url).endsWith('/cookies.json')) {
+        return {
+          ok: true,
+          // La sauvegarde perimee : un auth_token deja remplace, et un cookie
+          // que le navigateur n'a plus.
+          json: async () => [
+            { name: 'auth_token', value: 'session-du-10-aout', domain: '.x.com', path: '/' },
+            { name: 'lang', value: 'fr', domain: '.x.com', path: '/' },
+          ],
+        };
+      }
+      if (String(url).endsWith('/start_url.json')) {
+        return { ok: true, json: async () => ({ startUrl: 'https://x.com/home', closeOtherTabs: false }) };
+      }
+      if (String(url).endsWith('/api/save-cookies')) return { ok: true };
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const source = getCookieSyncBackgroundSource({
+      profileId: 'profil_session_vivante',
+      profileName: 'Session vivante',
+      launchId: '',
+      hasStagedCookies: true,
+      cookieImportMode,
+    });
+    vm.runInNewContext(source, {
+      self: fauxWorker(),
+      chrome,
+      fetch,
+      console,
+      setTimeout: (callback, delay = 0) => setTimeout(callback, Math.min(delay, 5)),
+      clearTimeout,
+      setInterval: () => 0,
+      clearInterval() {},
+      Promise,
+      JSON,
+      RegExp,
+      String,
+      Error,
+    }, { filename: `cookie-sync-${cookieImportMode}.js` });
+
+    await new Promise(resolve => setTimeout(resolve, 30));
+    return poses;
+  };
+
+  const completer = await lancer('completer');
+  assert.ok(
+    !completer.includes('auth_token'),
+    'la session vivante doit survivre a une sauvegarde plus ancienne'
+  );
+  assert.ok(completer.includes('lang'), 'les cookies absents doivent quand meme etre restaures');
+
+  // Le garde-fou doit dependre du mode, sinon un profil vraiment vide ne
+  // recupererait jamais sa session.
+  const remplacer = await lancer('remplacer');
+  assert.ok(
+    remplacer.includes('auth_token'),
+    'en mode remplacer, la sauvegarde reste autoritaire'
+  );
+});
+
+test('an incomplete local profile is never uploaded over the cloud copy', () => {
+  // Le 13 aout 2026, trois profils sont devenus impossibles a retelecharger.
+  // Spectra ignorait les fichiers absents a l'envoi mais les exigeait a la
+  // restauration : il fabriquait donc une archive qu'il refusait lui-meme
+  // d'ouvrir, et elle ecrasait la bonne version. Cause immediate : un profil
+  // ouvert quatre secondes par l'Auto Post puis tue avant que Chrome ait ecrit
+  // ses preferences.
+  const sync = read('desktop-app/src/main/profile-sync.ts');
+
+  // Les deux cotes doivent parler du meme fichier, par la meme constante.
+  assert.match(sync, /CHEMIN_REQUIS_DANS_ARCHIVE = 'Default\/Preferences'/);
+  const verificationEnvoi = sync.indexOf('throw new ArchiveLocaleIncomplete');
+  assert.ok(verificationEnvoi > -1, "l'envoi doit refuser un profil incomplet");
+  assert.ok(
+    verificationEnvoi < sync.indexOf('const buffer = zip.toBuffer()'),
+    "le refus doit tomber avant la construction de l'archive"
+  );
+
+  // La restauration, elle, ne doit jamais condamner un profil : refuser une
+  // archive sans preferences empechait de l'ouvrir, donc de la reparer. Elle
+  // exige desormais seulement de quoi retablir la session.
+  assert.ok(
+    !/throw new Error\(`Cloud profile archive is incomplete/.test(sync),
+    "la restauration ne doit plus rejeter une archive sans preferences"
+  );
+  assert.match(sync, /no session data: cookies or Local State missing/);
+  assert.match(sync, /porteUneSession/);
+  assert.match(sync, /CODE_ARCHIVE_INCOMPLETE = 'profile-sync\/incomplete-local'/);
+
+  // Seul le message franchit la frontiere entre les deux processus : le code
+  // doit donc y figurer, sinon l'interface ne peut pas reconnaitre le cas.
+  assert.match(
+    sync,
+    /super\(\s*`\[\$\{CODE_ARCHIVE_INCOMPLETE\}\]/,
+    'le code doit etre inscrit dans le message'
+  );
+
+  // Un envoi refuse ne doit pas laisser le profil verrouille : il serait alors
+  // impossible a ouvrir depuis les autres machines.
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const brancheIncomplet = app.indexOf("errorMessage.includes('profile-sync/incomplete-local')");
+  assert.ok(brancheIncomplet > -1, "l'interface doit reconnaitre ce cas");
+  const suite = app.slice(brancheIncomplet, brancheIncomplet + 700);
+  assert.match(suite, /releaseProfileLock/, 'le verrou doit etre relache');
+  assert.match(suite, /uploadQueue\.shift\(\)/, "l'envoi ne doit pas etre repris en boucle");
+});
+
+test('the local server lets the cookie-sync extension through its own preflight', () => {
+  // Le 12 aout 2026, la verification d'origine n'acceptait que les domaines de
+  // X. L'extension de synchronisation appelle pourtant ce serveur depuis son
+  // service worker, avec une origine chrome-extension:// : ses envois etaient
+  // bloques par le navigateur et plus aucune session n'etait enregistree.
+  const serveur = read('desktop-app/src/main/url-server.ts');
+
+  assert.match(
+    serveur,
+    /chrome-extension:\\\/\\\/\[a-z\]\{32\}/,
+    "l'origine d'une extension doit etre acceptee"
+  );
+  assert.match(
+    serveur,
+    /access-control-request-private-network/,
+    'la demande d acces au reseau prive doit recevoir une reponse'
+  );
+  assert.match(
+    serveur,
+    /Access-Control-Allow-Private-Network/,
+    'la permission reseau prive doit etre accordee explicitement'
+  );
+
+  // L'ordre compte : la requete OPTIONS arrive sans en-tete d'autorisation.
+  // Si le controle du jeton passe en premier, elle repart en 401 et la vraie
+  // requete n'est jamais emise.
+  const indexOptions = serveur.indexOf("req.method === 'OPTIONS'");
+  const indexJeton = serveur.indexOf('req.headers.authorization !==');
+  assert.ok(indexOptions > -1 && indexJeton > -1);
+  assert.ok(
+    indexOptions < indexJeton,
+    'la requete OPTIONS doit etre traitee avant la verification du jeton'
+  );
+});
+
+test('an instance stuck at the forced-close limit gets its service worker store reset', () => {
+  // Mesure du 15 aout 2026 sur le VPS 128 : six instances sur vingt-deux
+  // restaient ouvertes exactement 65 s -- la limite avant fermeture forcee --
+  // sans jamais quitter la page blanche, trente fois de suite. Effacer le
+  // magasin du service worker du profil a repare : sept echecs a 65 s puis 8 s
+  // et un repost au lancement suivant.
+  const lanceur = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  assert.match(
+    lanceur,
+    /viderCacheServiceWorker/,
+    'la remise a neuf doit exister'
+  );
+
+  const fonction = lanceur.slice(
+    lanceur.indexOf('private static reinitialiserServiceWorkerSiBloque'),
+    lanceur.indexOf('private static assertSafeId')
+  );
+
+  // Le nettoyage vise le seul dossier fautif. Les cookies sont ailleurs.
+  assert.match(fonction, /'Default', 'Service Worker'/);
+  assert.doesNotMatch(fonction, /Network|Cookies|Login Data/);
+
+  // On agit sur le symptome, jamais sur la taille : des profils sains portent
+  // 2988 fichiers et 1,3 Go la ou les malades en avaient 1370.
+  assert.doesNotMatch(fonction, /statSync\([^)]*Service Worker/);
+  // Le signal est le silence, pas la duree. Mesure du 17 aout 2026 sur 5820
+  // lancements : un retweet reussi prend 8 s en mediane et jamais plus de
+  // 25 s. Une fenetre qui depasse 30 s sans avoir charge la moindre page n'a
+  // pas demarre son extension.
+  //
+  // L'ancien seuil, 55 a 95 s, laissait passer 311 lancements muets entre 45
+  // et 55 s et ne s'est declenche que 16 fois en 5820 lancements -- alors que
+  // 9 de ces 16 ont retweete dans la foulee. Il reparait, mais presque jamais.
+  // Le critere est le resultat, pas la duree ni le silence : deux tours de
+  // suite sans retweet. Les criteres precedents laissaient passer des
+  // instances qui chargeaient bien leur page sans jamais trouver le tweet --
+  // le 18 aout 2026, 23 instances bloquees et zero reparation declenchee.
+  assert.match(fonction, /deuxDerniers\.some\(\(tour\) => tour\.abouti\)/);
+  assert.doesNotMatch(fonction, /duree >= \d+/);
+  assert.match(fonction, /entree\.event === 'chrome-open-post-verdict'/);
+  assert.match(fonction, /'reposted', 'already-reposted'/);
+
+  // Une fenetre fermee a la main reste ouverte des heures : deux lancements
+  // consecutifs restent exiges, pour ne pas prendre une fermeture manuelle
+  // pour une instance bloquee.
+  assert.match(fonction, /deuxDerniers\.length < 2/);
+
+  // Et seulement pour un tour Open Post, le seul ou la limite s'applique.
+  assert.match(fonction, /hasTargetTweet === true/);
+  assert.match(
+    lanceur,
+    /if \(targetTweetUrl\) \{\s*this\.viderCacheServiceWorker/,
+    'le cache doit etre vide avant chaque ouverture Open Post'
+  );
 });
 
 test('Open Post background bootstrap imports staged cookies before managed X navigation', async () => {
@@ -1190,6 +2580,7 @@ test('Open Post background bootstrap imports staged cookies before managed X nav
     openPostMode: true,
   });
   vm.runInNewContext(source, {
+    self: fauxWorker(),
     chrome,
     fetch,
     console,
@@ -1345,6 +2736,7 @@ test('five generated Open Selected bootstraps recover independently and retain o
         error: (...args) => logs.push(args.join(' ')),
       },
       Date: FastDate,
+      self: fauxWorker(),
       setTimeout: (callback, delay = 0) => setTimeout(callback, Math.min(5, delay / 1000)),
       clearTimeout,
       setInterval: () => 0,
@@ -1376,13 +2768,21 @@ test('five generated Open Selected bootstraps recover independently and retain o
 
 test('managed Chrome and the advertised user-agent stay version-aligned', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
-  assert.match(launcher, /const MANAGED_CHROME_VERSION = '151\.0\.7922\.47'/);
+  // Doit suivre le canal stable de Chrome for Testing : la 151.0.7922.47
+  // envoyait 18 extensions TLS la ou le Chrome stable en envoie 16.
+  assert.match(launcher, /const MANAGED_CHROME_VERSION = '151\.0\.7922\.77'/);
   assert.match(launcher, /cachedVersion === MANAGED_CHROME_VERSION/);
   assert.match(launcher, /alignUserAgentToBrowser/);
-  assert.match(launcher, /Correcting Chrome User-Agent mismatch/);
+
+  // Chrome gele les trois derniers composants de sa version dans l'User-Agent
+  // depuis 2023 : tous annoncent Chrome/<majeure>.0.0.0. S'aligner sur la
+  // version complete du binaire produisait une chaine qu'aucun Chrome n'envoie.
+  assert.match(launcher, /User-Agent reduit comme le fait Chrome/);
+  assert.match(launcher, /const reducedVersion = `\$\{String\(browserVersion\)\.split\('\.'\)\[0\]\}\.0\.0\.0`/);
+
   assert.match(launcher, /normalizedPath\.startsWith\(`\$\{managedBrowserRoot\}\$\{path\.sep\}`\)/);
   assert.match(launcher, /browserVersions\.get\(normalizedPath\)/);
-  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform, architecture, brands \}/);
+  assert.match(launcher, /const fp = \{\s*\.\.\.effectiveFingerprint,\s*userAgent,\s*platform,\s*architecture,\s*brands,/);
 });
 
 test('client hints follow the profile fingerprint instead of the host OS', () => {
@@ -1400,7 +2800,11 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
   // Navigation requests carry the login, so main_frame must be covered.
   assert.match(launcher, /resourceTypes: \[\s*'main_frame'/);
 
-  // High-entropy hints are dropped rather than forged, so the host OS never leaks.
+  // Ces en-tetes etaient supprimes pour que l'OS de la machine ne fuite jamais.
+  // Mesure du 11 aout 2026 : un Chrome qui refuse de repondre a une demande de
+  // client hints est plus rare, donc plus remarquable, qu'un Chrome qui repond
+  // banalement. La suppression devenait elle-meme le signal. Les valeurs sont
+  // desormais derivees de l'empreinte du profil, jamais de l'hote.
   for (const header of [
     'sec-ch-ua-platform-version',
     'sec-ch-ua-arch',
@@ -1408,7 +2812,7 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
     'sec-ch-ua-model',
     'sec-ch-ua-full-version-list',
   ]) {
-    assert.match(launcher, new RegExp(`header: '${header}', operation: 'remove'`));
+    assert.doesNotMatch(launcher, new RegExp(`header: '${header}', operation: 'remove'`));
   }
 
   // Accept-Language follows the fingerprint too: --lang is ignored on macOS, so a US
@@ -1419,16 +2823,28 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
   assert.match(launcher, /header: 'sec-ch-ua',\s*operation: 'set'/);
   assert.match(launcher, /brand: 'Google Chrome'/);
 
-  // The JS surface must agree with the headers.
-  assert.match(launcher, /uaDataProto\.getHighEntropyValues = function\(hints\)/);
-  assert.match(launcher, /const hintPlatform =/);
-  assert.match(launcher, /architecture: fp\.architecture \|\| 'x86'/);
+  // Le pendant JavaScript de ces en-tetes -- la reecriture de
+  // navigator.userAgentData -- a ete retire le 15 aout 2026 avec les autres
+  // substitutions d'identite : le navigateur compile pour Spectra annonce deja
+  // les bonnes valeurs, et cette couche etait mesuree comme la cause du refus
+  // de connexion de X. Les en-tetes, eux, restent poses ci-dessus.
+  assert.doesNotMatch(launcher, /uaDataProto\.getHighEntropyValues = function\(hints\)/);
+  assert.doesNotMatch(launcher, /define\(Navigator\.prototype, 'platform'/);
+  // Les hints de haute entropie partent donc tels que Chrome les produit.
+  // C'est coherent tant que l'hote et le profil annoncent le meme OS ; sur un
+  // hote different il faudrait les FIXER dans les regles d'en-tetes, jamais les
+  // retirer. La detection arm/x86 reste calculee et prete pour ce jour-la.
+  assert.match(launcher, /effectiveFingerprint\.architecture/);
   assert.match(launcher, /Apple M\\d\/i\.test\(effectiveFingerprint\.webglRenderer/);
 
   // TZ is ignored by Chromium on Windows. Date and Intl are therefore virtualized in
   // the shared runtime so the same profile keeps its IANA timezone on every device.
   assert.match(launcher, /const DateTimeFormatProxy = new Proxy\(NativeDateTimeFormat/);
-  assert.match(launcher, /Object\.defineProperty\(Date\.prototype, 'getTimezoneOffset'/);
+  // getTimezoneOffset etait seul reecrit : getHours et toString rendaient
+  // l'heure reelle de la machine, six heures d'ecart sur la meme page. Toutes
+  // les composantes derivent desormais du meme decalage, via poser().
+  assert.match(launcher, /poser\('getTimezoneOffset', function\(\)/);
+  assert.match(launcher, /poser\('toString', function\(\)/);
   assert.match(launcher, /timeZone: targetTimezone/);
   assert.match(launcher, /effectiveFingerprint\.timezone = proxy\.timezone/);
   assert.match(launcher, /Based on IP:/);
@@ -1441,12 +2857,15 @@ test('client hints follow the profile fingerprint instead of the host OS', () =>
   assert.match(launcher, /latitude: geo\.latitude/);
   assert.match(launcher, /longitude: geo\.longitude/);
 
-  // Geolocation keeps the native permission gate and only replaces coordinates after
-  // Chrome grants access, so sites never receive the host machine's real location.
-  assert.match(launcher, /nativeGetCurrentPosition\.call/);
-  assert.match(launcher, /nativeWatchPosition\.call/);
-  assert.match(launcher, /property === 'latitude'/);
-  assert.match(launcher, /property === 'longitude'/);
+  // La substitution des coordonnees a ete retiree le 15 aout 2026 avec le bloc
+  // d'identite dont elle faisait partie. Elle ne jouait que si un site demandait
+  // la geolocalisation ET que l'utilisateur l'accordait -- Chrome la refuse par
+  // defaut. La position du proxy reste calculee et rangee dans l'empreinte,
+  // d'ou viennent le fuseau et la langue ; seule la reecriture de
+  // navigator.geolocation est partie.
+  assert.doesNotMatch(launcher, /nativeGetCurrentPosition\.call/);
+  assert.doesNotMatch(launcher, /nativeWatchPosition\.call/);
+  assert.match(launcher, /proxyGeo: \{[\s\S]*latitude: geo\.latitude/);
 
   // The rules ship in the shared per-profile extension, so every launch mode and every
   // tab is covered without per-target wiring.
@@ -1488,14 +2907,17 @@ test('profile-specific fingerprint repairs persist without changing other profil
 
   assert.match(launcher, /const fingerprintOverridePath = path\.join\(profilePath, 'fingerprint_override\.json'\)/);
   assert.match(launcher, /effectiveFingerprint = \{ \.\.\.effectiveFingerprint, \.\.\.override \}/);
-  assert.match(launcher, /const fp = \{ \.\.\.effectiveFingerprint, userAgent, platform, architecture, brands \}/);
+  assert.match(launcher, /const fp = \{\s*\.\.\.effectiveFingerprint,\s*userAgent,\s*platform,\s*architecture,\s*brands,/);
   assert.match(launcher, /'fingerprint_override\.json'/);
   assert.match(sync, /'fingerprint_override\.json'/);
 });
 
 test('cloud profile restore validates in staging and rolls back failed swaps', () => {
   const sync = read('desktop-app/src/main/profile-sync.ts');
-  assert.match(sync, /Cloud profile archive is incomplete/);
+  // La validation porte sur ce qui rend le profil utilisable -- sa session --
+  // et non plus sur les preferences, dont l'absence condamnait le profil sans
+  // possibilite de reparation.
+  assert.match(sync, /Cloud profile archive is unusable/);
   assert.match(sync, /\.restore-\$\{transactionId\}/);
   assert.match(sync, /\.backup-\$\{transactionId\}/);
   assert.match(sync, /for \(const relativePath of installedPaths\.reverse\(\)\)/);
@@ -1659,4 +3081,229 @@ test('profile lifecycle telemetry records exits without changing OpenPost or Ven
     launcher,
     /if \(!OPEN_POST_MODE\) \{\s*throw new Error\('Profile close is only available in OpenPost mode'\)/
   );
+});
+
+test('Auto Post accepts only authenticated exact X post events', () => {
+  const urlServer = read('desktop-app/src/main/url-server.ts');
+  const main = read('desktop-app/src/main/main.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+
+  assert.match(urlServer, /req\.url === '\/api\/auto-post-event'/);
+  assert.match(urlServer, /const postUrl = normalizeTweetUrl\(data\?\.postUrl\)/);
+  assert.match(urlServer, /req\.headers\.authorization !== `Bearer \$\{this\.token\}`/);
+  assert.match(urlServer, /createHash\('sha256'\)[\s\S]*postUrl\}\|\$\{sourceProfileId/);
+  assert.match(main, /ipcMain\.on\('internal:auto-post-event'/);
+  assert.match(preload, /ipcRenderer\.on\('autoPost:event'/);
+});
+
+test('Auto Post observes VenusBot asynchronously and reuses the existing Open Post engine', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const app = read('desktop-app/src/renderer/App.tsx');
+  const dashboard = read('desktop-app/src/renderer/pages/Dashboard.tsx');
+  const main = read('desktop-app/src/main/main.ts');
+  const preload = read('desktop-app/src/main/preload.ts');
+
+  assert.match(launcher, /spectra-auto-post-bridge\.js/);
+  assert.match(launcher, /const result = await original\(text, media, \.\.\.args\);/);
+  assert.match(launcher, /report\(this, text\)\.catch/);
+  assert.match(launcher, /if \(result\?\.success\)/);
+  assert.match(launcher, /resolvePostUrl\(text, account\)/);
+  assert.match(launcher, /api\/client\/post-published/);
+  assert.match(launcher, /relayOnly: true/);
+  assert.match(launcher, /The cloud relay is authoritative/);
+  assert.match(launcher, /catch \(relayError\)[\s\S]*fetch\(SERVER \+ '\/api\/auto-post-event'/);
+  assert.match(launcher, /fetch\(SERVER \+ '\/api\/auto-post-event'/);
+  assert.match(main, /ipcMain\.handle\('autoPost:claimNext'/);
+  assert.match(main, /ipcMain\.handle\('autoPost:complete'/);
+  assert.match(preload, /claimNext: \(payload/);
+  assert.match(preload, /complete: \(payload/);
+  assert.match(app, /window\.electronAPI\.autoPost!\.claimNext/);
+  assert.match(app, /window\.electronAPI\.autoPost\.complete/);
+  assert.match(app, /claimToken/);
+  assert.match(app, /seenAutoPostUrlsRef/);
+  assert.match(app, /handleOpenTweetInFolder\(profileIds, event\.postUrl\)/);
+  assert.match(dashboard, /Auto Post — en écoute/);
+  assert.match(dashboard, /Auto Post — traitement/);
+  assert.match(dashboard, /Open post \(\{selectedFolderProfileIds\.length\}\)/);
+});
+
+test('no diagnostic scaffolding ships in a released build', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  // Quatre outils poses les 12 et 13 aout 2026 pour trouver pourquoi X refusait
+  // la connexion, puis pourquoi quatre profils ne republiaient pas. Les deux
+  // questions ont leur reponse, inscrite dans le code. Retires le 15 aout.
+
+  // 1-3. Les journaux de secours. Ils ecrivaient a chaque etape, dans chaque
+  // profil, et rien ne les relisait en usage normal.
+  assert.doesNotMatch(launcher, /spectraJournalOpenPost/);
+  assert.doesNotMatch(launcher, /spectraJournalDemarrage/);
+  assert.doesNotMatch(launcher, /spectraJournalInjection/);
+  assert.doesNotMatch(launcher, /noterSurDisque/);
+
+  // 4. L'interrupteur cache : le fichier temoin `spectra-sans-entetes.flag`,
+  // depose dans le dossier personnel et relu a chaque lancement. Selon son
+  // contenu -- entetes, sansbot, sansjs, nu, moitiea, moitieb, fuseauseul,
+  // sansfuseau -- il eteignait l'empreinte, les en-tetes ou les extensions
+  // d'un profil, en silence. Inacceptable dans une version livree.
+  assert.doesNotMatch(launcher, /modeDiagnostic/);
+  assert.doesNotMatch(launcher, /sans-entetes\.flag/);
+  assert.doesNotMatch(launcher, /partieEmpreinte/);
+  assert.doesNotMatch(launcher, /sansReecritureEntetes|sansJavaScriptInjecte/);
+  assert.doesNotMatch(launcher, /\[Diagnostic\]/);
+
+  // Ce que la suppression ne doit pas emporter : l'empreinte et les en-tetes
+  // sont desormais poses sans condition.
+  assert.match(launcher, /permissions: \['declarativeNetRequest'\]/);
+  assert.match(launcher, /js: \['fingerprint\.js'\]/);
+  assert.match(launcher, /path: 'client-hints-rules\.json'/);
+
+  // Les evenements de cycle de vie, eux, restent : ils partent vers Spectra,
+  // qui les conserve. Ce sont eux qui remplacent les journaux retires.
+  assert.match(launcher, /reportLifecycleEvent\('startup-chain-broken'/);
+  assert.match(launcher, /reportLifecycleEvent\('open-post-actions-injection-failed'/);
+});
+
+test("le droit d'envoi au cloud se juge sur la session portable, pas sur la base de Chrome", () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+
+  // Piege verifie le 18 aout 2026, et deja tombe dedans une fois : sur un
+  // profil pilote par Open Post, Chrome est tue une seconde apres le retweet.
+  // Sa base de cookies reste donc vide sur le disque alors que le compte est
+  // parfaitement connecte -- Kirby_Maree et honeymadydy ont retweete et like
+  // ce jour-la avec une base vide. Conditionner l'envoi a cette base bloquerait
+  // des comptes sains et les empecherait de se synchroniser a jamais.
+  const corps = (launcher.split('private static ensureAuthenticatedXSnapshot')[1] || '').slice(0, 1200);
+  assert.ok(corps.includes("path.join(profilePath, 'authenticated_cookies.json')"));
+  assert.doesNotMatch(corps, /Default', 'Network', 'Cookies'/);
+
+  // Les deux fermetures -- sortie de Chrome et fermeture forcee -- passent par
+  // cette meme fonction : c'est le seul point ou le droit d'envoi se decide.
+  assert.equal(launcher.split('this.ensureAuthenticatedXSnapshot(').length - 1, 4);
+  assert.match(launcher, /missing-authenticated-x-snapshot/);
+});
+
+test('le navigateur Spectra est trouve sur macOS comme sur Windows', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const corps = (launcher.split('private static findSpectraBrowser')[1] || '').slice(0, 1600);
+
+  // Sur macOS, une compilation de Chromium produit un paquet `.app` : chercher
+  // un fichier `chrome` a la racine ne trouve jamais rien, et le Mac retombe
+  // silencieusement sur Chrome for Testing -- le binaire que X refuse, et la
+  // cause n°1 des connexions bloquees du 12 aout 2026.
+  assert.ok(corps.includes("'Chromium.app', 'Contents', 'MacOS', 'Chromium'"));
+  assert.ok(corps.includes("'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'"));
+
+  // Windows ne doit pas changer de comportement : un seul candidat, chrome.exe.
+  assert.ok(corps.includes("? ['chrome.exe']"));
+
+  // Le fichier nu reste accepte en dernier recours, pour Linux et pour un
+  // paquet deja deballe a la main.
+  assert.ok(corps.includes("'chrome',"));
+
+  // Tous les chemins de profils hors Windows pointent au meme endroit : trois
+  // fichiers en donnent leur propre copie, elles doivent rester d'accord.
+  for (const f of [
+    'desktop-app/src/main/main.ts',
+    'desktop-app/src/main/profile-sync.ts',
+    'desktop-app/src/main/puppeteer-launcher.ts',
+  ]) {
+    assert.ok(read(f).includes("'.antidetect-browser', 'profiles'"), f);
+  }
+});
+
+test('VA Manager fonctionne meme sans coffre systeme, sans jamais ecrire en clair', () => {
+  const client = read('desktop-app/src/main/va-manager-client.ts');
+
+  // Le 18 aout 2026, sur le premier Mac a faire tourner Spectra, le trousseau
+  // refusait l'application : safeStorage.isEncryptionAvailable() rendait faux et
+  // la connexion VA Manager echouait sur « Le chiffrement securise Windows est
+  // indisponible » -- un message qui parlait de Windows sur un Mac, en plus.
+  assert.ok(client.includes('let sessionEnMemoire: StoredSession | null = null;'));
+
+  // Le repli garde la session en memoire pour la duree de l'application, et ne
+  // leve plus d'exception : c'est le refus pur et simple qui bloquait le Mac.
+  const sauve = (client.split('function saveEncryptedSession')[1] || '').slice(0, 700);
+  assert.ok(sauve.includes('sessionEnMemoire = session;'));
+  assert.doesNotMatch(sauve, /throw new Error/);
+
+  // ...et n'ecrit RIEN sur le disque dans ce cas : ces jetons ouvrent VA
+  // Manager, qui detient les mots de passe et les cles 2FA de tous les comptes.
+  const avantEcriture = sauve.split('store.set(')[0];
+  assert.ok(avantEcriture.includes('return;'));
+  assert.ok(sauve.includes('safeStorage.encryptString'));
+
+  // La deconnexion doit vider les deux endroits, pas seulement le disque.
+  const deco = (client.split('export function disconnectVaManager')[1] || '').slice(0, 200);
+  assert.ok(deco.includes('sessionEnMemoire = null;'));
+  assert.ok(deco.includes('store.delete('));
+
+  // Et l'utilisateur doit savoir que sa session ne survivra pas au redemarrage.
+  assert.ok(client.includes('memorisee: coffreSystemeDisponible()'));
+  assert.match(
+    read('desktop-app/src/renderer/pages/VaManagerPage.tsx'),
+    /connection\.memorisee === false/
+  );
+});
+
+test('la page VA Manager montre et filtre par assistant', () => {
+  const client = read('desktop-app/src/main/va-manager-client.ts');
+  const page = read('desktop-app/src/renderer/pages/VaManagerPage.tsx');
+
+  // VA Manager sait qui tient quel compte ; Spectra ne demandait pas ces deux
+  // colonnes, donc creer les instances d'un seul assistant obligeait a les
+  // cocher une par une.
+  assert.ok(client.includes('va_id,assigned_va_id'));
+  assert.ok(client.includes("table: 'vas'"));
+  assert.ok(client.includes("columns: 'id,name,organization_id'"));
+
+  // Meme regle de priorite que VA Manager lui-meme
+  // (api/scan-shadowban.js : `acc.assigned_va_id || acc.va_id`). L'inverser
+  // afficherait le mauvais assistant sur les comptes partages.
+  assert.ok(client.includes('account.assigned_va_id || account.va_id || null'));
+
+  // La liste des assistants du menu vient des comptes eux-memes : elle ne
+  // propose donc que des VA qui ont vraiment des comptes ici.
+  assert.ok(page.includes('const listeVa = useMemo('));
+  assert.ok(page.includes("if (filtreVa === 'sans-va') return !account.vaId;"));
+
+  // Le filtre doit etre dans les dependances du calcul, sinon la liste ne se
+  // rafraichit pas quand on change d'assistant.
+  assert.match(page, /\[accounts, auditFilter, etatParCompte, filtreVa, search, sort, statusFilter\]/);
+
+  // Et le nom s'affiche sur la ligne du compte.
+  assert.ok(page.includes('{account.vaName}'));
+});
+
+test('le verrou d\'instance de Chrome est retire meme quand le lien est casse', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const corps = (launcher.split('private static clearStaleSingletonFiles')[1] || '').slice(0, 1400);
+
+  // Sur macOS et Linux, SingletonLock est un lien symbolique vers
+  // `machine-numero`. Le bot ferme de force a chaque tour, donc la cible
+  // disparait et le lien reste. `existsSync` suit le lien et repond "absent" :
+  // le verrou n'etait jamais retire et Chrome refusait de rouvrir le profil.
+  assert.ok(corps.includes('fs.lstatSync(target)'));
+  assert.doesNotMatch(corps, /fs\.existsSync\(target\)/);
+  assert.ok(corps.includes("'SingletonLock', 'SingletonCookie', 'SingletonSocket'"));
+});
+
+test('les profils encore ouverts sont vus hors Windows aussi', () => {
+  const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
+  const corps = (launcher.split('static async getRunningProfiles')[1] || '').slice(0, 2000);
+
+  // Sur Windows, Spectra lit la table des processus : cela rattrape les profils
+  // restes ouverts apres un redemarrage de l'application. Hors Windows il s'en
+  // tenait a sa memoire interne, donc il les croyait fermes -- et un second
+  // navigateur serait parti sur le meme dossier de profil.
+  assert.ok(corps.includes('this.lireTableProcessus()'));
+  assert.ok(corps.includes("'.antidetect-browser', 'profiles'"));
+
+  // La table doit etre lue une seule fois pour toute la liste, pas une fois par
+  // instance : quarante-sept appels systeme a chaque rafraichissement.
+  assert.equal(corps.split('lireTableProcessus').length - 1, 1);
+
+  // Et Windows garde exactement son chemin d'avant.
+  assert.ok(corps.includes("process.platform !== 'win32'"));
+  assert.ok(corps.includes("Name = 'chrome.exe'"));
 });

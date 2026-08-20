@@ -1,6 +1,7 @@
 import * as http from 'http';
 import * as crypto from 'crypto';
 import { ipcMain } from 'electron';
+import { normalizeTweetUrl } from '../shared/twitter-url';
 
 export class UrlTrackingServer {
   private server: http.Server | null = null;
@@ -33,6 +34,62 @@ export class UrlTrackingServer {
     return new Promise((resolve, reject) => {
       this.server = http.createServer((req, res) => {
         const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+
+        // Le robot appelle ce serveur depuis une page x.com. Un navigateur
+        // n'autorise cet appel que si le serveur le declare, et il envoie
+        // d'abord une requete OPTIONS pour demander la permission -- sans
+        // en-tete d'autorisation, puisqu'il ne connait pas encore la reponse.
+        //
+        // Sans ca, le message se perd : mesure du 12 aout 2026, un post partait
+        // bien mais Spectra n'en etait jamais informe.
+        //   POST http://127.0.0.1:15200/api/auto-post-event
+        //   blocked by CORS policy: No 'Access-Control-Allow-Origin' header
+        //
+        // L'extension de synchronisation des cookies appelle elle aussi ce
+        // serveur, depuis son service worker, donc avec une origine
+        // chrome-extension://. Elle etait refusee, et la sauvegarde des
+        // sessions ne partait plus : mesure du 12 aout 2026, toutes les
+        // sauvegardes reussies dataient d'avant la mise en service de cette
+        // verification. Le serveur repondait pourtant 200 a une requete sans
+        // en-tete Origin -- c'est bien le navigateur qui bloquait.
+        //
+        // Une adresse locale ajoute une seconde barriere : le navigateur
+        // demande la permission d'atteindre le reseau prive, par un en-tete
+        // dedie dans la requete OPTIONS. Sans reponse a cette demande, l'appel
+        // est bloque avant d'etre emis.
+        //
+        // Autoriser ces origines ne donne aucun acces : chaque point d'entree
+        // reste protege par le jeton, verifie plus bas.
+        const originesAutorisees = [
+          'https://x.com', 'https://www.x.com',
+          'https://twitter.com', 'https://www.twitter.com',
+        ];
+        const origine = String(req.headers.origin || '');
+        const origineAutorisee =
+          originesAutorisees.includes(origine) ||
+          /^chrome-extension:\/\/[a-z]{32}$/.test(origine);
+        if (origineAutorisee) {
+          res.setHeader('Access-Control-Allow-Origin', origine);
+          res.setHeader('Vary', 'Origin');
+        }
+        if (req.method === 'OPTIONS') {
+          if (origineAutorisee) {
+            const entetes: Record<string, string> = {
+              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+              'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+              'Access-Control-Max-Age': '600',
+            };
+            if (req.headers['access-control-request-private-network'] === 'true') {
+              entetes['Access-Control-Allow-Private-Network'] = 'true';
+            }
+            res.writeHead(204, entetes);
+          } else {
+            res.writeHead(403);
+          }
+          res.end();
+          return;
+        }
+
         if (
           req.method === 'GET' &&
           requestUrl.pathname === '/api/close-profile' &&
@@ -73,7 +130,15 @@ export class UrlTrackingServer {
             res.end(JSON.stringify({ error: 'Session import attempt not found' }));
             return;
           }
-          this.sessionImportCredentials.delete(attemptId);
+          // On ne consomme pas a la premiere lecture. Le service worker d'une
+          // extension peut etre arrete par Chrome a tout moment ; en repartant
+          // il redemande les identifiants, et une lecture unique lui repondait
+          // alors « attempt not found ». La fenetre reste ouverte sur la page
+          // de connexion sans que rien ne soit saisi.
+          //
+          // La protection tient toujours : le jeton est exige, l'identifiant de
+          // tentative est un UUID, l'entree expire au bout de cinq minutes et
+          // main.ts l'efface des que la tentative se termine.
           res.writeHead(200, {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-store',
@@ -93,8 +158,13 @@ export class UrlTrackingServer {
             req.url === '/api/save-cookies' ||
             req.url === '/api/launch-status' ||
             req.url === '/api/lifecycle-event' ||
+            req.url === '/api/auto-post-event' ||
             req.url === '/api/close-profile' ||
-            req.url === '/api/session-import-status'
+            req.url === '/api/session-import-status' ||
+            req.url === '/api/bot-template' ||
+            req.url === '/api/bot-template-applied' ||
+            req.url === '/api/branding-status' ||
+            req.url === '/api/mass-post-status'
           )
         ) {
           let body = '';
@@ -115,6 +185,55 @@ export class UrlTrackingServer {
             if (res.writableEnded) return;
             try {
               const data = JSON.parse(body);
+
+              // Les reglages du robot ne sont lisibles que depuis l'extension
+              // du robot : c'est elle qui les publie ici, et Spectra les range.
+              if (req.url === '/api/bot-template') {
+                const { dossierId, profileId, reglages } = data;
+                if (dossierId && profileId && reglages && typeof reglages === 'object') {
+                  ipcMain.emit('internal:bot-template', null, dossierId, profileId, reglages);
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end();
+                }
+                return;
+              }
+
+              // Le branding et la publication rendent compte de la meme
+              // maniere -- une action automatique sur un profil qui dit ou elle
+              // en est -- et empruntent donc le meme canal vers l'interface.
+              if (req.url === '/api/branding-status' || req.url === '/api/mass-post-status') {
+                const { attemptId, profileId, status, message } = data;
+                if (attemptId && profileId) {
+                  ipcMain.emit('internal:branding-status', null, {
+                    attemptId: String(attemptId),
+                    profileId: String(profileId),
+                    status: String(status || ''),
+                    message: String(message || ''),
+                  });
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end();
+                }
+                return;
+              }
+
+              if (req.url === '/api/bot-template-applied') {
+                const { profileId, empreinte } = data;
+                if (profileId) {
+                  ipcMain.emit('internal:bot-template-applied', null, profileId, String(empreinte || ''));
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400);
+                  res.end();
+                }
+                return;
+              }
 
               if (req.url === '/api/save-url') {
                 const { profileId, url } = data;
@@ -190,6 +309,35 @@ export class UrlTrackingServer {
                 } else {
                   res.writeHead(400);
                   res.end(JSON.stringify({ error: 'Invalid lifecycle event' }));
+                }
+              } else if (req.url === '/api/auto-post-event') {
+                const postUrl = normalizeTweetUrl(data?.postUrl);
+                const sourceProfileId = String(data?.sourceProfileId || '');
+                const account = String(data?.account || '').replace(/^@+/, '').slice(0, 64);
+                if (
+                  postUrl &&
+                  /^[A-Za-z0-9_-]{1,160}$/.test(sourceProfileId) &&
+                  (!account || /^[A-Za-z0-9_]{1,64}$/.test(account))
+                ) {
+                  ipcMain.emit('internal:auto-post-event', null, {
+                    id: crypto
+                      .createHash('sha256')
+                      .update(`${postUrl}|${sourceProfileId}`)
+                      .digest('hex')
+                      .slice(0, 32),
+                    postUrl,
+                    sourceProfileId,
+                    account,
+                    receivedAt: Date.now(),
+                  });
+                  res.writeHead(202, {
+                    'Content-Type': 'application/json',
+                    'Cache-Control': 'no-store',
+                  });
+                  res.end(JSON.stringify({ success: true }));
+                } else {
+                  res.writeHead(400, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: 'Invalid Auto Post event' }));
                 }
               } else if (req.url === '/api/close-profile') {
                 const { profileId } = data;

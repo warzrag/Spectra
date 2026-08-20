@@ -1,5 +1,5 @@
-export function normalizeTweetUrl(value: string): string | null {
-  const rawValue = value.trim();
+export function normalizeTweetUrl(value: string | null | undefined): string | null {
+  const rawValue = typeof value === 'string' ? value.trim() : '';
   if (!rawValue) return null;
 
   try {

@@ -20,14 +20,17 @@ import {
   VaManagerOrganization,
 } from '../../types';
 import { findLinkedProfile } from '../../shared/va-manager';
+import { COMPTES_MAX_PAR_PROXY } from '../../shared/proxy-identity';
 import { SessionImportProgress } from '../../shared/session-import';
 
 interface VaManagerPageProps {
   profiles: Profile[];
+  folders: { id: string; name: string }[];
   onUpdateProfile: (profileId: string, data: Partial<Profile>) => Promise<void>;
   onCreateAndConnect: (
     accounts: VaManagerAccount[],
-    organizationId: string
+    organizationId: string,
+    folderId?: string | null
   ) => Promise<{ successful: number; failed: number; manual: boolean; message: string }>;
   onRetryConnection: (
     account: VaManagerAccount,
@@ -38,7 +41,7 @@ interface VaManagerPageProps {
   onStopImport: () => Promise<void>;
 }
 
-type AuditFilter = 'all' | 'existing' | 'to-create' | 'missing' | 'ready';
+type AuditFilter = 'all' | CategorieCompte;
 type AccountSort = 'followers-desc' | 'followers-asc' | 'username';
 
 function formatFollowers(value: number | null): string {
@@ -69,6 +72,84 @@ function getMissingInformation(account: VaManagerAccount): string[] {
   return missing;
 }
 
+// Quatre cas, et un compte tombe dans un seul. Les compteurs du haut et les
+// lignes du tableau lisent ce meme calcul : ils ne peuvent plus se contredire.
+type CategorieCompte = 'a-creer' | 'a-completer' | 'a-finir' | 'en-place';
+
+type EtatCompte = {
+  phrase: string;
+  ton: 'pret' | 'fait' | 'attente' | 'bloque';
+  action: null | 'creer' | 'reprendre' | 'reessayer' | 'confirmer' | 'lier';
+  categorie: CategorieCompte;
+  detail?: string;
+};
+
+/**
+ * Une ligne, une phrase, une action. La page affichait six colonnes par compte
+ * -- statut, abonnes, instance, proxy, connexion, dernier scan -- et l'action
+ * utile en tout petit au milieu. On repond desormais a une seule question :
+ * ou en est ce compte, et qu'est-ce que je fais.
+ */
+function etatDuCompte(
+  account: VaManagerAccount,
+  profile: Profile | undefined,
+  informationsManquantes: string[]
+): EtatCompte {
+  const ilManque = (): EtatCompte => ({
+    phrase:
+      informationsManquantes.length > 1
+        ? `Il manque ${informationsManquantes.length} informations`
+        : `Il manque ${informationsManquantes[0].toLowerCase()}`,
+    ton: 'bloque',
+    action: null,
+    categorie: 'a-completer',
+    detail: informationsManquantes.join(', '),
+  });
+
+  if (!profile) {
+    if (informationsManquantes.length > 0) return ilManque();
+    return { phrase: 'Prêt', ton: 'pret', action: 'creer', categorie: 'a-creer' };
+  }
+
+  // Une instance a ete trouvee par le nom, mais personne n'a confirme que
+  // c'est bien celle de ce compte.
+  if (profile.vaManagerAccountId !== account.id) {
+    return {
+      phrase: 'Une instance semble correspondre',
+      ton: 'attente',
+      action: 'confirmer',
+      categorie: 'a-finir',
+      detail: profile.name,
+    };
+  }
+
+  if (profile.vaManagerLoginStatus === 'connected') {
+    return { phrase: 'En place et connecté', ton: 'fait', action: null, categorie: 'en-place', detail: profile.name };
+  }
+
+  // Proposer de reessayer sans les informations necessaires, c'est promettre
+  // un echec. On dit ce qui manque, et on n'affiche aucun bouton.
+  if (informationsManquantes.length > 0) return ilManque();
+
+  switch (profile.vaManagerLoginStatus) {
+    case 'manual':
+      return { phrase: 'Connexion à finir à la main', ton: 'attente', action: 'reprendre', categorie: 'a-finir', detail: profile.name };
+    case 'failed':
+      return { phrase: 'La connexion a échoué', ton: 'bloque', action: 'reessayer', categorie: 'a-finir', detail: profile.name };
+    case 'pending':
+      return { phrase: 'Connexion en cours', ton: 'attente', action: null, categorie: 'a-finir', detail: profile.name };
+    default:
+      return { phrase: 'Instance en place', ton: 'fait', action: null, categorie: 'en-place', detail: profile.name };
+  }
+}
+
+const tonCouleur: Record<EtatCompte['ton'], string> = {
+  pret: 'var(--accent-light)',
+  fait: 'var(--success)',
+  attente: 'var(--warning)',
+  bloque: 'var(--danger)',
+};
+
 const statusStyle: Record<string, { label: string; color: string; background: string }> = {
   active: { label: 'Actif', color: 'var(--success)', background: 'var(--success-subtle)' },
   shadowban: { label: 'Shadowban', color: 'var(--warning)', background: 'var(--warning-subtle)' },
@@ -78,6 +159,7 @@ const statusStyle: Record<string, { label: string; color: string; background: st
 
 const VaManagerPage: React.FC<VaManagerPageProps> = ({
   profiles,
+  folders,
   onUpdateProfile,
   onCreateAndConnect,
   onRetryConnection,
@@ -96,12 +178,20 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [auditFilter, setAuditFilter] = useState<AuditFilter>('all');
+  const [filtreVa, setFiltreVa] = useState('all');
   const [sort, setSort] = useState<AccountSort>('followers-desc');
   const [linkingAccountId, setLinkingAccountId] = useState<string | null>(null);
   const [selectedProfileId, setSelectedProfileId] = useState('');
   const [linkActionLoading, setLinkActionLoading] = useState(false);
   const [showCreateConfirmation, setShowCreateConfirmation] = useState(false);
   const [createActionLoading, setCreateActionLoading] = useState(false);
+  // La creation demande une seule chose : ou ranger l'instance. `null` signifie
+  // qu'aucune creation n'est en cours ; un tableau vide n'existe jamais.
+  const [comptesACreer, setComptesACreer] = useState<VaManagerAccount[] | null>(null);
+  const [dossierChoisi, setDossierChoisi] = useState('__none__');
+  // Les comptes coches a la main. Vide = on traite tout ce qui est pret, comme
+  // avant : une selection vide ne doit pas bloquer le bouton.
+  const [comptesCoches, setComptesCoches] = useState<Set<string>>(new Set());
   const [retryingAccountId, setRetryingAccountId] = useState<string | null>(null);
   const attemptedExistingCookieSyncs = useRef(new Set<string>());
 
@@ -243,19 +333,50 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
     organizationId,
   ]);
 
+  // Un seul calcul pour toute la page : les compteurs, les filtres et les lignes
+  // en decoulent. C'est ce qui garantit qu'ils disent la meme chose.
+  const etatParCompte = useMemo(() => {
+    const resultat = new Map<string, EtatCompte>();
+    for (const account of accounts) {
+      resultat.set(
+        account.id,
+        etatDuCompte(account, linkedByAccountId.get(account.id), getMissingInformation(account))
+      );
+    }
+    return resultat;
+  }, [accounts, linkedByAccountId]);
+
+  // La liste des assistants, deduite des comptes eux-memes plutot que demandee
+  // a part : elle ne montre ainsi que les VA qui ont vraiment des comptes dans
+  // l'organisation ouverte, avec leur nombre.
+  const listeVa = useMemo(() => {
+    const parVa = new Map<string, { id: string; nom: string; combien: number }>();
+    for (const account of accounts) {
+      if (!account.vaId) continue;
+      const connu = parVa.get(account.vaId);
+      if (connu) connu.combien++;
+      else parVa.set(account.vaId, {
+        id: account.vaId,
+        nom: account.vaName || 'VA sans nom',
+        combien: 1,
+      });
+    }
+    return [...parVa.values()].sort((a, b) => a.nom.localeCompare(b.nom));
+  }, [accounts]);
+
   const visibleAccounts = useMemo(() => {
     const query = search.trim().toLowerCase().replace(/^@/, '');
     return accounts
       .filter(account => !query || account.username.toLowerCase().includes(query))
       .filter(account => statusFilter === 'all' || account.status === statusFilter)
       .filter(account => {
-        const linked = linkedByAccountId.has(account.id);
-        const complete = getMissingInformation(account).length === 0;
-        if (auditFilter === 'existing') return linked;
-        if (auditFilter === 'to-create') return !linked;
-        if (auditFilter === 'missing') return !complete;
-        if (auditFilter === 'ready') return !linked && complete;
-        return true;
+        if (filtreVa === 'all') return true;
+        if (filtreVa === 'sans-va') return !account.vaId;
+        return account.vaId === filtreVa;
+      })
+      .filter(account => {
+        if (auditFilter === 'all') return true;
+        return etatParCompte.get(account.id)?.categorie === auditFilter;
       })
       .sort((a, b) => {
         if (sort === 'username') return a.username.localeCompare(b.username);
@@ -265,29 +386,86 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
           ? aFollowers - bFollowers
           : bFollowers - aFollowers;
       });
-  }, [accounts, auditFilter, linkedByAccountId, search, sort, statusFilter]);
+  }, [accounts, auditFilter, etatParCompte, filtreVa, search, sort, statusFilter]);
 
-  const linkedCount = linkedByAccountId.size;
-  const toCreateCount = accounts.length - linkedCount;
-  const missingCount = accounts.filter(account => getMissingInformation(account).length > 0).length;
-  const readyCount = accounts.filter(
-    account =>
-      !linkedByAccountId.has(account.id) &&
-      getMissingInformation(account).length === 0
-  ).length;
+  // Chaque compte compte pour un, dans une seule case. Les quatre nombres
+  // s'additionnent au total : plus de recouvrement, plus de doute.
+  const compter = (categorie: CategorieCompte) =>
+    accounts.filter(account => etatParCompte.get(account.id)?.categorie === categorie).length;
+  const aCreerCount = compter('a-creer');
+  const aCompleterCount = compter('a-completer');
+  const aFinirCount = compter('a-finir');
+  const enPlaceCount = compter('en-place');
+  const readyCount = aCreerCount;
   const readyAccounts = accounts.filter(
-    account =>
-      !linkedByAccountId.has(account.id) &&
-      getMissingInformation(account).length === 0
+    account => etatParCompte.get(account.id)?.categorie === 'a-creer'
   );
 
+  // Un compte est traitable s'il y a quelque chose a faire : creer l'instance,
+  // ou terminer une connexion. Un compte incomplet ou deja en place ne l'est
+  // pas -- le cocher ne servirait a rien.
+  const estTraitable = (account: VaManagerAccount) => {
+    const categorie = etatParCompte.get(account.id)?.categorie;
+    return categorie === 'a-creer' || categorie === 'a-finir';
+  };
+  const cochablesVisibles = visibleAccounts.filter(estTraitable);
+  const selectionTraitable = accounts.filter(
+    (account) => comptesCoches.has(account.id) && estTraitable(account)
+  );
+  const toutCoche =
+    cochablesVisibles.length > 0 &&
+    cochablesVisibles.every((account) => comptesCoches.has(account.id));
+
+  const basculerCompte = (identifiant: string) => {
+    setComptesCoches((actuels) => {
+      const suivants = new Set(actuels);
+      if (suivants.has(identifiant)) suivants.delete(identifiant);
+      else suivants.add(identifiant);
+      return suivants;
+    });
+  };
+
   const handleCreateReadyAccounts = async () => {
-    if (!organizationId || readyAccounts.length === 0) return;
+    // Un seul chemin, qu'il s'agisse d'un compte, d'une selection ou de tout
+    // ce qui est pret : le dossier de destination est demande dans tous les cas.
+    const cibles = comptesACreer && comptesACreer.length > 0
+      ? comptesACreer
+      : (selectionTraitable.length > 0 ? selectionTraitable : readyAccounts);
+    if (!organizationId || cibles.length === 0) return;
     setCreateActionLoading(true);
     setError('');
     try {
-      await onCreateAndConnect(readyAccounts, organizationId);
+      // Deux cas dans une meme selection, et deux chemins differents : un compte
+      // sans instance doit etre cree puis connecte, un compte qui en a une n'a
+      // que sa connexion a reprendre. Les melanger enverrait les seconds dans
+      // une creation qui les ignore en silence.
+      const aCreer = cibles.filter(
+        (compte) => etatParCompte.get(compte.id)?.categorie === 'a-creer'
+      );
+      const aFinir = cibles.filter(
+        (compte) => etatParCompte.get(compte.id)?.categorie === 'a-finir'
+      );
+
+      if (aCreer.length > 0) {
+        await onCreateAndConnect(aCreer, organizationId, dossierChoisi);
+      }
+      // Un compte a la fois : deux fenetres de connexion X en meme temps sur le
+      // meme poste, c'est la meilleure facon de les faire echouer toutes les deux.
+      for (const compte of aFinir) {
+        const profil = linkedByAccountId.get(compte.id);
+        if (!profil) continue;
+        setRetryingAccountId(compte.id);
+        try {
+          await onRetryConnection(compte, organizationId, profil);
+        } finally {
+          setRetryingAccountId(null);
+        }
+      }
+
       setShowCreateConfirmation(false);
+      setComptesACreer(null);
+      setComptesCoches(new Set());
+      await loadAccounts(organizationId);
     } catch (createError) {
       setError(
         createError instanceof Error
@@ -454,6 +632,15 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
           <p className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
             Connecté avec {connection.email}
           </p>
+          {connection.memorisee === false && (
+            // Le coffre du systeme a refuse : la session tient le temps de
+            // l'application, rien n'est ecrit sur le disque. Le dire, sinon la
+            // deconnexion au prochain demarrage passe pour une panne.
+            <p className="text-xs mt-1" style={{ color: 'var(--warning, #f59e0b)' }}>
+              Session non mémorisée — à refaire au prochain démarrage. Le coffre
+              du système est indisponible.
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {organizations.length > 0 && (
@@ -504,19 +691,24 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
           <button
             type="button"
             onClick={() => setShowCreateConfirmation(true)}
-            disabled={readyCount === 0 || Boolean(importProgress?.running)}
+            disabled={
+              (selectionTraitable.length === 0 && readyCount === 0) ||
+              Boolean(importProgress?.running)
+            }
             className="px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ background: 'var(--accent)', color: 'white' }}
           >
-            Créer et connecter les prêts ({readyCount})
+            {selectionTraitable.length > 0
+              ? `Connecter la sélection (${selectionTraitable.length})`
+              : `Créer et connecter les prêts (${readyCount})`}
           </button>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 mb-4">
           {[
-            { label: 'Instances déjà créées', value: linkedCount, icon: Link2, color: 'var(--success)', filter: 'existing' as AuditFilter },
-            { label: 'Instances à créer', value: toCreateCount, icon: Users, color: 'var(--accent-light)', filter: 'to-create' as AuditFilter },
-            { label: 'Informations manquantes', value: missingCount, icon: AlertTriangle, color: 'var(--danger)', filter: 'missing' as AuditFilter },
-            { label: 'Prêts à créer et connecter', value: readyCount, icon: ShieldCheck, color: 'var(--success)', filter: 'ready' as AuditFilter },
+            { label: 'À créer', value: aCreerCount, icon: ShieldCheck, color: 'var(--accent-light)', filter: 'a-creer' as AuditFilter },
+            { label: 'À compléter', value: aCompleterCount, icon: AlertTriangle, color: 'var(--danger)', filter: 'a-completer' as AuditFilter },
+            { label: 'À finir', value: aFinirCount, icon: RefreshCw, color: 'var(--warning)', filter: 'a-finir' as AuditFilter },
+            { label: 'En place', value: enPlaceCount, icon: Link2, color: 'var(--success)', filter: 'en-place' as AuditFilter },
           ].map(card => (
             <button
               type="button"
@@ -624,12 +816,32 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
               className="px-3 py-2 rounded-lg text-xs outline-none"
               style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
             >
-              <option value="all">Audit complet</option>
-              <option value="existing">Instances déjà créées</option>
-              <option value="to-create">Instances à créer</option>
-              <option value="missing">Informations manquantes</option>
-              <option value="ready">Prêts à créer</option>
+              {/* Les memes quatre categories que les cartes du haut, avec les
+                  memes mots. Deux filtres qui ne parlent pas la meme langue,
+                  c'est un filtre qui ne marche pas. */}
+              <option value="all">Tous les comptes</option>
+              <option value="a-creer">À créer</option>
+              <option value="a-completer">À compléter</option>
+              <option value="a-finir">À finir</option>
+              <option value="en-place">En place</option>
             </select>
+            {/* Le filtre par assistant. VA Manager montre qui tient quel
+                compte ; sans lui ici, creer les instances d'une seule personne
+                obligeait a les cocher une par une. */}
+            {listeVa.length > 0 && (
+              <select
+                value={filtreVa}
+                onChange={event => setFiltreVa(event.target.value)}
+                className="px-3 py-2 rounded-lg text-xs outline-none"
+                style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
+              >
+                <option value="all">Tous les VA</option>
+                {listeVa.map(va => (
+                  <option key={va.id} value={va.id}>{va.nom} ({va.combien})</option>
+                ))}
+                <option value="sans-va">Sans VA</option>
+              </select>
+            )}
             <select
               value={sort}
               onChange={event => setSort(event.target.value as AccountSort)}
@@ -650,13 +862,33 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
 
           <div className="overflow-x-auto">
             <div className="min-w-[980px]">
-              <div className="grid grid-cols-[minmax(180px,1.5fr)_130px_120px_minmax(180px,1fr)_170px_130px] px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
+              <div className="grid grid-cols-[34px_minmax(220px,1.4fr)_minmax(240px,1fr)_190px] items-center px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
+                <input
+                  type="checkbox"
+                  checked={toutCoche}
+                  onChange={() => {
+                    // Tout cocher ne touche qu'a ce qui est affiche : une case
+                    // qui selectionne des lignes invisibles est un piege.
+                    setComptesCoches((actuels) => {
+                      const suivants = new Set(actuels);
+                      for (const compte of cochablesVisibles) {
+                        if (toutCoche) suivants.delete(compte.id);
+                        else suivants.add(compte.id);
+                      }
+                      return suivants;
+                    });
+                  }}
+                  disabled={cochablesVisibles.length === 0}
+                  title={
+                    cochablesVisibles.length === 0
+                      ? 'Aucun compte à traiter dans cette liste'
+                      : 'Tout cocher dans cette liste'
+                  }
+                  style={{ cursor: 'pointer' }}
+                />
                 <span>Compte</span>
-                <span>Abonnés</span>
-                <span>Statut</span>
-                <span>Instance Spectra</span>
-                <span>Audit connexion</span>
-                <span>Dernier scan</span>
+                <span>Où ça en est</span>
+                <span>Action</span>
               </div>
 
               {loading ? (
@@ -672,6 +904,9 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
               {visibleAccounts.map(account => {
                 const profile = linkedByAccountId.get(account.id);
                 const missingInformation = getMissingInformation(account);
+                const etat =
+                  etatParCompte.get(account.id) ||
+                  etatDuCompte(account, profile, missingInformation);
                 const visual = statusStyle[account.status] || {
                   label: account.status || 'Inconnu',
                   color: 'var(--text-secondary)',
@@ -680,153 +915,149 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
                 return (
                   <div
                     key={account.id}
-                    className="grid grid-cols-[minmax(180px,1.5fr)_130px_120px_minmax(180px,1fr)_170px_130px] items-center px-4 py-3 text-xs"
+                    className="grid grid-cols-[34px_minmax(220px,1.4fr)_minmax(240px,1fr)_190px] items-center px-4 py-3 text-xs"
                     style={{ color: 'var(--text-secondary)', borderBottom: '1px solid var(--border-subtle)' }}
                   >
-                    <div className="min-w-0">
-                      <div className="font-semibold truncate" style={{ color: 'var(--text-primary)' }}>@{account.username}</div>
-                      <div className="text-[10px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>{account.id}</div>
-                    </div>
-                    <div className="font-semibold tabular-nums" style={{ color: account.followers !== null ? 'var(--text-primary)' : 'var(--text-muted)' }}>
-                      {formatFollowers(account.followers)}
-                    </div>
-                    <div>
-                      <span className="inline-flex px-2 py-1 rounded-full text-[10px] font-semibold" style={{ color: visual.color, background: visual.background }}>
-                        {visual.label}
-                      </span>
-                    </div>
-                    <div className="min-w-0">
-                      {profile ? (
-                        <>
-                          <div className="flex items-center gap-1.5 font-medium truncate" style={{ color: 'var(--success)' }}>
-                            <Link2 size={13} className="shrink-0" /> {profile.name}
-                          </div>
-                          <div className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
-                            {profile.vaManagerAccountId === account.id ? 'Liaison confirmée' : 'Correspondance détectée'}
-                            {' · '}
-                            {profile.proxy?.host ? 'Proxy assigné' : 'Proxy manquant'}
-                          </div>
-                          {profile.vaManagerLoginStatus && (
-                            <div
-                              className="text-[10px] mt-1"
-                              style={{
-                                color: profile.vaManagerLoginStatus === 'connected'
-                                  ? 'var(--success)'
-                                  : profile.vaManagerLoginStatus === 'failed'
-                                    ? 'var(--danger)'
-                                    : 'var(--warning)',
-                              }}
-                              title={profile.vaManagerLoginMessage}
-                            >
-                              {profile.vaManagerLoginStatus === 'connected'
-                                ? 'Connexion X confirmée'
-                                : profile.vaManagerLoginStatus === 'manual'
-                                  ? 'Vérification manuelle requise'
-                                  : profile.vaManagerLoginStatus === 'failed'
-                                    ? 'Connexion X échouée'
-                                    : 'Connexion X en attente'}
-                            </div>
-                          )}
-                          <div className="flex items-center gap-1.5 mt-1.5">
-                            {profile.vaManagerAccountId !== account.id && (
-                              <button
-                                onClick={() => persistLink(account, profile)}
-                                disabled={linkActionLoading}
-                                className="px-2 py-1 rounded text-[9px] font-semibold disabled:opacity-50"
-                                style={{ background: 'var(--success-subtle)', color: 'var(--success)' }}
-                              >
-                                Confirmer
-                              </button>
-                            )}
-                            {profile.vaManagerAccountId === account.id && (
-                              <>
-                                <button
-                                  onClick={() => unlinkProfile(profile)}
-                                  disabled={linkActionLoading || retryingAccountId === account.id}
-                                  className="px-2 py-1 rounded text-[9px] font-semibold disabled:opacity-50"
-                                  style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}
-                                >
-                                  Délier
-                                </button>
-                                {profile.vaManagerLoginStatus &&
-                                  profile.vaManagerLoginStatus !== 'connected' && (
-                                    <button
-                                      onClick={async () => {
-                                        setRetryingAccountId(account.id);
-                                        setError('');
-                                        try {
-                                          await onRetryConnection(account, organizationId, profile);
-                                        } catch (retryError) {
-                                          setError(
-                                            retryError instanceof Error
-                                              ? retryError.message
-                                              : 'Nouvelle tentative impossible'
-                                          );
-                                        } finally {
-                                          setRetryingAccountId(null);
-                                        }
-                                      }}
-                                      disabled={
-                                        retryingAccountId === account.id ||
-                                        Boolean(importProgress?.running)
-                                      }
-                                      className="px-2 py-1 rounded text-[9px] font-semibold disabled:opacity-50"
-                                      style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}
-                                    >
-                                      {retryingAccountId === account.id ? 'Connexion…' : 'Réessayer'}
-                                    </button>
-                                  )}
-                              </>
-                            )}
-                          </div>
-                        </>
-                      ) : (
-                        <div>
-                          <div className="text-[11px]" style={{ color: 'var(--warning)' }}>Aucune instance trouvée</div>
-                          <button
-                            onClick={() => {
-                              setLinkingAccountId(account.id);
-                              setSelectedProfileId('');
+                    <input
+                      type="checkbox"
+                      checked={comptesCoches.has(account.id)}
+                      onChange={() => basculerCompte(account.id)}
+                      disabled={!estTraitable(account)}
+                      title={
+                        estTraitable(account)
+                          ? 'Traiter ce compte'
+                          : etat.categorie === 'en-place'
+                            ? 'Déjà en place et connecté'
+                            : 'Il manque des informations dans VA Manager'
+                      }
+                      style={{ cursor: estTraitable(account) ? 'pointer' : 'not-allowed' }}
+                    />
+                    {/* Colonne 1 : qui c'est. Le reste (abonnes, dernier scan)
+                        reste lisible mais ne prend plus la place de l'action. */}
+                    <div className="min-w-0 pr-3">
+                      <div className="font-semibold truncate flex items-center gap-2" style={{ color: 'var(--text-primary)' }}>
+                        <span className="truncate">@{account.username}</span>
+                        {/* L'assistant qui tient le compte. Present dans VA
+                            Manager, il manquait ici -- on ne savait pas de qui
+                            etait un compte sans changer d'application. */}
+                        {account.vaName && (
+                          <span
+                            className="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-medium"
+                            style={{
+                              background: 'var(--accent-subtle)',
+                              color: 'var(--accent-light)',
                             }}
-                            className="px-2 py-1 rounded text-[9px] font-semibold mt-1.5"
-                            style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}
+                            title={`Assistant : ${account.vaName}`}
                           >
-                            Lier une instance
-                          </button>
+                            {account.vaName}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[10px] mt-0.5 flex items-center gap-1.5 flex-wrap" style={{ color: 'var(--text-muted)' }}>
+                        <span style={{ color: visual.color }}>{visual.label}</span>
+                        <span>·</span>
+                        <span>{formatFollowers(account.followers)} abonnés</span>
+                        <span>·</span>
+                        <span>vu {formatDate(account.lastScannedAt || account.followersUpdatedAt)}</span>
+                        <span>·</span>
+                        {/* La sauvegarde de session vit dans VA Manager : c'est
+                            elle qui permet de retrouver le compte connecte
+                            ailleurs. On la garde visible, mais discrete. */}
+                        <span style={{ color: account.hasCookies ? 'var(--success)' : 'var(--warning)' }}>
+                          {account.hasCookies ? 'Cookies X synchronisés' : 'Cookies X en attente'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Colonne 2 : une phrase, en francais, qui dit ou ca en est. */}
+                    <div className="min-w-0 pr-3">
+                      <div className="font-medium" style={{ color: tonCouleur[etat.ton] }}>
+                        {etat.phrase}
+                      </div>
+                      {etat.detail && (
+                        <div className="text-[10px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }} title={etat.detail}>
+                          {etat.detail}
                         </div>
                       )}
                     </div>
-                    <div className="flex items-center gap-1.5 flex-wrap pr-2">
-                      {missingInformation.length === 0 ? (
-                        <span
-                          className="px-2 py-1 rounded text-[9px] font-semibold"
+
+                    {/* Colonne 3 : un bouton, ou rien du tout. */}
+                    <div className="flex items-center gap-1.5">
+                      {etat.action === 'creer' && (
+                        <button
+                          onClick={() => {
+                            setComptesACreer([account]);
+                            setDossierChoisi('__none__');
+                          }}
+                          disabled={Boolean(importProgress?.running)}
+                          className="px-3 py-1.5 rounded-lg text-[11px] font-semibold text-white disabled:opacity-40"
+                          style={{ background: 'var(--accent)' }}
+                        >
+                          Créer l’instance
+                        </button>
+                      )}
+
+                      {etat.action === 'confirmer' && profile && (
+                        <button
+                          onClick={() => persistLink(account, profile)}
+                          disabled={linkActionLoading}
+                          className="px-3 py-1.5 rounded-lg text-[11px] font-semibold disabled:opacity-50"
                           style={{ background: 'var(--success-subtle)', color: 'var(--success)' }}
                         >
-                          Informations complètes
-                        </span>
-                      ) : missingInformation.map(label => (
-                        <span
-                          key={label}
-                          className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
-                          style={{ background: 'var(--danger-subtle)', color: 'var(--danger)' }}
+                          C’est bien lui
+                        </button>
+                      )}
+
+                      {(etat.action === 'reprendre' || etat.action === 'reessayer') && profile && (
+                        <button
+                          onClick={async () => {
+                            setRetryingAccountId(account.id);
+                            setError('');
+                            try {
+                              await onRetryConnection(account, organizationId, profile);
+                            } catch (retryError) {
+                              setError(
+                                retryError instanceof Error
+                                  ? retryError.message
+                                  : 'Nouvelle tentative impossible'
+                              );
+                            } finally {
+                              setRetryingAccountId(null);
+                            }
+                          }}
+                          disabled={retryingAccountId === account.id || Boolean(importProgress?.running)}
+                          className="px-3 py-1.5 rounded-lg text-[11px] font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                          style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}
                         >
-                          {label}
-                        </span>
-                      ))}
-                      <span
-                        className="px-1.5 py-0.5 rounded text-[9px] font-semibold"
-                        style={{
-                          background: account.hasCookies
-                            ? 'var(--success-subtle)'
-                            : 'var(--warning-subtle)',
-                          color: account.hasCookies ? 'var(--success)' : 'var(--warning)',
-                        }}
-                      >
-                        {account.hasCookies ? 'Cookies X synchronisés' : 'Cookies X en attente'}
-                      </span>
-                    </div>
-                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
-                      {formatDate(account.lastScannedAt || account.followersUpdatedAt)}
+                          {retryingAccountId === account.id && <Loader2 size={12} className="animate-spin" />}
+                          {etat.action === 'reessayer' ? 'Réessayer' : 'Reprendre'}
+                        </button>
+                      )}
+
+                      {/* Actions de second plan, volontairement discretes. */}
+                      {!profile && (
+                        <button
+                          onClick={() => {
+                            setLinkingAccountId(account.id);
+                            setSelectedProfileId('');
+                          }}
+                          className="px-2 py-1.5 rounded-lg text-[10px]"
+                          style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}
+                          title="Rattacher une instance qui existe deja sous un autre nom"
+                        >
+                          Lier
+                        </button>
+                      )}
+                      {profile && profile.vaManagerAccountId === account.id && (
+                        <button
+                          onClick={() => unlinkProfile(profile)}
+                          disabled={linkActionLoading}
+                          className="px-2 py-1.5 rounded-lg text-[10px] disabled:opacity-50"
+                          style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}
+                        >
+                          Délier
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -913,13 +1144,14 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
         </div>
       )}
 
-      {showCreateConfirmation && (
+      {(showCreateConfirmation || comptesACreer !== null) && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-5"
           style={{ background: 'rgba(0,0,0,0.72)' }}
           onMouseDown={event => {
             if (event.target === event.currentTarget && !createActionLoading) {
               setShowCreateConfirmation(false);
+              setComptesACreer(null);
             }
           }}
         >
@@ -940,18 +1172,49 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
               </div>
               <div>
                 <div className="text-base font-semibold" style={{ color: 'var(--text-primary)' }}>
-                  Créer et connecter {readyCount} compte{readyCount !== 1 ? 's' : ''}
+                  {comptesACreer && comptesACreer.length === 1
+                    ? `Créer et connecter @${comptesACreer[0].username}`
+                    : (() => {
+                        const nombre =
+                          comptesACreer?.length ??
+                          (selectionTraitable.length > 0 ? selectionTraitable.length : readyCount);
+                        return `Créer et connecter ${nombre} compte${nombre !== 1 ? 's' : ''}`;
+                      })()}
                 </div>
                 <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
                   Organisation {organizations.find(org => org.id === organizationId)?.name || 'sélectionnée'}
                 </div>
               </div>
             </div>
+            {/* La seule decision qui revient a l'utilisateur. Avant, l'instance
+                atterrissait dans le dossier selectionne ailleurs dans l'appli,
+                sans que personne ne l'ait choisi. */}
+            <div className="mt-4">
+              <label className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+                Où ranger {(comptesACreer?.length ?? readyCount) > 1 ? 'ces instances' : 'cette instance'} ?
+              </label>
+              <select
+                value={dossierChoisi}
+                onChange={event => setDossierChoisi(event.target.value)}
+                disabled={createActionLoading}
+                className="w-full mt-1.5 px-3 py-2.5 rounded-lg text-sm outline-none"
+                style={{
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border-default)',
+                  color: 'var(--text-primary)',
+                }}
+              >
+                <option value="__none__">Aucun dossier</option>
+                {folders.map(folder => (
+                  <option key={folder.id} value={folder.id}>{folder.name}</option>
+                ))}
+              </select>
+            </div>
             <div
               className="mt-4 rounded-xl p-3 text-xs leading-relaxed"
               style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)' }}
             >
-              Spectra vérifiera les proxies, respectera la limite de trois comptes par proxy,
+              Spectra vérifiera les proxies, respectera la limite de {COMPTES_MAX_PAR_PROXY} comptes par proxy,
               créera les instances une par une et fermera chaque fenêtre après une connexion confirmée.
               Si la capacité proxy est insuffisante, seuls les comptes pouvant recevoir un proxy seront
               traités et les autres resteront en attente.
@@ -960,7 +1223,10 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
             <div className="mt-5 flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setShowCreateConfirmation(false)}
+                onClick={() => {
+                  setShowCreateConfirmation(false);
+                  setComptesACreer(null);
+                }}
                 disabled={createActionLoading}
                 className="px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-50"
                 style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)' }}

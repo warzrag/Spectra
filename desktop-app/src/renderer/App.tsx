@@ -66,7 +66,17 @@ import {
   parseSessionImportFile,
   SessionImportProgress,
 } from '../shared/session-import';
-import { proxyIdentityKey } from '../shared/proxy-identity';
+import { proxyIdentityKey, COMPTES_MAX_PAR_PROXY } from '../shared/proxy-identity';
+import { auth } from './services/firebase';
+
+interface AutoPostEvent {
+  id: string;
+  postUrl: string;
+  sourceProfileId: string;
+  account?: string;
+  receivedAt: number;
+  claimToken?: string;
+}
 
 declare global {
   interface Window {
@@ -124,6 +134,43 @@ declare global {
           status: SessionImportProgress['status'];
           message: string;
         }) => void) => () => void;
+      };
+      /** Ce que chaque instance fait pendant un tour Open Post. */
+      openPost?: {
+        onEvent: (callback: (payload: {
+          profileId: string;
+          event: string;
+          status: string;
+          raison: string;
+          cause?: string;
+          apercu?: string;
+          retweet?: boolean;
+          like?: boolean;
+        }) => void) => () => void;
+        dejaFait: (tweet: string) => Promise<string[]>;
+        registre: (tweet: string) => Promise<any>;
+      };
+      /** La sante des proxys, testee avant chaque tour. */
+      proxysSante?: {
+        tester: (proxy: any) => Promise<{ cle: string; ok: boolean; enPanne: boolean }>;
+        etat: () => Promise<Record<string, any>>;
+        enPanne: (proxy: any) => Promise<boolean>;
+      };
+      autoPost?: {
+        onEvent: (callback: (payload: AutoPostEvent) => void) => () => void;
+        claimNext: (payload: {
+          idToken: string;
+          teamId: string;
+          installationId: string;
+        }) => Promise<{ ok: true; event: AutoPostEvent | null }>;
+        complete: (payload: {
+          idToken: string;
+          teamId: string;
+          installationId: string;
+          eventId: string;
+          claimToken: string;
+          success: boolean;
+        }) => Promise<{ ok: true }>;
       };
       folders: {
         getAll: () => Promise<Folder[]>;
@@ -244,6 +291,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   defaultBrowser: 'chrome',
   sortBy: 'custom',
   sortOrder: 'asc',
+  autoPostEnabled: false,
 };
 
 function App() {
@@ -808,7 +856,8 @@ function App() {
                   installationId: currentInstallationId,
                 }).catch(() => {});
                 showToast(
-                  `"${profileName}" not synchronized: authenticated X snapshot is missing`,
+                  `"${profileName}" non envoyé : pas de session X dans ce profil. ` +
+                  `La version du cloud est préservée.`,
                   'warning'
                 );
                 continue;
@@ -856,6 +905,31 @@ function App() {
               );
               continue;
             }
+            // Un profil local incomplet ne guerira pas en reessayant : Chrome
+            // n'a pas ecrit ses preferences et ne les ecrira plus, le profil
+            // etant ferme. On abandonne l'envoi pour preserver la version du
+            // cloud, mais on relache le verrou -- sinon le profil deviendrait
+            // impossible a ouvrir sur les autres machines.
+            // Le code d'erreur ne traverse pas la frontiere entre les deux
+            // processus : seul le message arrive. On reconnait donc les deux.
+            if (
+              errorCode === 'profile-sync/incomplete-local' ||
+              errorMessage.includes('profile-sync/incomplete-local')
+            ) {
+              uploadQueue.shift();
+              persistQueue();
+              await releaseProfileLock(profileId, {
+                uid: user.uid,
+                deviceName: currentDeviceName,
+                installationId: currentInstallationId,
+              }).catch(() => {});
+              showToast(
+                `"${profileName}" non synchronisé : données locales incomplètes. ` +
+                "La version du cloud est intacte, rouvrez puis refermez l'instance normalement.",
+                'warning'
+              );
+              continue;
+            }
             if (!notifiedSyncFailures.has(profileId)) {
               notifiedSyncFailures.add(profileId);
               showToast(`Sync failed for "${profileName}" - retry scheduled`, 'error');
@@ -883,7 +957,8 @@ function App() {
         if (details.reason === 'missing-authenticated-x-snapshot') {
           const profile = profilesRef.current.find(p => p.id === profileId);
           showToast(
-            `"${profile?.name || profileId}" non synchronisé : aucune session X connectée détectée`,
+            `"${profile?.name || profileId}" non envoyé : pas de session X dans ce profil. ` +
+            `La version du cloud est préservée.`,
             'warning'
           );
         }
@@ -934,6 +1009,62 @@ function App() {
     showToast('Import des sessions arrêté', 'info');
   };
 
+  /**
+   * Rassemble assez de places proxy pour les comptes a creer.
+   *
+   * Les proxys etaient testes un par un, tous, avant d'ouvrir la moindre
+   * fenetre. Avec 65 proxys et dix secondes d'attente maximum chacun, creer un
+   * seul compte pouvait demander plusieurs minutes d'immobilite -- pour un
+   * besoin d'une place.
+   *
+   * Deux changements : les tests partent par lots, puisqu'ils sont
+   * independants, et on s'arrete des qu'il y a assez de places.
+   */
+  const rassemblerPlacesProxy = async (
+    candidats: FirestoreProxy[],
+    usageByProxy: Map<string, number>,
+    placesVoulues: number,
+    estAnnule: () => boolean
+  ): Promise<FirestoreProxy[]> => {
+    const TAILLE_LOT = 8;
+    const places: FirestoreProxy[] = [];
+
+    // On termine ce qui est commence avant d'entamer du neuf : les proxys les
+    // plus remplis passent en premier. Sans ce tri, l'ordre venait de la base
+    // de donnees et Spectra pouvait ouvrir un proxy vierge alors qu'un autre
+    // n'attendait qu'un compte pour etre plein -- le parc se consommait bien
+    // plus vite que necessaire.
+    //
+    // Le tri ne dispense de rien : chaque proxy est teste avant d'etre
+    // attribue, et un proxy muet est ecarte quel que soit son remplissage.
+    const parRemplissage = [...candidats].sort((a, b) =>
+      (usageByProxy.get(proxyIdentityKey(b)) || 0) - (usageByProxy.get(proxyIdentityKey(a)) || 0)
+    );
+
+    for (let debut = 0; debut < parRemplissage.length; debut += TAILLE_LOT) {
+      if (estAnnule() || places.length >= placesVoulues) break;
+      const lot = parRemplissage.slice(debut, debut + TAILLE_LOT);
+      const resultats = await Promise.all(lot.map(async (proxy) => {
+        try {
+          const reponse: any = await window.electronAPI.proxy.test(proxy);
+          const sain = typeof reponse === 'boolean' ? reponse : reponse?.isHealthy === true;
+          return { proxy, sain };
+        } catch {
+          return { proxy, sain: false };
+        }
+      }));
+      for (const { proxy, sain } of resultats) {
+        if (!sain) continue;
+        const restant = Math.max(
+          0,
+          COMPTES_MAX_PAR_PROXY - (usageByProxy.get(proxyIdentityKey(proxy)) || 0)
+        );
+        for (let index = 0; index < restant; index++) places.push(proxy);
+      }
+    }
+    return places;
+  };
+
   const handleImportSessions = async (content: string, fileName: string) => {
     if (!user || !window.electronAPI.sessionImport || sessionImportRunRef.current) {
       showToast('Un import de sessions est déjà en cours', 'warning');
@@ -956,7 +1087,7 @@ function App() {
     const uniqueCandidates = new Map<string, FirestoreProxy>();
     for (const proxy of proxies) {
       const key = proxyIdentityKey(proxy);
-      if ((usageByProxy.get(key) || 0) < 3 && !uniqueCandidates.has(key)) {
+      if ((usageByProxy.get(key) || 0) < COMPTES_MAX_PAR_PROXY && !uniqueCandidates.has(key)) {
         uniqueCandidates.set(key, proxy);
       }
     }
@@ -973,20 +1104,9 @@ function App() {
     sessionImportRunRef.current = run;
 
     try {
-      const validSlots: FirestoreProxy[] = [];
-      for (const proxy of candidates) {
-        if (run.cancelled) return;
-        const key = proxyIdentityKey(proxy);
-        const remaining = Math.max(0, 3 - (usageByProxy.get(key) || 0));
-        let testResult: any = false;
-        try {
-          testResult = await window.electronAPI.proxy.test(proxy);
-        } catch {}
-        const healthy = typeof testResult === 'boolean' ? testResult : testResult?.isHealthy === true;
-        if (healthy) {
-          for (let index = 0; index < remaining; index++) validSlots.push(proxy);
-        }
-      }
+      const validSlots = await rassemblerPlacesProxy(
+        candidates, usageByProxy, accounts.length, () => run.cancelled
+      );
       if (validSlots.length < accounts.length) {
         setSessionImportProgress({
           running: false,
@@ -995,7 +1115,10 @@ function App() {
           status: 'failed',
           message: `Capacité proxy insuffisante (${validSlots.length}/${accounts.length})`,
         });
-        showToast('Import annulé : capacité insuffisante de proxies valides (3 comptes maximum par proxy)', 'error');
+        showToast(
+          `Import annulé : capacité insuffisante de proxies valides (${COMPTES_MAX_PAR_PROXY} comptes maximum par proxy)`,
+          'error'
+        );
         return;
       }
 
@@ -1040,7 +1163,7 @@ function App() {
           language: 'en-US',
           screenResolution: usFingerprint.screenResolution || '1920x1080',
           fingerprint: usFingerprint,
-          os: 'windows',
+          os: (usFingerprint as any).os || 'windows',
           browserType: 'chrome',
           connectionType: 'proxy',
           connectionConfig: { type: 'proxy', proxy: proxyData },
@@ -1202,7 +1325,11 @@ function App() {
 
   const handleCreateVaManagerInstances = async (
     accounts: VaManagerAccount[],
-    organizationId: string
+    organizationId: string,
+    // Le dossier est demande au moment de creer. Avant, l'instance atterrissait
+    // dans celui qui se trouvait selectionne dans la barre de gauche, sans que
+    // personne ne l'ait choisi ni ne le voie.
+    folderId?: string | null
   ): Promise<{ successful: number; failed: number; manual: boolean; message: string }> => {
     if (!user || !window.electronAPI.sessionImport?.runVaManager) {
       throw new Error('Connexion automatique VA Manager indisponible');
@@ -1234,7 +1361,7 @@ function App() {
     const uniqueCandidates = new Map<string, FirestoreProxy>();
     for (const proxy of proxies) {
       const key = proxyIdentityKey(proxy);
-      if ((usageByProxy.get(key) || 0) < 3 && !uniqueCandidates.has(key)) {
+      if ((usageByProxy.get(key) || 0) < COMPTES_MAX_PAR_PROXY && !uniqueCandidates.has(key)) {
         uniqueCandidates.set(key, proxy);
       }
     }
@@ -1251,22 +1378,12 @@ function App() {
     sessionImportRunRef.current = run;
 
     try {
-      const validSlots: FirestoreProxy[] = [];
-      for (const proxy of uniqueCandidates.values()) {
-        if (run.cancelled) break;
-        const key = proxyIdentityKey(proxy);
-        const remaining = Math.max(0, 3 - (usageByProxy.get(key) || 0));
-        let testResult: any = false;
-        try {
-          testResult = await window.electronAPI.proxy.test(proxy);
-        } catch {}
-        const healthy = typeof testResult === 'boolean'
-          ? testResult
-          : testResult?.isHealthy === true;
-        if (healthy) {
-          for (let index = 0; index < remaining; index++) validSlots.push(proxy);
-        }
-      }
+      const validSlots = await rassemblerPlacesProxy(
+        Array.from(uniqueCandidates.values()),
+        usageByProxy,
+        pendingAccounts.length,
+        () => run.cancelled
+      );
       if (validSlots.length === 0) {
         throw new Error(
           'Aucune place proxy valide disponible'
@@ -1320,12 +1437,14 @@ function App() {
           language: 'en-US',
           screenResolution: usFingerprint.screenResolution || '1920x1080',
           fingerprint: usFingerprint,
-          os: 'windows',
+          os: (usFingerprint as any).os || 'windows',
           browserType: 'chrome',
           connectionType: 'proxy',
           connectionConfig: { type: 'proxy', proxy: proxyData },
           proxy: proxyData,
-          folderId: selectedFolderId || undefined,
+          // '__none__' veut dire « hors dossier » : c'est un choix explicite,
+          // pas une absence de reponse.
+          folderId: folderId === '__none__' ? undefined : (folderId || undefined),
           lastUrl: 'https://x.com/home',
           status: 'none',
           tags: ['va-manager'],
@@ -1404,6 +1523,9 @@ function App() {
             vaManagerLoginStatus: 'connected',
             vaManagerLoginMessage: result.message || 'Connexion X confirmée',
             vaManagerLastLoginAt: new Date().toISOString(),
+            // Le compte est authentifie et utilisable : la colonne Account le
+            // dit sans qu'on ait a le poser a la main.
+            status: 'active',
           });
         } else {
           failed++;
@@ -1504,6 +1626,11 @@ function App() {
             : 'failed',
         vaManagerLoginMessage: result.message,
         vaManagerLastLoginAt: new Date().toISOString(),
+        // Une reprise reussie vaut une premiere connexion reussie : meme
+        // consequence sur la colonne Account. Un echec, lui, ne touche a rien
+        // -- il ne dit pas que le compte est mauvais, seulement que la
+        // connexion n'a pas abouti cette fois.
+        ...(result.status === 'success' ? { status: 'active' as const } : {}),
       });
       setSessionImportProgress({
         running: false,
@@ -1808,11 +1935,228 @@ function App() {
 
   const [bulkLaunching, setBulkLaunching] = useState<{ total: number; current: number; name: string } | null>(null);
   const [isOpenPostRunning, setIsOpenPostRunning] = useState(false);
+  /**
+   * Ce que chaque instance a reellement fait pendant le tour en cours.
+   *
+   * Le bot annonce deja tout -- page chargee, tweet trouve, retweet, like --
+   * mais ces annonces n'allaient que dans le journal du profil, sur le disque
+   * de la machine qui tournait. Savoir quelles instances avaient retweete
+   * demandait d'ouvrir une session distante et de lire des fichiers a la main.
+   */
+  type ResultatTour = {
+    nom: string;
+    pageChargee: boolean;
+    tweetTrouve: boolean;
+    retweet: boolean;
+    like: boolean;
+    panne: string;
+  };
+  const resultatsTourRef = useRef(new Map<string, ResultatTour>());
+  const [recapTour, setRecapTour] = useState<{
+    quand: string;
+    postUrl: string;
+    resultats: Array<{ profileId: string } & ResultatTour>;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!window.electronAPI.openPost?.onEvent) return;
+    return window.electronAPI.openPost.onEvent((e: any) => {
+      const id = String(e?.profileId || '');
+      if (!id) return;
+      const actuel = resultatsTourRef.current.get(id) || {
+        nom: '', pageChargee: false, tweetTrouve: false, retweet: false, like: false, panne: '',
+      };
+      switch (String(e?.event || '')) {
+        case 'open-post-content-loaded': actuel.pageChargee = true; break;
+        case 'open-post-target-found': actuel.tweetTrouve = true; break;
+        case 'open-post-target-not-found': {
+          // Le bot dit maintenant ce qu'il avait a l'ecran : trois pannes tres
+          // differentes produisaient toutes « tweet introuvable ».
+          const causes: Record<string, string> = {
+            'verification-humaine': 'X demande une vérification humaine',
+            'deconnecte': 'Le compte est déconnecté',
+            'compte-suspendu': 'Compte suspendu par X',
+            'post-indisponible': 'Le post n’est plus accessible',
+            'erreur-x': 'X a renvoyé une erreur',
+          };
+          const cause = String(e?.cause || '');
+          actuel.panne = causes[cause]
+            || (cause === 'inconnu' && e?.apercu
+              ? `Tweet introuvable — « ${String(e.apercu).slice(0, 60)} »`
+              : 'Tweet introuvable dans la page');
+          break;
+        }
+        // « deja retweete » est une reussite, pas un echec : le compteur ne
+        // retenait que « reposted » et comptait pour rate tout ce qui l'etait
+        // deja. C'est une des raisons pour lesquelles le tweet affichait 24
+        // retweets quand le recapitulatif en annoncait 7.
+        case 'open-post-repost-result':
+          if (['reposted', 'already-reposted'].includes(String(e?.status || ''))) {
+            actuel.retweet = true;
+          }
+          break;
+        case 'open-post-like-result':
+          if (['liked', 'already-liked'].includes(String(e?.status || ''))) actuel.like = true;
+          break;
+        // Le verdict lu sur la page fait foi : il arrive en direct, sans le
+        // relais qui perdait des messages.
+        case 'open-post-verdict':
+          if (e?.retweet) actuel.retweet = true;
+          if (e?.like) actuel.like = true;
+          break;
+        case 'bootstrap-failed':
+          // « Frame with ID 0 is showing error page » : la page n'a pas pu se
+          // charger du tout. C'est le proxy, neuf fois sur dix.
+          actuel.panne = /error page/i.test(String(e?.raison || ''))
+            ? 'Proxy injoignable — la page ne charge pas'
+            : String(e?.raison || 'Démarrage impossible');
+          break;
+      }
+      resultatsTourRef.current.set(id, actuel);
+    });
+  }, []);
+
+  const [autoPostQueue, setAutoPostQueue] = useState<AutoPostEvent[]>([]);
+  const [autoPostProcessing, setAutoPostProcessing] = useState(false);
+  const [autoPostNotice, setAutoPostNotice] = useState<{
+    postUrl: string;
+    account?: string;
+    status: 'pending' | 'processing' | 'completed' | 'failed';
+  } | null>(null);
+  const autoPostEnabledRef = useRef(false);
+  const seenAutoPostUrlsRef = useRef<Set<string>>(new Set());
   const openPostRunRef = useRef<{
     cancelled: boolean;
     activeProfileIds: Set<string>;
     candidateProfileIds: string[];
   } | null>(null);
+
+  useEffect(() => {
+    autoPostEnabledRef.current = Boolean(
+      settings.autoPostEnabled && settings.autoPostFolderId
+    );
+  }, [settings.autoPostEnabled, settings.autoPostFolderId]);
+
+  useEffect(() => {
+    if (!autoPostNotice) return;
+    const dismissAfterMs = autoPostNotice.status === 'completed'
+      ? 5000
+      : autoPostNotice.status === 'failed'
+        ? 10000
+        : null;
+    if (!dismissAfterMs) return;
+
+    const noticeUrl = autoPostNotice.postUrl;
+    const noticeStatus = autoPostNotice.status;
+    const timer = window.setTimeout(() => {
+      setAutoPostNotice(current =>
+        current?.postUrl === noticeUrl && current.status === noticeStatus
+          ? null
+          : current
+      );
+    }, dismissAfterMs);
+
+    return () => window.clearTimeout(timer);
+  }, [autoPostNotice?.postUrl, autoPostNotice?.status]);
+
+  useEffect(() => {
+    if (!window.electronAPI.autoPost?.onEvent) return;
+    return window.electronAPI.autoPost.onEvent((event) => {
+      const normalizedUrl = normalizeTweetUrl(event?.postUrl);
+      if (!autoPostEnabledRef.current || !normalizedUrl) return;
+      if (seenAutoPostUrlsRef.current.has(normalizedUrl)) return;
+      seenAutoPostUrlsRef.current.add(normalizedUrl);
+      if (seenAutoPostUrlsRef.current.size > 500) {
+        const oldest = seenAutoPostUrlsRef.current.values().next().value;
+        if (oldest) seenAutoPostUrlsRef.current.delete(oldest);
+      }
+      setAutoPostQueue(current => [
+        ...current,
+        { ...event, postUrl: normalizedUrl },
+      ]);
+      setAutoPostNotice({
+        postUrl: normalizedUrl,
+        account: event.account,
+        status: 'pending',
+      });
+      showToast(
+        `Auto Post: nouvelle publication${event.account ? ` de @${event.account}` : ''}`,
+        'info'
+      );
+    });
+  }, [showToast]);
+
+  useEffect(() => {
+    if (
+      !settings.autoPostEnabled ||
+      !settings.autoPostFolderId ||
+      !activeWorkspaceTeamId ||
+      !currentInstallationId ||
+      !window.electronAPI.autoPost?.claimNext
+    ) return;
+
+    let stopped = false;
+    let inFlight = false;
+    const poll = async () => {
+      if (stopped || inFlight || autoPostProcessing || autoPostQueue.length > 0) return;
+      const currentAuthUser = auth.currentUser;
+      if (!currentAuthUser) return;
+      inFlight = true;
+      try {
+        const idToken = await currentAuthUser.getIdToken();
+        const result = await window.electronAPI.autoPost!.claimNext({
+          idToken,
+          teamId: activeWorkspaceTeamId,
+          installationId: currentInstallationId,
+        });
+        const event = result?.event;
+        const normalizedUrl = normalizeTweetUrl(event?.postUrl);
+        if (!event || !normalizedUrl || stopped) return;
+        if (seenAutoPostUrlsRef.current.has(normalizedUrl)) {
+          if (event.claimToken) {
+            await window.electronAPI.autoPost!.complete({
+              idToken,
+              teamId: activeWorkspaceTeamId,
+              installationId: currentInstallationId,
+              eventId: event.id,
+              claimToken: event.claimToken,
+              success: true,
+            });
+          }
+          return;
+        }
+        seenAutoPostUrlsRef.current.add(normalizedUrl);
+        setAutoPostQueue(current => [...current, { ...event, postUrl: normalizedUrl }]);
+        setAutoPostNotice({
+          postUrl: normalizedUrl,
+          account: event.account,
+          status: 'pending',
+        });
+        showToast(
+          `Auto Post Telegram reçu${event.account ? ` pour @${event.account}` : ''}`,
+          'info'
+        );
+      } catch (error) {
+        console.warn('Auto Post relay poll failed:', error);
+      } finally {
+        inFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 4000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    settings.autoPostEnabled,
+    settings.autoPostFolderId,
+    activeWorkspaceTeamId,
+    currentInstallationId,
+    autoPostProcessing,
+    autoPostQueue.length,
+    showToast,
+  ]);
 
   const handleStopOpenPost = async () => {
     const run = openPostRunRef.current;
@@ -1885,16 +2229,64 @@ function App() {
       return;
     }
 
-    const profilesToLaunch = visibleProfiles.filter(p =>
+    // Le registre dit qui a deja retweete ce tweet precis. Sans lui, un post
+    // renvoye par le relais rouvrait les 47 instances, y compris les 25 qui
+    // l'avaient deja fait -- 50 secondes perdues chacune, pendant qu'un post
+    // plus recent attendait son tour.
+    const idTweet = normalizedUrl.match(/\/status\/(\d+)/)?.[1] || '';
+    let dejaFaits: string[] = [];
+    if (idTweet && window.electronAPI.openPost?.dejaFait) {
+      dejaFaits = await window.electronAPI.openPost.dejaFait(idTweet).catch(() => []);
+    }
+
+    const disponibles = visibleProfiles.filter(p =>
       profileIds.includes(p.id) &&
       !activeProfiles.includes(p.id) &&
       !(user && isLockedByOther(p, user.uid, currentDeviceName, currentInstallationId))
     );
-    const skippedCount = profileIds.length - profilesToLaunch.length;
+    const restants = disponibles.filter(p => !dejaFaits.includes(p.id));
+    const dejaCount = disponibles.length - restants.length;
+
+    // Les proxys en panne : on teste chacun une fois, puis on saute leurs
+    // instances. Un proxy injoignable fait perdre 65 secondes par instance
+    // et par tour -- et il revient souvent tout seul une heure plus tard,
+    // donc on ne change surtout pas l'adresse du compte pour autant.
+    let profilesToLaunch = restants;
+    let proxyCount = 0;
+    if (window.electronAPI.proxysSante?.tester) {
+      const testes = new Map<string, boolean>();
+      const vivants: typeof restants = [];
+      for (const profil of restants) {
+        const cle = profil.proxy?.host ? `${profil.proxy.host}:${profil.proxy.port}` : '';
+        if (!cle) { vivants.push(profil); continue; }
+        if (!testes.has(cle)) {
+          const r = await window.electronAPI.proxysSante.tester(profil.proxy).catch(() => null);
+          testes.set(cle, r ? r.ok : true);
+        }
+        if (testes.get(cle)) vivants.push(profil); else proxyCount++;
+      }
+      profilesToLaunch = vivants;
+    }
+    if (proxyCount > 0) {
+      showToast(`${proxyCount} instance(s) sautée(s) — proxy injoignable`, 'warning');
+    }
+    if (dejaCount > 0) {
+      showToast(`${dejaCount} instance(s) ont déjà retweeté ce post — sautées`, 'info');
+    }
+    const skippedCount = profileIds.length - disponibles.length;
 
     if (profilesToLaunch.length === 0) {
       showToast('No available instance in this folder', 'info');
       return;
+    }
+
+    // Table rase avant le tour : sinon le recapitulatif melangerait deux tours.
+    resultatsTourRef.current = new Map();
+    for (const profil of profilesToLaunch) {
+      resultatsTourRef.current.set(profil.id, {
+        nom: profil.name, pageChargee: false, tweetTrouve: false,
+        retweet: false, like: false, panne: '',
+      });
     }
 
     const runState = {
@@ -2011,14 +2403,47 @@ function App() {
     setIsOpenPostRunning(false);
     setBulkLaunching(null);
     if (wasCancelled) return;
-    const failedCount = profilesToLaunch.length - launchedCount;
-    const summary = [
-      `${launchedCount} opened`,
-      timedOutCount > 0 ? `${timedOutCount} ignored (timeout)` : '',
-      failedCount > 0 ? `${failedCount} failed` : '',
-      skippedCount > 0 ? `${skippedCount} already open or unavailable` : '',
-    ].filter(Boolean).join(', ');
-    showToast(summary, failedCount === 0 ? 'success' : 'warning');
+
+    // Le recapitulatif du tour : qui a retweete, qui n'a pas, et pourquoi.
+    // Une instance ouverte n'est pas une instance qui a agi -- c'est toute la
+    // difference que ce tableau rend visible.
+    const resultats = profilesToLaunch.map(profil => {
+      const r = resultatsTourRef.current.get(profil.id) || {
+        nom: profil.name, pageChargee: false, tweetTrouve: false,
+        retweet: false, like: false, panne: '',
+      };
+      const panne = r.panne
+        || (r.retweet ? '' : !r.pageChargee ? 'Jamais arrivée jusqu’à la page'
+          : !r.tweetTrouve ? 'Tweet introuvable dans la page'
+          : 'Tweet vu, retweet non confirmé');
+      return { profileId: profil.id, ...r, nom: profil.name, panne };
+    });
+
+    setRecapTour({ quand: new Date().toISOString(), postUrl: normalizedUrl, resultats });
+
+    // Ecrit sur la fiche de l'instance : le tour se joue sur le VPS, on le
+    // regarde depuis le PC. Sans passer par Firebase, ce resultat resterait
+    // sur la machine qui a tourne.
+    void Promise.allSettled(resultats.map(r => firestoreUpdateProfile(r.profileId, {
+      lastOpenPost: {
+        quand: new Date().toISOString(),
+        postUrl: normalizedUrl,
+        retweet: r.retweet,
+        like: r.like,
+        panne: r.panne,
+      },
+    } as any))).catch(() => {});
+
+    const retweets = resultats.filter(r => r.retweet).length;
+    const rates = resultats.length - retweets;
+    showToast(
+      [
+        `Tour terminé — ${retweets} retweet(s), ${rates} en échec`,
+        timedOutCount > 0 ? `${timedOutCount} ignored (timeout)` : '',
+        skippedCount > 0 ? `${skippedCount} non disponible(s)` : '',
+      ].filter(Boolean).join(', '),
+      rates === 0 ? 'success' : 'warning'
+    );
   };
 
   const handleCreateFolder = async (folderData: any) => {
@@ -2068,6 +2493,52 @@ function App() {
     }
   };
 
+  /* Mass post automatique : un lot toutes les N heures sur un dossier.
+     A ne pas confondre avec Auto Post juste au-dessus, qui reagit a une
+     publication du bot. Celui-ci n'attend rien : il publie tout seul. */
+  const handleToggleMassPostAuto = (folderId: string) => {
+    const disabling = Boolean(
+      settings.massPostAutoEnabled && settings.massPostAutoFolderId === folderId
+    );
+    handleSettingsChange({
+      massPostAutoEnabled: !disabling,
+      massPostAutoFolderId: folderId,
+      massPostAutoHours: settings.massPostAutoHours || 6,
+      /* On repart de maintenant : allumer le bouton ne doit pas declencher
+         un lot dans la seconde a cause d'un ancien horodatage. */
+      massPostAutoLastRun: disabling ? settings.massPostAutoLastRun : Date.now(),
+    });
+    showToast(
+      disabling
+        ? 'Mass post automatique désactivé'
+        : `Mass post automatique : un lot toutes les ${settings.massPostAutoHours || 6} h`,
+      disabling ? 'warning' : 'success'
+    );
+  };
+
+  const handleMassPostAutoRan = (quand: number) => {
+    handleSettingsChange({ massPostAutoLastRun: quand });
+  };
+
+  const handleToggleAutoPost = (folderId: string) => {
+    const disabling = Boolean(
+      settings.autoPostEnabled && settings.autoPostFolderId === folderId
+    );
+    handleSettingsChange({
+      autoPostEnabled: !disabling,
+      autoPostFolderId: folderId,
+    });
+    if (disabling) {
+      autoPostEnabledRef.current = false;
+      setAutoPostQueue([]);
+      setAutoPostNotice(null);
+      showToast('Auto Post désactivé', 'warning');
+    } else {
+      autoPostEnabledRef.current = true;
+      showToast('Auto Post en écoute', 'success');
+    }
+  };
+
   // Filter profiles: exclude deleted, and for VA only show assigned
   const vaAssignedFolderIds = (() => {
     if (user?.role !== 'va' || !user.assignedFolderId) return new Set<string>();
@@ -2101,6 +2572,102 @@ function App() {
     : folders;
 
   const deletedProfiles = profiles.filter(p => p.deleted);
+
+  useEffect(() => {
+    if (
+      !settings.autoPostEnabled ||
+      !settings.autoPostFolderId ||
+      autoPostProcessing ||
+      isOpenPostRunning ||
+      autoPostQueue.length === 0
+    ) return;
+
+    const event = autoPostQueue[0];
+    const completeRelayEvent = async (success: boolean) => {
+      if (
+        !event.claimToken ||
+        !activeWorkspaceTeamId ||
+        !currentInstallationId ||
+        !window.electronAPI.autoPost?.complete ||
+        !auth.currentUser
+      ) return;
+      const idToken = await auth.currentUser.getIdToken();
+      await window.electronAPI.autoPost.complete({
+        idToken,
+        teamId: activeWorkspaceTeamId,
+        installationId: currentInstallationId,
+        eventId: event.id,
+        claimToken: event.claimToken,
+        success,
+      });
+    };
+    const folderIds = new Set<string>([settings.autoPostFolderId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const folder of visibleFolders) {
+        if (folder.parentId && folderIds.has(folder.parentId) && !folderIds.has(folder.id)) {
+          folderIds.add(folder.id);
+          changed = true;
+        }
+      }
+    }
+    const profileIds = visibleProfiles
+      .filter(profile => Boolean(profile.folderId && folderIds.has(profile.folderId)))
+      .map(profile => profile.id);
+
+    if (profileIds.length === 0) {
+      setAutoPostQueue(current => current.slice(1));
+      showToast('Auto Post: le dossier configuré ne contient aucune instance', 'warning');
+      void completeRelayEvent(false).catch(() => {});
+      return;
+    }
+
+    setAutoPostProcessing(true);
+    const startAutomaticOpenPost = async () => {
+      // Leave the received state visible long enough for the operator to see
+      // the URL being filled before the existing Open Post action starts.
+      await new Promise(resolve => setTimeout(resolve, 750));
+      if (!autoPostEnabledRef.current) throw new Error('Auto Post disabled');
+      setAutoPostNotice(current =>
+        current?.postUrl === event.postUrl
+          ? { ...current, status: 'processing' }
+          : current
+      );
+      await handleOpenTweetInFolder(profileIds, event.postUrl);
+      await completeRelayEvent(true);
+      setAutoPostNotice(current =>
+        current?.postUrl === event.postUrl
+          ? { ...current, status: 'completed' }
+          : current
+      );
+    };
+
+    void startAutomaticOpenPost()
+      .catch(async (error) => {
+        console.error('Auto Post failed:', error);
+        await completeRelayEvent(false).catch(() => {});
+        setAutoPostNotice(current =>
+          current?.postUrl === event.postUrl
+            ? { ...current, status: 'failed' }
+            : current
+        );
+      })
+      .finally(() => {
+        setAutoPostQueue(current => current.filter(item => item.id !== event.id));
+        setAutoPostProcessing(false);
+      });
+  }, [
+    settings.autoPostEnabled,
+    settings.autoPostFolderId,
+    autoPostProcessing,
+    isOpenPostRunning,
+    autoPostQueue,
+    visibleFolders,
+    visibleProfiles,
+    activeWorkspaceTeamId,
+    currentInstallationId,
+  ]);
 
   const profileCounts = visibleProfiles.reduce((acc, profile) => {
     if (profile.folderId) {
@@ -2138,6 +2705,19 @@ function App() {
             bulkLaunching={bulkLaunching}
             isOpenPostRunning={isOpenPostRunning}
             onStopOpenPost={handleStopOpenPost}
+            autoPostEnabled={Boolean(settings.autoPostEnabled)}
+            autoPostFolderId={settings.autoPostFolderId || null}
+            autoPostProcessing={autoPostProcessing}
+            autoPostQueueCount={autoPostQueue.length}
+            autoPostNotice={autoPostNotice}
+            onDismissAutoPostNotice={() => setAutoPostNotice(null)}
+            onToggleAutoPost={handleToggleAutoPost}
+            massPostAutoEnabled={Boolean(settings.massPostAutoEnabled)}
+            massPostAutoFolderId={settings.massPostAutoFolderId || null}
+            massPostAutoHours={Number(settings.massPostAutoHours) || 6}
+            massPostAutoLastRun={Number(settings.massPostAutoLastRun) || 0}
+            onToggleMassPostAuto={handleToggleMassPostAuto}
+            onMassPostAutoRan={handleMassPostAutoRan}
             sessionImportProgress={sessionImportProgress}
             onImportSessions={handleImportSessions}
             onStopSessionImport={handleStopSessionImport}
@@ -2164,6 +2744,7 @@ function App() {
         return hasAdminAccess ? (
           <VaManagerPage
             profiles={visibleProfiles}
+            folders={visibleFolders}
             onUpdateProfile={handleUpdateVaManagerLink}
             onCreateAndConnect={handleCreateVaManagerInstances}
             onRetryConnection={handleRetryVaManagerConnection}
@@ -2323,6 +2904,77 @@ function App() {
 
         {updateInfo && (
           <ForceUpdateModal version={updateInfo.version} releaseNotes={updateInfo.releaseNotes} downloadPercent={updatePercent} downloaded={updateDownloaded} />
+        )}
+
+        {/* Recapitulatif de fin de tour : qui a retweete, qui n'a pas, et
+            pourquoi. Une instance ouverte n'est pas une instance qui a agi. */}
+        {recapTour && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-5"
+            style={{ background: 'rgba(0,0,0,0.72)' }}
+            onMouseDown={e => { if (e.target === e.currentTarget) setRecapTour(null); }}
+          >
+            <div
+              className="w-full max-w-3xl rounded-2xl p-5 max-h-[86vh] overflow-auto"
+              style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-default)' }}
+            >
+              <div className="flex items-center justify-between mb-1">
+                <div className="text-base font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  Tour terminé — {recapTour.resultats.filter(r => r.retweet).length} retweet(s)
+                  {' '}sur {recapTour.resultats.length}
+                </div>
+                <button onClick={() => setRecapTour(null)} style={{ color: 'var(--text-muted)' }}>✕</button>
+              </div>
+              <a
+                href={recapTour.postUrl} target="_blank" rel="noreferrer"
+                className="text-xs underline"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {recapTour.postUrl}
+              </a>
+
+              {(() => {
+                const rates = recapTour.resultats.filter(r => !r.retweet);
+                const reussis = recapTour.resultats.filter(r => r.retweet);
+                const bloc = (titre: string, liste: typeof recapTour.resultats, couleur: string) => (
+                  liste.length === 0 ? null : (
+                    <div className="mt-4">
+                      <div className="text-xs font-semibold mb-1.5" style={{ color: couleur }}>
+                        {titre} — {liste.length}
+                      </div>
+                      <div className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--border-subtle)' }}>
+                        {liste.map(r => (
+                          <div
+                            key={r.profileId}
+                            className="flex items-center gap-3 px-3 py-1.5 text-[12px]"
+                            style={{ borderTop: '1px solid var(--border-subtle)', color: 'var(--text-secondary)' }}
+                          >
+                            <span className="flex-1 truncate" style={{ color: 'var(--text-primary)' }}>{r.nom}</span>
+                            <span style={{ color: r.retweet ? 'var(--success)' : '#f87171' }}>
+                              {r.retweet ? 'RT ✓' : 'RT ✕'}
+                            </span>
+                            <span style={{ color: r.like ? 'var(--success)' : 'var(--text-muted)' }}>
+                              {r.like ? 'Like ✓' : 'Like ✕'}
+                            </span>
+                            <span className="w-64 truncate text-right" style={{ color: 'var(--text-muted)' }}>
+                              {r.panne}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                );
+                return (
+                  <>
+                    {/* Les echecs d'abord : c'est la liste sur laquelle on agit. */}
+                    {bloc('N’ont pas retweeté', rates, '#f87171')}
+                    {bloc('Ont retweeté', reussis, 'var(--success, #22c55e)')}
+                  </>
+                );
+              })()}
+            </div>
+          </div>
         )}
       </div>
     </AuthProvider>

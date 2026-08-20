@@ -9,11 +9,26 @@ import { ChromeLauncher } from './chrome-launcher';
 import { resolveLaunchMode } from '../shared/launch-policy';
 import { hasAuthenticatedXSession } from '../shared/x-auth-snapshot';
 import { PuppeteerLauncher } from './puppeteer-launcher';
+import {
+  preparerDossierBranding,
+  attribuerBranding,
+  lireEtatBranding,
+  ecrireTextesBranding,
+  ajouterImagesBranding,
+  supprimerImagesBranding,
+  tirerPublication,
+  lireResultats,
+  ecrireResultat,
+  rendrePublication,
+  marquerEcartee,
+} from './branding-manager';
+import { noterResultat, dejaRetweete, resultatsDuTweet, bilanParTweet } from './registre-openpost';
+import { cleProxy, testerProxy, noterTest, enPanne, lireSante, remplacementJustifie } from './sante-proxys';
 import { UrlTrackingServer } from './url-server';
 import ProxyManager from './proxy-manager';
 import NetworkManager from './network-manager';
 import { installExtension, updateExtension, getInstalledExtensions, removeExtension, getExtensionPaths, zipExtension, readZipFile, downloadAndInstallExtension } from './extension-manager';
-import { generateFingerprint } from './fingerprint-generator';
+import { generateFingerprint, hostDefaultOS } from './fingerprint-generator';
 import {
   zipProfileDir,
   unzipProfileDir,
@@ -253,6 +268,15 @@ async function launchProfileBrowser(profileId: string, profileData: any) {
       autoStartTwitterBot: profileData.autoStartTwitterBot === true,
       targetTweetUrl: profileData.targetTweetUrl,
       sessionImport: profileData.sessionImport,
+      // Cette liste est reconstruite champ par champ : tout ce qui n'y figure
+      // pas est perdu en silence. Le branding et le modele de robot etaient
+      // demandes, transmis, puis jetes ici -- la fenetre s'ouvrait et il ne se
+      // passait rien.
+      branding: profileData.branding,
+      massPost: profileData.massPost,
+      folderId: profileData.folderId,
+      botTemplate: profileData.botTemplate,
+      botTemplateApplied: profileData.botTemplateApplied,
     });
 
     // Check if Chrome returned an error because profile is already running
@@ -542,12 +566,123 @@ ipcMain.on('internal:save-cookies', (_, profileId, cookies, acknowledge) => {
   }
 });
 
+ipcMain.on('internal:auto-post-event', (_, payload) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('autoPost:event', payload);
+  }
+});
+
+const AUTO_POST_RELAY_ORIGIN = 'https://venusbot-dashboard.vercel.app';
+
+function validateAutoPostRelayPayload(payload: any): void {
+  if (!payload || typeof payload !== 'object') throw new Error('Invalid Auto Post relay payload');
+  if (typeof payload.idToken !== 'string' || payload.idToken.length < 100 || payload.idToken.length > 8192) {
+    throw new Error('Invalid Spectra session token');
+  }
+  for (const field of ['teamId', 'installationId']) {
+    if (typeof payload[field] !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(payload[field])) {
+      throw new Error(`Invalid ${field}`);
+    }
+  }
+}
+
+async function callAutoPostRelay(pathname: string, payload: any): Promise<any> {
+  validateAutoPostRelayPayload(payload);
+  const response = await fetch(`${AUTO_POST_RELAY_ORIGIN}${pathname}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${payload.idToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ ...payload, idToken: undefined }),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok || !result?.ok) {
+    throw new Error(result?.error || `Auto Post relay HTTP ${response.status}`);
+  }
+  return result;
+}
+
+ipcMain.handle('autoPost:claimNext', async (_, payload) =>
+  callAutoPostRelay('/api/spectra/auto-post/next', payload)
+);
+
+ipcMain.handle('autoPost:complete', async (_, payload) => {
+  validateAutoPostRelayPayload(payload);
+  if (typeof payload.eventId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(payload.eventId)) {
+    throw new Error('Invalid Auto Post event ID');
+  }
+  if (typeof payload.claimToken !== 'string' || !/^[a-f0-9]{48}$/.test(payload.claimToken)) {
+    throw new Error('Invalid Auto Post claim token');
+  }
+  return callAutoPostRelay('/api/spectra/auto-post/complete', payload);
+});
+
 ipcMain.on('internal:launch-status', (_, payload) => {
   PuppeteerLauncher.reportLaunchStatus(payload);
 });
 
+/**
+ * Les evenements d'un tour Open Post interessent l'interface, pas seulement le
+ * disque.
+ *
+ * Jusqu'ici ils n'allaient que dans le journal du profil, sur la machine qui a
+ * tourne : savoir quelles instances avaient retweete demandait d'ouvrir une
+ * session distante et de lire des fichiers a la main. C'est exactement ce
+ * qu'on remplace.
+ */
+const EVENEMENTS_TOUR = [
+  'open-post-content-loaded',
+  'open-post-target-found',
+  'open-post-target-not-found',
+  'open-post-repost-result',
+  'open-post-like-result',
+  'bootstrap-failed',
+  // Le verdict lu sur la page, envoye en direct sans passer par l'extension.
+  'open-post-verdict',
+];
+
 ipcMain.on('internal:lifecycle-event', (_, payload) => {
   PuppeteerLauncher.reportLifecycleEvent(payload);
+
+  const event = String(payload?.event || '');
+  if (!EVENEMENTS_TOUR.includes(event)) return;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const details = (payload?.details && typeof payload.details === 'object'
+    ? payload.details
+    : {}) as Record<string, unknown>;
+  // Le verdict entre au registre : c'est la seule trace qui survit a un
+  // redemarrage, et celle qui evite de rouvrir une instance ayant deja fait
+  // le travail.
+  if (event === 'open-post-verdict' && details.tweet) {
+    noterResultat({
+      tweet: String(details.tweet),
+      profileId: String(payload?.profileId || ''),
+      retweet: details.retweet === true,
+      like: details.like === true,
+      quand: new Date().toISOString(),
+      panne: String(details.panne || ''),
+    });
+  }
+
+  mainWindow.webContents.send('openPost:event', {
+    profileId: String(payload?.profileId || ''),
+    event,
+    status: String(details.status || ''),
+    raison: String(details.raison || ''),
+    // Ce que le bot avait sous les yeux quand il n'a pas trouve le tweet :
+    // verification humaine, mur de connexion, compte suspendu... Trois pannes
+    // qui se ressemblent dans le journal et se reparent differemment.
+    cause: String(details.cause || ''),
+    apercu: String(details.apercu || '').slice(0, 200),
+    // Combien d'articles la page contenait : distingue une page vide d'un
+    // selecteur qui ne correspond plus a ce que X affiche.
+    articlesTweet: Number(details.articlesTweet ?? -1),
+    articlesTous: Number(details.articlesTous ?? -1),
+    marqueurs: String(details.marqueurs || '').slice(0, 200),
+    retweet: details.retweet === true,
+    like: details.like === true,
+  });
 });
 
 ipcMain.on('internal:session-import-status', (_, payload) => {
@@ -561,6 +696,291 @@ ipcMain.on('internal:session-import-status', (_, payload) => {
   clearTimeout(waiter.timeout);
   sessionImportWaiters.delete(payload.attemptId);
   waiter.resolve({ status: payload.status, message: payload.message || '' });
+});
+
+// Une instance modele vient de publier ses reglages : on les range pour son
+// dossier. Ils restent sur cette machine -- ils contiennent les photos et les
+// videos du robot, bien trop volumineux pour une fiche Firestore.
+ipcMain.on('internal:bot-template', (_, dossierId, profileId, reglages) => {
+  try {
+    assertSafeId(String(dossierId || ''), 'folder ID');
+    assertSafeId(String(profileId || ''), 'profile ID');
+    PuppeteerLauncher.enregistrerModeleBot(String(dossierId), String(profileId), reglages);
+  } catch (error) {
+    console.warn('[Spectra Modele] Enregistrement refuse:', error);
+  }
+});
+
+// Un branding vient de se terminer dans une fenetre : on reveille celui qui
+// attend, exactement comme pour une connexion.
+const brandingWaiters = new Map<
+  string,
+  { resolve: (r: { status: string; message: string }) => void; timeout: NodeJS.Timeout }
+>();
+
+ipcMain.on('internal:branding-status', (_, payload) => {
+  if (!payload || typeof payload.attemptId !== 'string') return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('branding:status', payload);
+  }
+  if (!['success', 'failed'].includes(payload.status)) return;
+  const waiter = brandingWaiters.get(payload.attemptId);
+  if (!waiter) return;
+  clearTimeout(waiter.timeout);
+  brandingWaiters.delete(payload.attemptId);
+  waiter.resolve({ status: payload.status, message: payload.message || '' });
+});
+
+/**
+ * Pose le branding sur un compte, puis referme la fenetre.
+ *
+ * Un compte a la fois : c'est l'appelant qui enchaine. Deux fenetres qui
+ * modifient un profil X en meme temps sur le meme poste, c'est le meilleur
+ * moyen de faire echouer les deux.
+ */
+ipcMain.handle('branding:apply', async (_, profileData, placement) => {
+  const profileId = String(profileData?.id || '');
+  // Un seul lot pour tout le parc : on le remplit une fois, et aucune instance
+  // ne partage son visage avec une autre, quel que soit son dossier.
+  const folderId = 'tous';
+  assertSafeId(profileId, 'profile ID');
+
+  // Le tirage vit dans le processus principal : c'est lui qui lit le lot sur le
+  // disque et retient qui a recu quoi.
+  const racine = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+  const tirage = attribuerBranding(
+    racine,
+    folderId,
+    profileId,
+    String(profileData?.proxy?.country || '') || null
+  );
+  const choix = tirage.attribution;
+  if (!choix.photo && !choix.banniere && !choix.bio && !choix.nom && !choix.lien && !choix.lieu) {
+    return { status: 'failed', message: 'Le dossier de branding est vide' };
+  }
+
+  // Les images partent en data URL : le script les redonne au champ de fichier
+  // comme si elles venaient d'etre choisies a la main.
+  const enDataUrl = (chemin: string | null): string | null => {
+    if (!chemin || !fs.existsSync(chemin)) return null;
+    const type = path.extname(chemin).toLowerCase() === '.png' ? 'image/png'
+      : path.extname(chemin).toLowerCase() === '.webp' ? 'image/webp'
+      : 'image/jpeg';
+    return `data:${type};base64,${fs.readFileSync(chemin).toString('base64')}`;
+  };
+  const branding = {
+    nom: choix.nom,
+    bio: choix.bio,
+    lien: choix.lien,
+    lieu: choix.lieu,
+    photo: enDataUrl(choix.photo),
+    banniere: enDataUrl(choix.banniere),
+    doublons: tirage.doublons,
+  };
+
+  const attemptId = crypto.randomUUID();
+  const resultat = new Promise<{ status: string; message: string }>((resolve) => {
+    const timeout = setTimeout(() => {
+      brandingWaiters.delete(attemptId);
+      resolve({ status: 'failed', message: 'Délai de branding dépassé' });
+    }, 3 * 60 * 1000);
+    brandingWaiters.set(attemptId, { resolve, timeout });
+  });
+
+  const lancement = await launchProfileBrowser(profileId, {
+    ...profileData,
+    lastUrl: 'https://x.com/settings/profile',
+    launchMode: 'automation',
+    autoStartTwitterBot: false,
+    targetTweetUrl: undefined,
+    branding: { ...branding, attemptId },
+    // La place a l'ecran vient de l'appelant : c'est lui qui sait combien de
+    // fenetres tournent ensemble, et donc comment les aligner.
+    windowLayout: {
+      index: Number(placement?.index) || 0,
+      total: Number(placement?.total) || 1,
+    },
+  });
+  if (!lancement.success) {
+    const waiter = brandingWaiters.get(attemptId);
+    if (waiter) clearTimeout(waiter.timeout);
+    brandingWaiters.delete(attemptId);
+    return { status: 'failed', message: lancement.error || 'Impossible d’ouvrir le profil' };
+  }
+
+  const fin = await resultat;
+  ecrireResultat(racine, folderId, profileId, 'branding', {
+    statut: fin.status === 'success' ? 'reussi' : 'echoue',
+    quand: new Date().toISOString(),
+    message: fin.message || '',
+  });
+  // Comme pour la connexion : une reussite se referme vite, un echec laisse le
+  // temps de lire l'ecran.
+  if (fin.status === 'success') {
+    await new Promise((suite) => setTimeout(suite, 1500));
+    await PuppeteerLauncher.closeProfile(profileId).catch(() =>
+      PuppeteerLauncher.forceCloseProfile(profileId)
+    );
+  } else {
+    setTimeout(() => {
+      PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
+    }, 90_000);
+  }
+  return fin;
+});
+
+/**
+ * Publie un post depuis une instance.
+ *
+ * Le tirage se fait ici, juste avant l'ouverture : deux instances lancees en
+ * meme temps demandent chacune sa part, et l'historique ecrit sur le disque
+ * empeche qu'elles tombent sur le meme texte.
+ */
+ipcMain.handle('massPost:apply', async (_, profileData, placement) => {
+  const profileId = String(profileData?.id || '');
+  const folderId = 'tous';
+  assertSafeId(profileId, 'profile ID');
+
+  const racine = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+  const tirage = tirerPublication(racine, folderId, profileId);
+  if (!tirage.post && !tirage.media) {
+    return { status: 'failed', message: 'Aucun post ni média à publier' };
+  }
+
+  // Un media part en data URL, comme les images du branding. Au-dela de 40 Mo
+  // on refuse : le fichier est recopie dans le script de l'extension, et une
+  // video de cette taille rendrait le lancement interminable.
+  let media: string | null = null;
+  let nomMedia: string | null = null;
+  if (tirage.media && fs.existsSync(tirage.media)) {
+    const taille = fs.statSync(tirage.media).size;
+    if (taille > 40 * 1024 * 1024) {
+      return {
+        status: 'failed',
+        message: `Média trop lourd (${Math.round(taille / 1024 / 1024)} Mo, maximum 40)`,
+      };
+    }
+    const extension = path.extname(tirage.media).toLowerCase();
+    const type = extension === '.png' ? 'image/png'
+      : extension === '.webp' ? 'image/webp'
+      : extension === '.gif' ? 'image/gif'
+      : extension === '.mp4' ? 'video/mp4'
+      : extension === '.mov' ? 'video/quicktime'
+      : 'image/jpeg';
+    media = `data:${type};base64,${fs.readFileSync(tirage.media).toString('base64')}`;
+    nomMedia = path.basename(tirage.media);
+  }
+
+  const attemptId = crypto.randomUUID();
+  const resultat = new Promise<{ status: string; message: string }>((resolve) => {
+    const timeout = setTimeout(() => {
+      brandingWaiters.delete(attemptId);
+      resolve({ status: 'failed', message: 'Délai de publication dépassé' });
+      // Large : une video peut mettre plusieurs minutes a etre acceptee par X,
+      // et le script attend l'apercu, puis l'envoi, puis l'allumage du bouton.
+    }, 10 * 60 * 1000);
+    brandingWaiters.set(attemptId, { resolve, timeout });
+  });
+
+  const lancement = await launchProfileBrowser(profileId, {
+    ...profileData,
+    lastUrl: 'https://x.com/compose/post',
+    launchMode: 'automation',
+    autoStartTwitterBot: false,
+    targetTweetUrl: undefined,
+    massPost: { attemptId, texte: tirage.post, media, nomMedia },
+    windowLayout: {
+      index: Number(placement?.index) || 0,
+      total: Number(placement?.total) || 1,
+    },
+  });
+  if (!lancement.success) {
+    const waiter = brandingWaiters.get(attemptId);
+    if (waiter) clearTimeout(waiter.timeout);
+    brandingWaiters.delete(attemptId);
+    return { status: 'failed', message: lancement.error || 'Impossible d’ouvrir le profil' };
+  }
+
+  const fin = await resultat;
+  const apercu = tirage.post ? String(tirage.post).slice(0, 60) : null;
+  ecrireResultat(racine, folderId, profileId, 'post', {
+    statut: fin.status === 'success' ? 'reussi' : 'echoue',
+    quand: new Date().toISOString(),
+    message: fin.message || '',
+    apercu,
+  });
+  // Un post qui n'est pas parti doit revenir dans la reserve : sinon une serie
+  // d'echecs la viderait sans qu'une seule publication ait ete envoyee.
+  if (fin.status !== 'success') {
+    rendrePublication(racine, folderId, profileId, tirage.post, tirage.media);
+  }
+  if (fin.status === 'success') {
+    await new Promise((suite) => setTimeout(suite, 1500));
+    await PuppeteerLauncher.closeProfile(profileId).catch(() =>
+      PuppeteerLauncher.forceCloseProfile(profileId)
+    );
+  } else {
+    setTimeout(() => {
+      PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
+    }, 90_000);
+  }
+  // Dire ce qui est parti : sans cela, un post repete passerait inapercu.
+  return { ...fin, epuise: tirage.epuise, apercu };
+});
+
+/** Le registre : qui a deja retweete quoi. */
+/**
+ * Teste un proxy et met sa fiche a jour.
+ *
+ * Un proxy tombe rarement pour toujours : on le teste avant chaque tour
+ * plutot que de le declarer mort au premier echec.
+ */
+ipcMain.handle('proxys:tester', async (_, proxy: any) => {
+  const cle = cleProxy(proxy);
+  if (!cle) return { cle: '', ok: true, enPanne: false };
+  const ok = await testerProxy(proxy);
+  const fiche = noterTest(cle, ok);
+  return { cle, ok, enPanne: fiche.enPanne, echecs: fiche.echecs, depuis: fiche.depuis,
+    remplacementJustifie: remplacementJustifie(cle) };
+});
+
+ipcMain.handle('proxys:sante', async () => lireSante());
+
+ipcMain.handle('proxys:enPanne', async (_, proxy: any) => enPanne(cleProxy(proxy)));
+
+ipcMain.handle('openPost:dejaFait', async (_, tweet: string) => {
+  return Array.from(dejaRetweete(String(tweet || '')));
+});
+
+ipcMain.handle('openPost:registre', async (_, tweet: string) => {
+  return {
+    detail: resultatsDuTweet(String(tweet || '')),
+    parTweet: bilanParTweet(),
+  };
+});
+
+ipcMain.handle('branding:results', async (_, folderId: string) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  return lireResultats(racineBranding(), String(folderId));
+});
+
+ipcMain.handle('branding:setSkipped', async (
+  _, folderId: string, profileId: string, ecartee: boolean, raison: string
+) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  assertSafeId(String(profileId || ''), 'profile ID');
+  marquerEcartee(
+    racineBranding(), String(folderId), String(profileId),
+    Boolean(ecartee), String(raison || '').slice(0, 200)
+  );
+  return lireResultats(racineBranding(), String(folderId));
+});
+
+ipcMain.on('internal:bot-template-applied', (_, profileId, empreinte) => {
+  if (typeof profileId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(profileId)) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('bot:templateApplied', { profileId, empreinte });
+  }
 });
 
 ipcMain.on('internal:close-profile', (_, profileId) => {
@@ -735,7 +1155,10 @@ async function runSessionImport(
 
   const launchResult = await launchProfileBrowser(profileId, {
     ...profileData,
-    lastUrl: 'https://x.com/i/flow/login',
+    // L'accueil de X presente le champ identifiant directement. La page de
+    // connexion, elle, redirige vers un ecran a boite de dialogue ou le script
+    // ne retrouvait plus ses reperes.
+    lastUrl: 'https://x.com/',
     launchMode: 'session-import',
     autoStartTwitterBot: false,
     targetTweetUrl: undefined,
@@ -758,7 +1181,15 @@ async function runSessionImport(
       PuppeteerLauncher.forceCloseProfile(profileId)
     );
   } else if (result.status === 'failed') {
-    await PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
+    // La fenetre etait fermee sur-le-champ, c'est-a-dire exactement au moment
+    // ou il aurait fallu regarder l'ecran : message de X, compte suspendu,
+    // journal de connexion. On laisse une minute et demie pour lire.
+    //
+    // Sans `await` : une creation en lot enchaine tout de suite le compte
+    // suivant, la fermeture se fait de son cote.
+    setTimeout(() => {
+      PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
+    }, 90_000);
   }
   return result;
 }
@@ -799,6 +1230,62 @@ ipcMain.handle('sessionImport:stop', async (_, profileId?: string) => {
     await PuppeteerLauncher.forceCloseProfile(profileId).catch(() => {});
   }
   return true;
+});
+
+/**
+ * Ouvre le dossier ou deposer les photos, bannieres, bios, noms et lieux.
+ *
+ * Pas d'interface d'envoi de fichiers a construire ni a apprendre : on ouvre
+ * l'explorateur, l'utilisateur depose ce qu'il veut, quand il veut.
+ */
+const racineBranding = () =>
+  path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+
+ipcMain.handle('branding:read', async (_, folderId: string) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  return lireEtatBranding(racineBranding(), String(folderId));
+});
+
+ipcMain.handle('branding:saveTexts', async (_, folderId: string, textes: any) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  ecrireTextesBranding(racineBranding(), String(folderId), textes || {});
+  return lireEtatBranding(racineBranding(), String(folderId));
+});
+
+ipcMain.handle('branding:addImages', async (_, folderId: string, sorte: string) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  if (sorte !== 'photos' && sorte !== 'bannieres' && sorte !== 'medias') {
+    throw new Error('Sorte inconnue');
+  }
+  const choix = await dialog.showOpenDialog({
+    title: sorte === 'photos' ? 'Photos de profil'
+      : sorte === 'bannieres' ? 'Bannières'
+      : 'Médias à publier',
+    properties: ['openFile', 'multiSelections'],
+    filters: sorte === 'medias'
+      ? [{ name: 'Images et vidéos', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'mp4', 'mov'] }]
+      : [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp'] }],
+  });
+  if (choix.canceled || choix.filePaths.length === 0) return { ajoutees: 0 };
+  const ajoutees = ajouterImagesBranding(racineBranding(), String(folderId), sorte, choix.filePaths);
+  return { ajoutees, etat: lireEtatBranding(racineBranding(), String(folderId)) };
+});
+
+ipcMain.handle('branding:clearImages', async (_, folderId: string, sorte: string) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  if (sorte !== 'photos' && sorte !== 'bannieres' && sorte !== 'medias') {
+    throw new Error('Sorte inconnue');
+  }
+  const retirees = supprimerImagesBranding(racineBranding(), String(folderId), sorte);
+  return { retirees, etat: lireEtatBranding(racineBranding(), String(folderId)) };
+});
+
+ipcMain.handle('branding:openFolder', async (_, folderId: string) => {
+  assertSafeId(String(folderId || ''), 'folder ID');
+  const racine = path.join(os.homedir(), 'AppData', 'Local', 'AntidetectBrowser');
+  const chemin = preparerDossierBranding(racine, String(folderId));
+  await shell.openPath(chemin);
+  return chemin;
 });
 
 ipcMain.handle('profile:forceClose', async (_, profileId) => {
@@ -909,8 +1396,13 @@ ipcMain.handle('profile:cleanupLocal', (_, profileId: string) => {
 
 // Fingerprint generation
 ipcMain.handle('fingerprint:generate', (_, os?: string, browserType?: string, countryCode?: string) => {
-  console.log(`[Fingerprint] Generate request: os=${os}, browser=${browserType}, country=${countryCode}`);
-  return generateFingerprint(os as any, browserType as any, countryCode);
+  // 'auto' (ou rien) => le systeme de la machine hote, pour que l'empreinte ne
+  // contredise pas ce que le navigateur laisse fuir malgre nous.
+  const resolvedOS = !os || os === 'auto' ? hostDefaultOS() : os;
+  console.log(
+    `[Fingerprint] Generate request: os=${os} -> ${resolvedOS}, browser=${browserType}, country=${countryCode}`
+  );
+  return generateFingerprint(resolvedOS as any, browserType as any, countryCode);
 });
 
 ipcMain.handle('fingerprint:getPresets', () => {
@@ -1060,6 +1552,11 @@ ipcMain.handle('profile:setLocalSyncRevision', (_, profileId: string, revision: 
 
 ipcMain.handle('system:hostname', () => {
   return os.hostname();
+});
+
+// Systeme d'empreinte a proposer par defaut a la creation d'un profil.
+ipcMain.handle('system:fingerprintOS', () => {
+  return hostDefaultOS();
 });
 
 ipcMain.handle('system:installationId', () => {
