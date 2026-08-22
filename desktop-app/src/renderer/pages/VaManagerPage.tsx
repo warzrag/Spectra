@@ -188,6 +188,18 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
   // La creation demande une seule chose : ou ranger l'instance. `null` signifie
   // qu'aucune creation n'est en cours ; un tableau vide n'existe jamais.
   const [comptesACreer, setComptesACreer] = useState<VaManagerAccount[] | null>(null);
+  /* Un compte « en place » n'a plus rien a faire ici : son instance existe
+     et tout est branche. Le garder a l'ecran noyait ce qu'il restait a
+     traiter -- la liste ne faisait que grossir. On le masque, sans jamais
+     rien effacer chez VA Manager : c'est un affichage, pas une suppression.
+     Le choix est retenu d'une fois sur l'autre. */
+  const [montrerEnPlace, setMontrerEnPlace] = useState<boolean>(() => {
+    try { return localStorage.getItem('vaMontrerEnPlace') === 'oui'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem('vaMontrerEnPlace', montrerEnPlace ? 'oui' : 'non'); } catch { /* stockage refuse : tant pis */ }
+  }, [montrerEnPlace]);
+
   const [dossierChoisi, setDossierChoisi] = useState('__none__');
   // Les comptes coches a la main. Vide = on traite tout ce qui est pret, comme
   // avant : une selection vide ne doit pas bloquer le bouton.
@@ -378,6 +390,12 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
         if (auditFilter === 'all') return true;
         return etatParCompte.get(account.id)?.categorie === auditFilter;
       })
+      /* Cliquer la carte « En place » les fait revenir : c'est le geste
+         naturel quand on veut justement les revoir. */
+      .filter(account => {
+        if (montrerEnPlace || auditFilter === 'en-place') return true;
+        return etatParCompte.get(account.id)?.categorie !== 'en-place';
+      })
       .sort((a, b) => {
         if (sort === 'username') return a.username.localeCompare(b.username);
         const aFollowers = a.followers ?? -1;
@@ -386,7 +404,7 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
           ? aFollowers - bFollowers
           : bFollowers - aFollowers;
       });
-  }, [accounts, auditFilter, etatParCompte, filtreVa, search, sort, statusFilter]);
+  }, [accounts, auditFilter, etatParCompte, filtreVa, montrerEnPlace, search, sort, statusFilter]);
 
   // Chaque compte compte pour un, dans une seule case. Les quatre nombres
   // s'additionnent au total : plus de recouvrement, plus de doute.
@@ -732,6 +750,23 @@ const VaManagerPage: React.FC<VaManagerPageProps> = ({
             </button>
           ))}
         </div>
+
+        {enPlaceCount > 0 && (
+          <label
+            className="flex items-center gap-2 mb-4 cursor-pointer select-none text-[12.5px]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <input
+              type="checkbox"
+              checked={montrerEnPlace}
+              onChange={event => setMontrerEnPlace(event.target.checked)}
+              style={{ accentColor: 'var(--accent)', width: 15, height: 15, cursor: 'pointer' }}
+            />
+            {montrerEnPlace
+              ? `Les ${enPlaceCount} comptes déjà en place sont affichés`
+              : `${enPlaceCount} compte${enPlaceCount > 1 ? 's' : ''} déjà en place, masqué${enPlaceCount > 1 ? 's' : ''} — cocher pour les revoir`}
+          </label>
+        )}
 
         {importProgress && (
           <div
