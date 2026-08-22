@@ -70,6 +70,36 @@ export interface PuppeteerLaunchOptions {
   botTemplateApplied?: string;
 }
 
+/**
+ * Ecrit un script injecte, apres avoir verifie qu'il se compile.
+ *
+ * Le 22 aout 2026, le mass post n'a plus rien fait pendant des heures :
+ * une expression reguliere du script contenait un vrai saut de ligne --
+ * un « \n » ecrit « 
+ » dans le gabarit, donc transforme en retour a la
+ * ligne au moment de fabriquer le fichier. Chrome refusait tout le script,
+ * en silence. Le navigateur s'ouvrait sur x.com/home et restait la.
+ *
+ * new Function() analyse sans executer : c'est exactement le controle qui
+ * manquait. On ecrit quand meme -- refuser laisserait le profil sans
+ * script du tout, ce qui n'aide personne -- mais l'erreur est ecrite dans
+ * la console de Spectra, la ou on la verra.
+ */
+function ecrireScriptInjecte(chemin: string, code: string): void {
+  try {
+    // eslint-disable-next-line no-new-func
+    new Function(code);
+  } catch (erreur) {
+    console.error(
+      '[Spectra] Le script injecte ' + path.basename(chemin) +
+      ' ne se compile pas : ' + String(erreur && (erreur as Error).message) +
+      ' — Chrome le rejettera en entier et l’action ne fera rien.'
+    );
+  }
+  fs.writeFileSync(chemin, code);
+}
+
+
 export class PuppeteerLauncher {
   private static activeProfiles = new Map<string, any>();
   private static pendingProfiles = new Set<string>();
@@ -2889,7 +2919,7 @@ public class Win32 {
         } : {}),
       }));
       if (options.branding) {
-        fs.writeFileSync(path.join(cookieSyncPath, 'spectra-branding.js'),
+        ecrireScriptInjecte(path.join(cookieSyncPath, 'spectra-branding.js'),
 `(() => {
   if (window.__spectraBrandingInstalled) return;
   window.__spectraBrandingInstalled = true;
@@ -3250,7 +3280,7 @@ public class Win32 {
       }
 
       if (options.massPost) {
-        fs.writeFileSync(path.join(cookieSyncPath, 'spectra-mass-post.js'),
+        ecrireScriptInjecte(path.join(cookieSyncPath, 'spectra-mass-post.js'),
 `(() => {
   if (window.__spectraMassPostInstalled) return;
   window.__spectraMassPostInstalled = true;
@@ -3705,14 +3735,28 @@ public class Win32 {
       return;
     }
 
-    // La page dediee : un editeur seul, sans le fil autour.
-    if (!/\\/compose\\/post/.test(location.pathname)) {
-      journal('Je vais sur la page de publication', 'attente');
-      location.assign('https://x.com/compose/post');
+    /* On reste sur le fil, comme le fait VenusBot.
+       Le champ de publication est deja la, en haut de /home. Aller sur
+       /compose/post etait notre tout premier geste, et c'est la que ca
+       bloquait : la page s'ouvrait, l'editeur n'arrivait jamais, plus rien
+       ne bougeait. VenusBot ne quitte jamais le fil et publie tous les
+       jours. On fait pareil ; /compose/post ne sert plus que de secours. */
+    const surCompose = /\\/compose\\/post/.test(location.pathname);
+    if (!surCompose && !/\\/home/.test(location.pathname)) {
+      journal('Je vais sur le fil', 'attente');
+      location.assign('https://x.com/home');
       return;
     }
 
-    const editeur = await attendreElement(EDITEUR, 25000);
+    /* Douze secondes sur le fil, pas vingt-cinq : si le champ n'y est pas,
+       autant essayer la page dediee tout de suite plutot que d'attendre
+       pour rien. */
+    const editeur = await attendreElement(EDITEUR, surCompose ? 25000 : 12000);
+    if (!editeur && !surCompose) {
+      journal('Pas de champ sur le fil, j’ouvre la page de publication', 'attente');
+      location.assign('https://x.com/compose/post');
+      return;
+    }
     if (!editeur) {
       // La verification peut arriver apres coup, pendant qu'on attend.
       if (verificationHumaine()) {
@@ -3788,7 +3832,7 @@ public class Win32 {
         const editeur = document.querySelector('[data-testid="tweetTextarea_0"]');
         const longueur = editeur ? String(editeur.textContent || '').trim().length : -1;
         const media = document.querySelector('[data-testid="attachments"]');
-        const plainte = texte().match(/[^.\n]*(not supported|too long|too large|failed|couldn.t|non pris en charge|trop)[^.\n]*/i);
+        const plainte = texte().match(/[^.\\n]*(not supported|too long|too large|failed|couldn.t|non pris en charge|trop)[^.\\n]*/i);
         etat = ' — ' + (longueur < 0 ? 'éditeur absent' : longueur + ' caractères')
           + (media ? ', média joint' : ', sans média')
           + (plainte ? ', X dit : « ' + plainte[0].trim().slice(0, 60) + ' »' : '');
@@ -3806,7 +3850,11 @@ public class Win32 {
     while (Date.now() < finEnvoi) {
       const encore = chercher(EDITEUR);
       const vide = !encore || !String(encore.textContent || '').trim();
-      if (vide || !/\\/compose\\/post/.test(location.pathname)) {
+      /* L'editeur qui se vide est le signe sur : X a pris le texte.
+         Le changement de page ne vaut que si l'on etait sur /compose/post --
+         sur le fil on n'en bouge pas, et tester l'adresse ici declencherait
+         un faux succes des la premiere seconde. */
+      if (vide || (surCompose && !/\\/compose\\/post/.test(location.pathname))) {
         await rapport('success', 'Publication envoyée');
         return;
       }
@@ -3880,7 +3928,7 @@ public class Win32 {
           `http://127.0.0.1:${this.localServerConfig?.port || 0}/api/close-profile` +
           `?profileId=${encodeURIComponent(options.profileId)}` +
           `&token=${encodeURIComponent(this.localServerConfig?.token || '')}`;
-        fs.writeFileSync(path.join(cookieSyncPath, 'open-post-actions.js'),
+        ecrireScriptInjecte(path.join(cookieSyncPath, 'open-post-actions.js'),
 `(() => {
   if (window.__spectraOpenPostActionsStarted) return;
   window.__spectraOpenPostActionsStarted = true;
