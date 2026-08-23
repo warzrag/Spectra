@@ -2,9 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Plus, Trash2, RefreshCw, CheckCircle, XCircle, Download, Shield, Globe, X, Shuffle, Search, Copy, AlertCircle, Zap, Clock, Filter, ChevronDown, Link2, Unlink, FolderOpen } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
 import { Profile, Folder } from '../../types';
+import { proxyIdentityKey } from '../../shared/proxy-identity';
 import {
   subscribeToProxies,
-  createProxy as firestoreCreateProxy,
   createProxiesBulk,
   updateProxy as firestoreUpdateProxy,
   deleteProxy as firestoreDeleteProxy,
@@ -19,7 +19,8 @@ interface ProxyManagerPageProps {
   folders?: Folder[];
   onUpdateProfile?: (profileId: string, data: any) => Promise<void>;
   userId?: string;
-  teamId?: string;
+  teamId?: string | null;
+  teamScope?: string[];
 }
 
 type StatusFilter = 'all' | 'healthy' | 'failed' | 'untested';
@@ -40,7 +41,7 @@ function CountryFlag({ code }: { code: string }) {
   );
 }
 
-const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], folders = [], onUpdateProfile, userId, teamId }) => {
+const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], folders = [], onUpdateProfile, userId, teamId, teamScope }) => {
   const { showToast } = useToast();
   const [proxies, setProxies] = useState<Proxy[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
@@ -61,15 +62,16 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
   const [folderDropdownProxy, setFolderDropdownProxy] = useState<string | null>(null);
   const folderDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Subscribe to Firestore proxies (real-time sync, scoped by teamId)
+  // A null team scope is reserved for super admins and loads every agency.
   useEffect(() => {
-    if (!teamId) return;
-    const unsub = subscribeToProxies(teamId, (allProxies) => {
+    if (teamId === undefined) return;
+    setLoading(true);
+    const unsub = subscribeToProxies(teamScope?.length ? teamScope : teamId, (allProxies) => {
       setProxies(allProxies);
       setLoading(false);
     });
     return () => unsub();
-  }, [teamId]);
+  }, [teamId, teamScope]);
 
   // Close assign dropdown on click outside
   useEffect(() => {
@@ -121,21 +123,40 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
     return null;
   };
 
+  const analyzeBulkProxyText = () => {
+    const lines = bulkProxies.split('\n').filter(line => line.trim());
+    const parsed: Omit<Proxy, 'id'>[] = [];
+    const knownKeys = new Set(
+      proxies
+        .filter(proxy => !teamId || proxy.teamId === teamId)
+        .map(proxyIdentityKey)
+    );
+    let invalid = 0;
+    let duplicates = 0;
+    for (const line of lines) {
+      const proxy = parseProxyString(line.trim());
+      if (!proxy) {
+        invalid++;
+        continue;
+      }
+      const key = proxyIdentityKey(proxy);
+      if (knownKeys.has(key)) {
+        duplicates++;
+        continue;
+      }
+      knownKeys.add(key);
+      parsed.push(proxy);
+    }
+    return { parsed, duplicates, invalid, total: lines.length };
+  };
+
+  const bulkAnalysis = analyzeBulkProxyText();
+
   const handleAddBulkProxies = async () => {
     if (!bulkProxies.trim()) return;
     setAdding(true);
     try {
-      const lines = bulkProxies.split('\n').filter(l => l.trim());
-      const parsed: Omit<Proxy, 'id'>[] = [];
-      let failed = 0;
-      for (const line of lines) {
-        const proxy = parseProxyString(line.trim());
-        if (proxy) {
-          parsed.push(proxy);
-        } else {
-          failed++;
-        }
-      }
+      const { parsed, duplicates, invalid: failed } = analyzeBulkProxyText();
       if (parsed.length > 0) {
         // Clean undefined values (Firestore doesn't accept undefined)
         const cleaned = parsed.map(p => {
@@ -147,11 +168,12 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
         });
         await createProxiesBulk(cleaned, userId || 'unknown', teamId || '');
       }
-      if (failed > 0) {
-        showToast(`Added ${parsed.length} proxies, ${failed} failed (invalid format)`, parsed.length > 0 ? 'success' : 'error');
-      } else {
-        showToast(`Added ${parsed.length} proxies successfully`, 'success');
-      }
+      const summary = [
+        `${parsed.length} ajouté${parsed.length !== 1 ? 's' : ''}`,
+        duplicates ? `${duplicates} doublon${duplicates !== 1 ? 's' : ''} ignoré${duplicates !== 1 ? 's' : ''}` : '',
+        failed ? `${failed} ligne${failed !== 1 ? 's' : ''} invalide${failed !== 1 ? 's' : ''}` : '',
+      ].filter(Boolean).join(', ');
+      showToast(summary, parsed.length > 0 ? 'success' : duplicates > 0 && failed === 0 ? 'info' : 'error');
       setBulkProxies('');
       setAddProxyFolderId('');
       setShowAddModal(false);
@@ -174,10 +196,22 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
         const res = result as any;
         const isHealthy = res && typeof res === 'object' ? res.isHealthy : res;
         const country = res && typeof res === 'object' ? res.country : undefined;
+        const timezone = res && typeof res === 'object' ? res.timezone : undefined;
+        const city = res && typeof res === 'object' ? res.city : undefined;
+        const region = res && typeof res === 'object' ? res.region : undefined;
+        const latitude = res && typeof res === 'object' ? res.latitude : undefined;
+        const longitude = res && typeof res === 'object' ? res.longitude : undefined;
+        const exitIp = res && typeof res === 'object' ? res.exitIp : undefined;
         const lastCheck = new Date().toISOString();
         // Save test results to Firestore
         const updateData: any = { isHealthy, lastCheck, responseTime };
         if (country) updateData.country = country;
+        if (timezone) updateData.timezone = timezone;
+        if (city) updateData.city = city;
+        if (region) updateData.region = region;
+        if (Number.isFinite(latitude)) updateData.latitude = latitude;
+        if (Number.isFinite(longitude)) updateData.longitude = longitude;
+        if (exitIp) updateData.lastExitIp = exitIp;
         await firestoreUpdateProxy(proxyId, updateData).catch(() => {});
       }
     } finally {
@@ -201,9 +235,21 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
           const res = result as any;
           const isHealthy = res && typeof res === 'object' ? res.isHealthy : res;
           const country = res && typeof res === 'object' ? res.country : undefined;
+          const timezone = res && typeof res === 'object' ? res.timezone : undefined;
+          const city = res && typeof res === 'object' ? res.city : undefined;
+          const region = res && typeof res === 'object' ? res.region : undefined;
+          const latitude = res && typeof res === 'object' ? res.latitude : undefined;
+          const longitude = res && typeof res === 'object' ? res.longitude : undefined;
+          const exitIp = res && typeof res === 'object' ? res.exitIp : undefined;
           const lastCheck = new Date().toISOString();
           const updateData: any = { isHealthy, lastCheck, responseTime };
           if (country) updateData.country = country;
+          if (timezone) updateData.timezone = timezone;
+          if (city) updateData.city = city;
+          if (region) updateData.region = region;
+          if (Number.isFinite(latitude)) updateData.latitude = latitude;
+          if (Number.isFinite(longitude)) updateData.longitude = longitude;
+          if (exitIp) updateData.lastExitIp = exitIp;
           await firestoreUpdateProxy(proxy.id, updateData).catch(() => {});
         } finally {
           setTestingProxies(prev => {
@@ -227,26 +273,70 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
     showToast(`Tested ${selected.length} proxies`, 'success');
   };
 
+  const assignedProfileIdsFor = (targetProxies: Proxy[]) => {
+    const proxyKeys = new Set(targetProxies.map(proxy =>
+      `${proxy.teamId || ''}|${proxyIdentityKey(proxy)}`
+    ));
+
+    return profiles
+      .filter(profile => {
+        const assignedProxy = profile.proxy || profile.connectionConfig?.proxy;
+        if (!assignedProxy?.host) return false;
+        return proxyKeys.has(`${profile.teamId || ''}|${proxyIdentityKey(assignedProxy)}`);
+      })
+      .map(profile => profile.id);
+  };
+
   const removeProxy = async (proxyId: string) => {
     try {
-      await firestoreDeleteProxy(proxyId);
+      const proxy = proxies.find(item => item.id === proxyId);
+      if (!proxy) return;
+      const assignedProfileIds = assignedProfileIdsFor([proxy]);
+      if (
+        assignedProfileIds.length > 0 &&
+        !confirm(`Remove this proxy and detach it from ${assignedProfileIds.length} instance(s)?`)
+      ) {
+        return;
+      }
+      await firestoreDeleteProxy(proxyId, assignedProfileIds);
       setSelectedProxies(prev => {
         const next = new Set(prev);
         next.delete(proxyId);
         return next;
       });
+      showToast(
+        assignedProfileIds.length > 0
+          ? `Proxy removed from ${assignedProfileIds.length} instance(s)`
+          : 'Proxy removed',
+        'success'
+      );
     } catch (error) {
       console.error('Failed to remove proxy:', error);
+      showToast('Failed to remove proxy', 'error');
     }
   };
 
   const removeSelected = async () => {
     const count = selectedProxies.size;
-    if (!confirm(`Remove ${count} proxies?`)) return;
     const ids = Array.from(selectedProxies);
-    await deleteProxiesBulk(ids);
-    setSelectedProxies(new Set());
-    showToast(`Removed ${count} proxies`, 'success');
+    const targetProxies = proxies.filter(proxy => selectedProxies.has(proxy.id));
+    const assignedProfileIds = assignedProfileIdsFor(targetProxies);
+    const detachMessage = assignedProfileIds.length > 0
+      ? ` and detach them from ${assignedProfileIds.length} instance(s)`
+      : '';
+    if (!confirm(`Remove ${count} proxies${detachMessage}?`)) return;
+    try {
+      await deleteProxiesBulk(ids, assignedProfileIds);
+      setSelectedProxies(new Set());
+      showToast(
+        `Removed ${count} proxies` +
+          (assignedProfileIds.length > 0 ? ` from ${assignedProfileIds.length} instance(s)` : ''),
+        'success'
+      );
+    } catch (error) {
+      console.error('Bulk proxy removal failed:', error);
+      showToast('Failed to remove selected proxies', 'error');
+    }
   };
 
   // Assign a specific proxy to a specific profile
@@ -1135,6 +1225,31 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
                   </span>
                 )}
               </div>
+              {bulkAnalysis.total > 0 && (
+                <div
+                  className="mt-3 grid grid-cols-3 gap-2 rounded-xl p-3"
+                  style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)' }}
+                >
+                  <div className="text-center">
+                    <div className="text-sm font-bold" style={{ color: 'var(--success)' }}>
+                      {bulkAnalysis.parsed.length}
+                    </div>
+                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>À ajouter</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-sm font-bold" style={{ color: 'var(--warning)' }}>
+                      {bulkAnalysis.duplicates}
+                    </div>
+                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Doublons ignorés</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-sm font-bold" style={{ color: 'var(--danger)' }}>
+                      {bulkAnalysis.invalid}
+                    </div>
+                    <div className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Invalides</div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="px-6 py-4 flex justify-end gap-3" style={{ borderTop: '1px solid var(--border-subtle)' }}>
@@ -1144,11 +1259,13 @@ const ProxyManagerPage: React.FC<ProxyManagerPageProps> = ({ profiles = [], fold
                 Cancel
               </button>
               <button onClick={handleAddBulkProxies}
-                disabled={lineCount === 0 || adding}
+                disabled={bulkAnalysis.parsed.length === 0 || adding}
                 className="px-4 py-2 rounded-lg text-[13px] font-semibold text-white transition-all flex items-center gap-2 disabled:opacity-40"
                 style={{ background: 'var(--accent)' }}>
                 {adding ? <RefreshCw size={14} className="animate-spin" /> : <Plus size={14} />}
-                {adding ? 'Adding...' : `Add ${lineCount > 0 ? `${lineCount} Prox${lineCount > 1 ? 'ies' : 'y'}` : 'Proxies'}`}
+                {adding
+                  ? 'Adding...'
+                  : `Add ${bulkAnalysis.parsed.length} ${bulkAnalysis.parsed.length === 1 ? 'Proxy' : 'Proxies'}`}
               </button>
             </div>
           </div>

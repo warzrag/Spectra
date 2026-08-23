@@ -33,3 +33,6 @@ electron-builder.yml
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+# Sortie de compilation : 929 Mo de binaires, jamais dans le depot.
+build-production-x64/
+desktop-app/build-production-x64/

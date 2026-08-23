@@ -1,9 +1,11 @@
 import { collection, addDoc, getDocs, query, orderBy, limit, where, startAfter, doc, getDoc, setDoc, updateDoc, deleteDoc, onSnapshot, writeBatch, Unsubscribe } from 'firebase/firestore';
 import { db } from './firebase';
-import { ActivityLogEntry, UserProfile, Profile, Folder, Extension } from '../../types';
+import { ActivityLogEntry, UserProfile, Profile, Folder, Extension, Team } from '../../types';
+import { proxyDocumentId } from '../../shared/proxy-identity';
 
 const ACTIVITY_COLLECTION = 'activityLogs';
 const USERS_COLLECTION = 'users';
+const TEAMS_COLLECTION = 'teams';
 const PROFILES_COLLECTION = 'profiles';
 const FOLDERS_COLLECTION = 'folders';
 const EXTENSIONS_COLLECTION = 'extensions';
@@ -93,36 +95,102 @@ export async function getAllUsers(teamId?: string): Promise<UserProfile[]> {
   }
 }
 
+export async function findUserByEmail(email: string): Promise<UserProfile | null> {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail) return null;
+  const q = query(
+    collection(db, USERS_COLLECTION),
+    where('email', '==', normalizedEmail),
+    limit(1)
+  );
+  const snapshot = await getDocs(q);
+  if (snapshot.empty) return null;
+  const result = snapshot.docs[0];
+  return { uid: result.id, ...result.data() } as UserProfile;
+}
+
+export async function getTeamById(teamId: string): Promise<Team | null> {
+  if (!teamId) return null;
+  const teamDoc = await getDoc(doc(db, TEAMS_COLLECTION, teamId));
+  return teamDoc.exists() ? ({ id: teamDoc.id, ...teamDoc.data() } as Team) : null;
+}
+
+export async function getTeamsByOwnerId(ownerId: string): Promise<Team[]> {
+  if (!ownerId) return [];
+  const q = query(collection(db, TEAMS_COLLECTION), where('ownerId', '==', ownerId));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map(teamDoc => ({
+    id: teamDoc.id,
+    ...teamDoc.data(),
+  })) as Team[];
+}
+
+export function subscribeToTeams(callback: (teams: Team[]) => void): Unsubscribe {
+  const q = query(collection(db, TEAMS_COLLECTION), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snapshot) => {
+    const teams: Team[] = snapshot.docs.map(d => ({
+      id: d.id,
+      ...d.data(),
+    })) as Team[];
+    callback(teams);
+  }, (error) => {
+    console.error('Teams subscription error:', error);
+  });
+}
+
 // ── Profiles (Cloud Sync) ──────────────────────────────────────
 
-export function subscribeToProfiles(teamId: string, callback: (profiles: Profile[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, PROFILES_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToProfiles(
+  teamId: string | string[] | null | undefined,
+  callback: (profiles: Profile[]) => void,
+  assignedFolderId?: string | null
+): Unsubscribe {
+  const teamIds = Array.isArray(teamId) ? teamId.filter(Boolean) : teamId ? [teamId] : [];
+  const q = teamIds.length
+    ? assignedFolderId
+      ? query(
+          collection(db, PROFILES_COLLECTION),
+          where('teamId', teamIds.length === 1 ? '==' : 'in', teamIds.length === 1 ? teamIds[0] : teamIds.slice(0, 30)),
+          where('folderId', '==', assignedFolderId)
+        )
+      : teamIds.length === 1
+        ? query(collection(db, PROFILES_COLLECTION), where('teamId', '==', teamIds[0]), orderBy('createdAt', 'desc'))
+        : query(collection(db, PROFILES_COLLECTION), where('teamId', 'in', teamIds.slice(0, 30)))
+    : query(collection(db, PROFILES_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const profiles: Profile[] = snapshot.docs.map(d => ({
       id: d.id,
       ...d.data(),
-    })) as Profile[];
+    })).sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))) as Profile[];
     callback(profiles);
   }, (error) => {
     console.error('Profiles subscription error:', error);
   });
 }
 
-export function subscribeToFolders(teamId: string, callback: (folders: Folder[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, FOLDERS_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToFolders(
+  teamId: string | string[] | null | undefined,
+  callback: (folders: Folder[]) => void,
+  assignedFolderId?: string | null
+): Unsubscribe {
+  const teamIds = Array.isArray(teamId) ? teamId.filter(Boolean) : teamId ? [teamId] : [];
+  if (teamIds.length && assignedFolderId) {
+    return onSnapshot(doc(db, FOLDERS_COLLECTION, assignedFolderId), (snapshot) => {
+      callback(snapshot.exists() ? [{ id: snapshot.id, ...snapshot.data() } as Folder] : []);
+    }, (error) => {
+      console.error('Folder subscription error:', error);
+    });
+  }
+  const q = teamIds.length
+    ? teamIds.length === 1
+      ? query(collection(db, FOLDERS_COLLECTION), where('teamId', '==', teamIds[0]), orderBy('createdAt', 'desc'))
+      : query(collection(db, FOLDERS_COLLECTION), where('teamId', 'in', teamIds.slice(0, 30)))
+    : query(collection(db, FOLDERS_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const folders: Folder[] = snapshot.docs.map(d => ({
       id: d.id,
       ...d.data(),
-    })) as Folder[];
+    })).sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))) as Folder[];
     callback(folders);
   }, (error) => {
     console.error('Folders subscription error:', error);
@@ -284,12 +352,10 @@ export async function migrateLocalProfiles(localProfiles: Profile[], localFolder
 
 // ── Extensions (Cloud Sync) ────────────────────────────────────
 
-export function subscribeToExtensions(teamId: string, callback: (extensions: Extension[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, EXTENSIONS_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToExtensions(teamId: string | null | undefined, callback: (extensions: Extension[]) => void): Unsubscribe {
+  const q = teamId
+    ? query(collection(db, EXTENSIONS_COLLECTION), where('teamId', '==', teamId), orderBy('createdAt', 'desc'))
+    : query(collection(db, EXTENSIONS_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const extensions: Extension[] = snapshot.docs.map(d => ({
       id: d.id,
@@ -302,8 +368,17 @@ export function subscribeToExtensions(teamId: string, callback: (extensions: Ext
 }
 
 export async function registerExtension(ext: Omit<Extension, 'id'> & { id: string }, teamId: string): Promise<void> {
+  if (!teamId) {
+    throw new Error('Cannot register extension without a teamId');
+  }
+
   const { id, ...data } = ext;
-  await setDoc(doc(db, EXTENSIONS_COLLECTION, id), { ...data, teamId });
+  const teamExtensionId = id.startsWith(`${teamId}_`) ? id : `${teamId}_${id}`;
+  await setDoc(doc(db, EXTENSIONS_COLLECTION, teamExtensionId), { ...data, teamId });
+
+  if (teamExtensionId !== id) {
+    await deleteDoc(doc(db, EXTENSIONS_COLLECTION, id)).catch(() => {});
+  }
 }
 
 export async function setExtensionEnabled(extensionId: string, enabled: boolean): Promise<void> {
@@ -327,6 +402,12 @@ export interface FirestoreProxy {
   password?: string;
   provider?: string;
   country?: string;
+  timezone?: string;
+  city?: string;
+  region?: string;
+  latitude?: number;
+  longitude?: number;
+  lastExitIp?: string;
   folderId?: string | null;
   isHealthy?: boolean;
   lastCheck?: string;
@@ -336,17 +417,18 @@ export interface FirestoreProxy {
   updatedAt?: string;
 }
 
-export function subscribeToProxies(teamId: string, callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
-  const q = query(
-    collection(db, PROXIES_COLLECTION),
-    where('teamId', '==', teamId),
-    orderBy('createdAt', 'desc')
-  );
+export function subscribeToProxies(teamId: string | string[] | null | undefined, callback: (proxies: FirestoreProxy[]) => void): Unsubscribe {
+  const teamIds = Array.isArray(teamId) ? teamId.filter(Boolean) : teamId ? [teamId] : [];
+  const q = teamIds.length
+    ? teamIds.length === 1
+      ? query(collection(db, PROXIES_COLLECTION), where('teamId', '==', teamIds[0]), orderBy('createdAt', 'desc'))
+      : query(collection(db, PROXIES_COLLECTION), where('teamId', 'in', teamIds.slice(0, 30)))
+    : query(collection(db, PROXIES_COLLECTION), orderBy('createdAt', 'desc'));
   return onSnapshot(q, (snapshot) => {
     const proxies: FirestoreProxy[] = snapshot.docs.map(d => ({
       id: d.id,
       ...d.data(),
-    })) as FirestoreProxy[];
+    })).sort((a: any, b: any) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))) as FirestoreProxy[];
     callback(proxies);
   }, (error) => {
     console.error('Proxies subscription error:', error);
@@ -362,7 +444,9 @@ export async function createProxy(proxyData: Omit<FirestoreProxy, 'id'>, userId:
     createdAt: now,
     updatedAt: now,
   };
-  const docRef = await addDoc(collection(db, PROXIES_COLLECTION), data);
+  const deterministicId = await proxyDocumentId(teamId, proxyData);
+  const docRef = doc(db, PROXIES_COLLECTION, deterministicId);
+  await setDoc(docRef, data, { merge: true });
   return { id: docRef.id, ...data } as FirestoreProxy;
 }
 
@@ -374,7 +458,8 @@ export async function createProxiesBulk(proxies: Omit<FirestoreProxy, 'id'>[], u
 
   for (const proxy of proxies) {
     try {
-      const docRef = doc(collection(db, PROXIES_COLLECTION));
+      const deterministicId = await proxyDocumentId(teamId, proxy);
+      const docRef = doc(db, PROXIES_COLLECTION, deterministicId);
       batch.set(docRef, {
         ...proxy,
         teamId,
@@ -402,16 +487,40 @@ export async function updateProxy(proxyId: string, data: Partial<FirestoreProxy>
   });
 }
 
-export async function deleteProxy(proxyId: string): Promise<void> {
-  await deleteDoc(doc(db, PROXIES_COLLECTION, proxyId));
+const PROXY_DELETE_BATCH_SIZE = 450;
+
+export async function deleteProxy(
+  proxyId: string,
+  assignedProfileIds: string[] = []
+): Promise<void> {
+  await deleteProxiesBulk([proxyId], assignedProfileIds);
 }
 
-export async function deleteProxiesBulk(proxyIds: string[]): Promise<void> {
-  const batch = writeBatch(db);
-  for (const id of proxyIds) {
-    batch.delete(doc(db, PROXIES_COLLECTION, id));
+export async function deleteProxiesBulk(
+  proxyIds: string[],
+  assignedProfileIds: string[] = []
+): Promise<void> {
+  const operations = [
+    ...Array.from(new Set(assignedProfileIds)).map(id => ({ type: 'profile' as const, id })),
+    ...Array.from(new Set(proxyIds)).map(id => ({ type: 'proxy' as const, id })),
+  ];
+
+  for (let offset = 0; offset < operations.length; offset += PROXY_DELETE_BATCH_SIZE) {
+    const batch = writeBatch(db);
+    for (const operation of operations.slice(offset, offset + PROXY_DELETE_BATCH_SIZE)) {
+      if (operation.type === 'profile') {
+        batch.update(doc(db, PROFILES_COLLECTION, operation.id), {
+          proxy: null,
+          connectionType: 'system',
+          connectionConfig: { type: 'system' },
+          updatedAt: new Date().toISOString(),
+        });
+      } else {
+        batch.delete(doc(db, PROXIES_COLLECTION, operation.id));
+      }
+    }
+    await batch.commit();
   }
-  await batch.commit();
 }
 
 // ── Migration: assign teamId to existing data ──────────────────

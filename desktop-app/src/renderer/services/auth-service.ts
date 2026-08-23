@@ -1,68 +1,58 @@
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged as firebaseOnAuthStateChanged, User } from 'firebase/auth';
-import { doc, getDoc, setDoc, addDoc, collection, updateDoc } from 'firebase/firestore';
+import { doc, getDoc, collection, runTransaction } from 'firebase/firestore';
 import { auth, db } from './firebase';
 import { AppUser, UserRole } from '../../types';
 
-// Admin UIDs - these users always get admin role
-const ADMIN_UIDS = [
-  'EsZbVc0qtNYwTsUmXm9drmF5hu53',
-];
+class UserConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserConfigurationError';
+  }
+}
 
-async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string }> {
+async function resolveUser(user: User): Promise<{ role: UserRole; teamId: string; assignedFolderId: string | null }> {
   const userRef = doc(db, 'users', user.uid);
   const userDoc = await getDoc(userRef);
 
   if (userDoc.exists()) {
     const data = userDoc.data();
-    const role: UserRole = ADMIN_UIDS.includes(user.uid)
-      ? 'owner'
-      : (data.role as UserRole) || 'va';
+    const role: UserRole = (data.role as UserRole) || 'va';
     const teamId = data.teamId;
 
-    // Safety: if existing user has no teamId (legacy), create a team for them
     if (!teamId) {
-      const teamRef = await addDoc(collection(db, 'teams'), {
-        name: user.email || 'My Team',
-        ownerId: user.uid,
-        createdAt: new Date().toISOString(),
-      });
-      await setDoc(userRef, { ...data, teamId: teamRef.id, role }, { merge: true });
-      return { role, teamId: teamRef.id };
+      throw new UserConfigurationError('Ce compte doit être rattaché à une équipe par un administrateur');
     }
 
-    return { role, teamId };
+    return { role, teamId, assignedFolderId: data.assignedFolderId || null };
   }
 
-  // First login ever → create team + user document
-  const isAdmin = ADMIN_UIDS.includes(user.uid);
-  const role: UserRole = isAdmin ? 'owner' : 'owner'; // New users are always owner of their own team
+  throw new UserConfigurationError('Compte non configuré. Utilisez un code d’invitation valide.');
+}
 
-  const teamRef = await addDoc(collection(db, 'teams'), {
-    name: user.email || 'My Team',
-    ownerId: user.uid,
-    createdAt: new Date().toISOString(),
-  });
-
-  await setDoc(userRef, {
+function toAppUser(
+  user: User,
+  resolved: { role: UserRole; teamId: string; assignedFolderId: string | null }
+): AppUser {
+  return {
     uid: user.uid,
-    email: user.email,
-    role,
-    teamId: teamRef.id,
-    createdAt: new Date().toISOString(),
-  });
-
-  return { role, teamId: teamRef.id };
+    email: user.email || '',
+    displayName: user.displayName,
+    role: resolved.role,
+    teamId: resolved.teamId,
+    assignedFolderId: resolved.assignedFolderId,
+  };
 }
 
 export async function loginWithEmail(email: string, password: string): Promise<AppUser> {
   const credential = await signInWithEmailAndPassword(auth, email, password);
-  const { role, teamId } = await resolveUser(credential.user);
+  const { role, teamId, assignedFolderId } = await resolveUser(credential.user);
   return {
     uid: credential.user.uid,
     email: credential.user.email || email,
     displayName: credential.user.displayName,
     role,
     teamId,
+    assignedFolderId,
   };
 }
 
@@ -88,35 +78,54 @@ export async function registerWithInviteCode(email: string, password: string, in
     // 3. Determine team based on code type
     let teamId: string;
     let role: UserRole;
+    let personalTeamRef: ReturnType<typeof doc> | null = null;
 
     if (codeData.codeType === 'team' && codeData.teamId) {
       teamId = codeData.teamId;
       role = 'va';
     } else {
-      const teamRef = await addDoc(collection(db, 'teams'), {
-        name: email,
-        ownerId: user.uid,
-        createdAt: new Date().toISOString(),
-      });
-      teamId = teamRef.id;
+      personalTeamRef = doc(collection(db, 'teams'));
+      teamId = personalTeamRef.id;
       role = 'owner';
     }
 
-    // 4. Create user document
-    await setDoc(doc(db, 'users', user.uid), {
-      uid: user.uid,
-      email: user.email,
-      role,
-      teamId,
-      createdAt: new Date().toISOString(),
-    });
+    // 4. Claim the invite and create the membership atomically.
+    await runTransaction(db, async (transaction) => {
+      const latestCodeSnap = await transaction.get(codeRef);
+      if (!latestCodeSnap.exists() || latestCodeSnap.data().used) {
+        throw new Error('Ce code a déjà été utilisé');
+      }
+      const latestCode = latestCodeSnap.data();
+      if (
+        (role === 'va' && (latestCode.codeType !== 'team' || latestCode.teamId !== teamId)) ||
+        (role === 'owner' && latestCode.codeType !== 'personal')
+      ) {
+        throw new Error('Ce code d\'invitation ne correspond pas à ce compte');
+      }
 
-    // 5. Mark invite code as used
-    await updateDoc(codeRef, {
-      used: true,
-      usedBy: user.uid,
-      usedByEmail: email,
-      usedAt: new Date().toISOString(),
+      const now = new Date().toISOString();
+      if (personalTeamRef) {
+        transaction.set(personalTeamRef, {
+          name: email,
+          ownerId: user.uid,
+          inviteCode,
+          createdAt: now,
+        });
+      }
+      transaction.set(doc(db, 'users', user.uid), {
+        uid: user.uid,
+        email: user.email,
+        role,
+        teamId,
+        inviteCode,
+        createdAt: now,
+      });
+      transaction.update(codeRef, {
+        used: true,
+        usedBy: user.uid,
+        usedByEmail: email,
+        usedAt: now,
+      });
     });
 
     return {
@@ -125,6 +134,7 @@ export async function registerWithInviteCode(email: string, password: string, in
       displayName: user.displayName,
       role,
       teamId,
+      assignedFolderId: null,
     };
   } catch (error) {
     await signOut(auth).catch(() => {});
@@ -137,18 +147,61 @@ export async function logout(): Promise<void> {
 }
 
 export function onAuthStateChanged(callback: (user: AppUser | null) => void): () => void {
-  return firebaseOnAuthStateChanged(auth, async (firebaseUser) => {
-    if (firebaseUser) {
-      const { role, teamId } = await resolveUser(firebaseUser);
-      callback({
-        uid: firebaseUser.uid,
-        email: firebaseUser.email || '',
-        displayName: firebaseUser.displayName,
-        role,
-        teamId,
-      });
-    } else {
-      callback(null);
-    }
+  let cancelled = false;
+  let generation = 0;
+  let lastResolvedUser: AppUser | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const waitForRetry = (delay: number) => new Promise<void>(resolve => {
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      resolve();
+    }, delay);
   });
+
+  const unsubscribe = firebaseOnAuthStateChanged(auth, (firebaseUser) => {
+    const currentGeneration = ++generation;
+    if (!firebaseUser) {
+      lastResolvedUser = null;
+      callback(null);
+      return;
+    }
+
+    void (async () => {
+      let attempt = 0;
+      while (!cancelled && currentGeneration === generation && auth.currentUser?.uid === firebaseUser.uid) {
+        try {
+          const resolved = await resolveUser(firebaseUser);
+          if (cancelled || currentGeneration !== generation) return;
+          lastResolvedUser = toAppUser(firebaseUser, resolved);
+          callback(lastResolvedUser);
+          return;
+        } catch (error) {
+          if (error instanceof UserConfigurationError) {
+            console.error('Authenticated account is not configured:', error);
+            await signOut(auth).catch(() => {});
+            if (!cancelled && currentGeneration === generation) callback(null);
+            return;
+          }
+
+          // A temporary network or Firestore failure must not destroy a valid
+          // Firebase session. Keep the previous user and retry in the background.
+          console.warn('Temporary user resolution failure; session retained:', error);
+          if (lastResolvedUser?.uid === firebaseUser.uid && attempt === 0) {
+            callback(lastResolvedUser);
+          }
+          const delays = [1000, 3000, 5000, 10000, 30000];
+          await waitForRetry(delays[Math.min(attempt, delays.length - 1)]);
+          attempt++;
+        }
+      }
+    })();
+  });
+
+  return () => {
+    cancelled = true;
+    generation++;
+    if (retryTimer) clearTimeout(retryTimer);
+    unsubscribe();
+  };
 }

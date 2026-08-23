@@ -13,6 +13,7 @@ export interface ChromeLaunchOptions {
   proxy?: string;
   fingerprint?: any;
   lastUrl?: string;
+  windowLayout?: { index: number; total: number };
 }
 
 const isDev = process.env.NODE_ENV !== 'production';
@@ -21,6 +22,7 @@ export class ChromeLauncher {
   private static processes = new Map<string, any>();
   private static activeUrls = new Map<string, string>();
   private static activeProfiles = new Set<string>();
+  private static readonly compactWindow = { width: 900, height: 720, margin: 0, gap: 0 };
 
   static isProfileActive(profileId: string): boolean {
     return this.activeProfiles.has(profileId);
@@ -28,6 +30,90 @@ export class ChromeLauncher {
 
   static getActiveProfiles(): string[] {
     return Array.from(this.activeProfiles);
+  }
+
+  private static getWindowPlacement(layout?: { index: number; total: number }) {
+    let workArea = { x: 0, y: 0, width: 1920, height: 1080 };
+
+    try {
+      const { screen } = require('electron');
+      workArea = screen.getPrimaryDisplay().workArea;
+    } catch {}
+
+    const win = this.compactWindow;
+    const maxColumns = Math.max(1, Math.floor((workArea.width - win.margin * 2 + win.gap) / (win.width + win.gap)));
+    const columns = Math.max(1, maxColumns);
+    const slot = Math.max(0, layout?.index ?? this.activeProfiles.size);
+    const col = slot % columns;
+    const row = Math.floor(slot / columns);
+    const left = workArea.x + win.margin + col * (win.width + win.gap);
+    const top = workArea.y + win.margin + row * (win.height + win.gap);
+
+    return {
+      left,
+      top,
+      right: left + win.width,
+      bottom: top + win.height,
+      width: win.width,
+      height: win.height,
+      workArea,
+    };
+  }
+
+  private static applyCleanLaunchState(profilePath: string, prefs: any) {
+    prefs.profile = {
+      ...(prefs.profile || {}),
+      exit_type: 'Normal',
+      exited_cleanly: true,
+    };
+    prefs.session = {
+      ...(prefs.session || {}),
+      restore_on_startup: 0,
+      startup_urls: [],
+    };
+
+    const localStatePath = path.join(profilePath, 'Local State');
+    try {
+      const localState = fs.existsSync(localStatePath) ? JSON.parse(fs.readFileSync(localStatePath, 'utf8')) : {};
+      localState.profile = {
+        ...(localState.profile || {}),
+        exit_type: 'Normal',
+        exited_cleanly: true,
+      };
+      fs.writeFileSync(localStatePath, JSON.stringify(localState));
+    } catch {}
+  }
+
+  private static enforceWindowPlacement(pid: number | undefined, placement: ReturnType<typeof ChromeLauncher.getWindowPlacement>) {
+    if (!pid || process.platform !== 'win32') return;
+
+    const ps = `
+      Start-Sleep -Milliseconds 900
+      Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+  [DllImport("user32.dll")]
+  public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}
+"@
+      $p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue
+      if ($p) {
+        $deadline = (Get-Date).AddSeconds(5)
+        while ($p.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline) {
+          Start-Sleep -Milliseconds 150
+          $p.Refresh()
+        }
+        if ($p.MainWindowHandle -ne 0) {
+          [Win32]::SetWindowPos($p.MainWindowHandle, [IntPtr]::Zero, ${placement.left}, ${placement.top}, ${placement.width}, ${placement.height}, 0x0040) | Out-Null
+        }
+      }
+    `;
+
+    spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref();
   }
 
   static async launch(options: ChromeLaunchOptions) {
@@ -108,6 +194,29 @@ export class ChromeLauncher {
 
     // Setup Chrome preferences for session restoration
     ProfilePreferences.setupChromePreferences(profilePath, options.lastUrl);
+    const placement = this.getWindowPlacement(options.windowLayout);
+    const prefsPath = path.join(profilePath, 'Default', 'Preferences');
+    try {
+      const prefs = fs.existsSync(prefsPath) ? JSON.parse(fs.readFileSync(prefsPath, 'utf8')) : {};
+      this.applyCleanLaunchState(profilePath, prefs);
+      prefs.browser = {
+        ...(prefs.browser || {}),
+        window_placement: {
+          left: placement.left,
+          top: placement.top,
+          right: placement.right,
+          bottom: placement.bottom,
+          maximized: false,
+          work_area_left: placement.workArea.x,
+          work_area_top: placement.workArea.y,
+          work_area_right: placement.workArea.x + placement.workArea.width,
+          work_area_bottom: placement.workArea.y + placement.workArea.height,
+        },
+      };
+      fs.writeFileSync(prefsPath, JSON.stringify(prefs));
+    } catch (error) {
+      console.error('Failed to set Chrome window placement:', error);
+    }
     
     // Create Chrome session files for URL persistence (like AdsPower/GoLogin)
     if (options.lastUrl && options.lastUrl !== '') {
@@ -150,11 +259,15 @@ export class ChromeLauncher {
     }
     
     // Build arguments — minimal flags to avoid detection
+    const compactWindowSize = `${placement.width},${placement.height}`;
+    const compactWindowPosition = `${placement.left},${placement.top}`;
     const args = [
       `--user-data-dir=${profilePath}`,
       '--no-default-browser-check',
       '--no-first-run',
       '--restore-last-session',
+      `--window-size=${compactWindowSize}`,
+      `--window-position=${compactWindowPosition}`,
 
       // Anti-automation detection
       '--disable-blink-features=AutomationControlled',
@@ -233,6 +346,7 @@ export class ChromeLauncher {
       detached: true,
       stdio: 'ignore'
     });
+    this.enforceWindowPlacement(chromeProcess.pid, placement);
 
     // Store process reference
     this.processes.set(options.profileId, chromeProcess);

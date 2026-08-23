@@ -21,9 +21,25 @@ export interface ProxyConfig {
   };
   country?: string;
   city?: string;
+  timezone?: string;
+  region?: string;
+  latitude?: number;
+  longitude?: number;
+  lastExitIp?: string;
   lastUsed?: Date;
   isHealthy?: boolean;
   lastCheck?: Date;
+}
+
+export interface ProxyGeoSnapshot {
+  ip: string;
+  countryCode: string;
+  region: string;
+  city: string;
+  latitude: number;
+  longitude: number;
+  timezone: string;
+  checkedAt: string;
 }
 
 export interface ProxyStats {
@@ -221,11 +237,9 @@ export class ProxyManager {
     return null;
   }
 
-  // Test proxy connectivity (supports HTTP, HTTPS, SOCKS4, SOCKS5)
-  // Also detects country and IP via ip-api.com
-  async testProxy(proxy: ProxyConfig): Promise<boolean> {
-    const testUrl = 'http://ip-api.com/json/?fields=status,countryCode,query';
-
+  // Resolve the actual exit IP through the configured proxy before browser navigation.
+  async inspectProxyGeo(proxy: ProxyConfig): Promise<ProxyGeoSnapshot | null> {
+    const testUrl = 'http://ip-api.com/json/?fields=status,message,countryCode,regionName,city,lat,lon,timezone,query';
     try {
       const isSocks = proxy.type === 'socks4' || proxy.type === 'socks5';
       let response: any;
@@ -262,20 +276,47 @@ export class ProxyManager {
         response = await axios.get(testUrl, axiosConfig);
       }
 
-      // Extract country from response
-      if (response.status === 200 && response.data) {
-        const data = response.data;
-        if (data.countryCode) {
-          proxy.country = data.countryCode;
-          console.log(`[Proxy] Detected country: ${data.countryCode} (IP: ${data.query})`);
-        }
-      }
+      if (response.status !== 200 || response.data?.status !== 'success') return null;
+      const data = response.data;
+      const latitude = Number(data.lat);
+      const longitude = Number(data.lon);
+      if (
+        !data.query || !data.countryCode || !data.timezone
+        || !Number.isFinite(latitude) || !Number.isFinite(longitude)
+      ) return null;
 
-      return response.status === 200;
+      // Reject invalid IANA zones before they reach the browser runtime.
+      new Intl.DateTimeFormat('en-US', { timeZone: data.timezone }).format(new Date());
+      proxy.country = String(data.countryCode).toUpperCase();
+      proxy.city = String(data.city || '');
+      proxy.timezone = String(data.timezone);
+      proxy.region = String(data.regionName || '');
+      proxy.latitude = latitude;
+      proxy.longitude = longitude;
+      proxy.lastExitIp = String(data.query);
+      const snapshot: ProxyGeoSnapshot = {
+        ip: String(data.query),
+        countryCode: proxy.country,
+        region: String(data.regionName || ''),
+        city: proxy.city,
+        latitude,
+        longitude,
+        timezone: proxy.timezone,
+        checkedAt: new Date().toISOString(),
+      };
+      console.log(
+        `[Proxy] Exit ${snapshot.ip} · ${snapshot.city || snapshot.region} · ${snapshot.timezone}`
+      );
+      return snapshot;
     } catch (error) {
-      console.error('Proxy test failed:', error);
-      return false;
+      console.error('Proxy geo inspection failed:', error);
+      return null;
     }
+  }
+
+  // Test proxy connectivity (supports HTTP, HTTPS, SOCKS4, SOCKS5).
+  async testProxy(proxy: ProxyConfig): Promise<boolean> {
+    return Boolean(await this.inspectProxyGeo(proxy));
   }
 
   // Get proxy for a profile

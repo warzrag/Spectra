@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { X, Zap, Loader2 } from 'lucide-react';
 import { Folder as FolderType, Platform } from '../../types';
 
@@ -18,6 +18,18 @@ const QuickCreateModal: React.FC<QuickCreateModalProps> = ({ onClose, onCreate, 
   const [generateFingerprints, setGenerateFingerprints] = useState(true);
   const [creating, setCreating] = useState(false);
   const [progress, setProgress] = useState(0);
+
+  // Proposer par defaut le systeme de la machine : une empreinte Windows servie
+  // depuis un Mac se contredit (polices, barres de defilement, carte graphique).
+  useEffect(() => {
+    let cancelled = false;
+    (window.electronAPI as any)?.profileSync?.getFingerprintOS?.()
+      .then((hostOS: 'windows' | 'macos' | 'linux') => {
+        if (!cancelled && hostOS) setOs(hostOS);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   const inputStyle: React.CSSProperties = {
     background: 'var(--bg-elevated)',

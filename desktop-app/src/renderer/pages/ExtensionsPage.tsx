@@ -1,21 +1,23 @@
 import React, { useState, useEffect } from 'react';
-import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link } from 'lucide-react';
+import { Puzzle, Plus, FolderOpen, Trash2, Loader2, AlertCircle, Cloud, Download, RefreshCw, Link, ChevronDown, ChevronRight } from 'lucide-react';
 import { useToast } from '../contexts/ToastContext';
-import { Extension } from '../../types';
+import { Extension, Team, UserProfile } from '../../types';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { storage } from '../services/firebase';
 import {
   subscribeToExtensions,
+  getAllUsers,
   registerExtension,
   setExtensionEnabled,
   unregisterExtension,
 } from '../services/firestore-service';
 
 interface ExtensionsPageProps {
-  teamId: string;
+  teamId: string | null;
+  teams?: Team[];
 }
 
-const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
+const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId, teams = [] }) => {
   const { showToast } = useToast();
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [localInstalled, setLocalInstalled] = useState<Set<string>>(new Set());
@@ -23,15 +25,26 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   const [installing, setInstalling] = useState(false);
   const [storeUrl, setStoreUrl] = useState('');
   const [installingFromStore, setInstallingFromStore] = useState(false);
+  const [expandedTeamIds, setExpandedTeamIds] = useState<Set<string>>(new Set());
+  const [users, setUsers] = useState<UserProfile[]>([]);
 
-  // Subscribe to Firestore extensions (scoped by teamId)
+  // Subscribe to Firestore extensions (super admin = global, others = scoped by teamId)
   useEffect(() => {
-    if (!teamId) return;
     const unsub = subscribeToExtensions(teamId, (exts) => {
       setExtensions(exts);
       setLoading(false);
     });
     return () => unsub();
+  }, [teamId]);
+
+  useEffect(() => {
+    if (teamId !== null) return;
+    getAllUsers()
+      .then(setUsers)
+      .catch((error) => {
+        console.error('Failed to load extension team members:', error);
+        setUsers([]);
+      });
   }, [teamId]);
 
   // Check which extensions are installed locally + auto-download missing/outdated ones
@@ -51,7 +64,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         // Helper: get a fresh download URL (stored URLs may have expired tokens)
         const getFreshUrl = async (): Promise<string> => {
           try {
-            const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+            const storageRef = ref(storage, ext.teamId ? `extensions/${ext.teamId}/${ext.id}.zip` : `extensions/${ext.id}.zip`);
             return await getDownloadURL(storageRef);
           } catch {
             // Fallback to stored URL
@@ -63,7 +76,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
           // Missing locally → download
           try {
             const url = await getFreshUrl();
-            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt);
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt, ext.version);
             localIds.add(ext.id);
             console.log(`[ExtSync] Downloaded missing extension: ${ext.name}`);
           } catch (e) {
@@ -73,26 +86,12 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
           (ext.version && local.version && ext.version !== local.version) ||
           (ext.updatedAt && ext.updatedAt !== local.updatedAt)
         )) {
-          // Version or timestamp mismatch → remove old and re-download
+          // Version or timestamp mismatch: validate and atomically replace.
           try {
             console.log(`[ExtSync] Updating ${ext.name}: ${local.version} → ${ext.version}`);
-            // Rename old version instead of deleting (so we can rollback)
-            const oldPath = local.localPath;
-            const backupId = ext.id + '_backup';
-            try {
-              // Use main process to rename
-              await window.electronAPI.extensions!.remove(backupId); // clean any previous backup
-            } catch {}
-            await window.electronAPI.extensions!.remove(ext.id);
-            try {
-              const url = await getFreshUrl();
-              await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt);
-              console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
-            } catch (dlError) {
-              console.error(`[ExtSync] Download failed for ${ext.name}, keeping old version:`, dlError);
-              // Download failed - old version is already removed, re-download won't help
-              // User will need to update manually or wait for next sync
-            }
+            const url = await getFreshUrl();
+            await window.electronAPI.extensions!.downloadAndInstall(ext.id, url, ext.updatedAt, ext.version);
+            console.log(`[ExtSync] Updated extension: ${ext.name} to v${ext.version}`);
           } catch (e) {
             console.error(`Failed to update extension ${ext.name}:`, e);
           }
@@ -106,6 +105,11 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   }, [extensions]);
 
   const doInstall = async (pathToInstall: string) => {
+    if (!teamId) {
+      showToast('Choose a team before installing a new extension', 'warning');
+      return;
+    }
+
     const result = await window.electronAPI.extensions!.install(pathToInstall);
     if (!result.success) {
       showToast(`Failed to install extension: ${result.error}`, 'error');
@@ -119,7 +123,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
     try {
       const zipPath = await window.electronAPI.extensions!.zip(ext.id);
       const zipBuffer = await window.electronAPI.extensions!.readZip(zipPath);
-      const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+      const storageRef = ref(storage, `extensions/${teamId}/${ext.id}.zip`);
       await uploadBytes(storageRef, new Uint8Array(zipBuffer));
       storageUrl = await getDownloadURL(storageRef);
     } catch (e) {
@@ -139,6 +143,11 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
   };
 
   const handleInstallFromStore = async () => {
+    if (!teamId) {
+      showToast('Choose a team before installing a new extension', 'warning');
+      return;
+    }
+
     if (!storeUrl.trim() || !window.electronAPI?.extensions) return;
     setInstallingFromStore(true);
     try {
@@ -154,7 +163,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
       try {
         const zipPath = await window.electronAPI.extensions!.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions!.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${teamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -224,6 +233,12 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
 
   const handleUpdate = async (ext: Extension) => {
     if (!window.electronAPI?.extensions) return;
+    const targetTeamId = ext.teamId || teamId;
+    if (!targetTeamId) {
+      showToast('This extension has no team. Reassign it before updating.', 'warning');
+      return;
+    }
+
     setUpdating(ext.id);
     try {
       // Ask user to pick new file or folder
@@ -244,7 +259,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
       try {
         const zipPath = await window.electronAPI.extensions.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${targetTeamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -262,7 +277,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         storageUrl,
         createdAt: ext.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      }, teamId);
+      }, targetTeamId);
 
       showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
     } catch (error) {
@@ -275,6 +290,12 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
 
   const handleUpdateFolder = async (ext: Extension) => {
     if (!window.electronAPI?.extensions?.selectFolder) return;
+    const targetTeamId = ext.teamId || teamId;
+    if (!targetTeamId) {
+      showToast('This extension has no team. Reassign it before updating.', 'warning');
+      return;
+    }
+
     setUpdating(ext.id);
     try {
       const folderPath = await window.electronAPI.extensions.selectFolder();
@@ -293,7 +314,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
       try {
         const zipPath = await window.electronAPI.extensions.zip(ext.id);
         const zipBuffer = await window.electronAPI.extensions.readZip(zipPath);
-        const storageRef = ref(storage, `extensions/${ext.id}.zip`);
+        const storageRef = ref(storage, `extensions/${targetTeamId}/${ext.id}.zip`);
         await uploadBytes(storageRef, new Uint8Array(zipBuffer));
         storageUrl = await getDownloadURL(storageRef);
       } catch (e) {
@@ -310,7 +331,7 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
         storageUrl,
         createdAt: ext.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      }, teamId);
+      }, targetTeamId);
 
       showToast(`"${updated.name}" updated to v${updated.version}`, 'success');
     } catch (error) {
@@ -339,6 +360,113 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
       </div>
     );
   }
+
+  const isGlobalView = teamId === null;
+  const teamById = new Map(teams.map(team => [team.id, team]));
+  const teamSections = Array.from(new Set(extensions.map(ext => ext.teamId || 'unknown')))
+    .map(sectionTeamId => {
+      const team = teamById.get(sectionTeamId);
+      const members = users.filter(user => (user.teamId || 'unknown') === sectionTeamId);
+      const owner = team?.ownerId
+        ? users.find(user => user.uid === team.ownerId)
+        : members.find(user => user.role === 'owner' || user.role === 'super_admin');
+      const otherMembers = members.filter(user => user.uid !== owner?.uid);
+
+      return {
+        teamId: sectionTeamId,
+        teamName: team?.name || owner?.email || (sectionTeamId === 'unknown' ? 'No team' : `Team ${sectionTeamId.slice(0, 6)}`),
+        ownerEmail: owner?.email || (team?.name?.includes('@') ? team.name : ''),
+        members: otherMembers,
+        extensions: extensions.filter(ext => (ext.teamId || 'unknown') === sectionTeamId),
+      };
+    })
+    .filter(section => section.extensions.length > 0)
+    .sort((a, b) => (a.ownerEmail || a.teamName).localeCompare(b.ownerEmail || b.teamName));
+
+  const renderExtensionRow = (ext: Extension) => {
+    const isLocal = localInstalled.has(ext.id);
+    return (
+      <div
+        key={ext.id}
+        className="flex items-center gap-4 p-4 rounded-xl border transition-colors"
+        style={{
+          background: 'var(--bg-elevated)',
+          borderColor: 'var(--border)',
+        }}
+      >
+        <div
+          className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
+          style={{ background: ext.enabled ? 'var(--accent-subtle)' : 'var(--bg-base)' }}
+        >
+          <Puzzle size={18} style={{ color: ext.enabled ? 'var(--accent)' : 'var(--text-muted)' }} />
+        </div>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-[13px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+              {ext.name}
+            </span>
+            {ext.version && (
+              <span className="text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-base)', color: 'var(--text-muted)' }}>
+                v{ext.version}
+              </span>
+            )}
+            {!isLocal && (
+              <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}>
+                <AlertCircle size={10} />
+                Not installed locally
+              </span>
+            )}
+          </div>
+          {ext.description && (
+            <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
+              {ext.description}
+            </p>
+          )}
+        </div>
+
+        <button
+          onClick={() => handleToggle(ext)}
+          className="relative w-10 h-5 rounded-full flex-shrink-0 transition-colors"
+          style={{ background: ext.enabled ? 'var(--accent)' : 'var(--bg-base)' }}
+        >
+          <div
+            className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
+            style={{ left: ext.enabled ? '22px' : '2px' }}
+          />
+        </button>
+
+        <button
+          onClick={() => handleUpdateFolder(ext)}
+          disabled={updating === ext.id}
+          className="p-2 rounded-lg transition-colors"
+          style={{ color: 'var(--text-muted)' }}
+          title="Update (folder)"
+          onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
+          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
+        >
+          {updating === ext.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+        </button>
+
+        <button
+          onClick={() => handleRemove(ext)}
+          className="p-2 rounded-lg transition-colors hover:bg-red-500/10"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+    );
+  };
+
+  const toggleTeamSection = (sectionTeamId: string) => {
+    setExpandedTeamIds(prev => {
+      const next = new Set(prev);
+      if (next.has(sectionTeamId)) next.delete(sectionTeamId);
+      else next.add(sectionTeamId);
+      return next;
+    });
+  };
 
   return (
     <div className="h-full flex flex-col p-6">
@@ -425,82 +553,77 @@ const ExtensionsPage: React.FC<ExtensionsPageProps> = ({ teamId }) => {
           </div>
         </div>
       ) : (
-        <div className="space-y-2 overflow-auto">
-          {extensions.map((ext) => {
-            const isLocal = localInstalled.has(ext.id);
-            return (
-              <div
-                key={ext.id}
-                className="flex items-center gap-4 p-4 rounded-xl border transition-colors"
-                style={{
-                  background: 'var(--bg-elevated)',
-                  borderColor: 'var(--border)',
-                }}
-              >
-                <div
-                  className="w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0"
-                  style={{ background: ext.enabled ? 'var(--accent-subtle)' : 'var(--bg-base)' }}
+        <div className="space-y-6 overflow-auto">
+          {isGlobalView ? (
+            teamSections.map(section => (
+              <section key={section.teamId} className="rounded-xl border overflow-hidden" style={{ borderColor: 'var(--border-default)', background: 'var(--bg-surface)' }}>
+                <button
+                  onClick={() => toggleTeamSection(section.teamId)}
+                  className="w-full px-4 py-3 flex items-center gap-3 text-left transition-colors"
+                  style={{ color: 'var(--text-primary)' }}
+                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
                 >
-                  <Puzzle size={18} style={{ color: ext.enabled ? 'var(--accent)' : 'var(--text-muted)' }} />
-                </div>
-
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[13px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
-                      {ext.name}
-                    </span>
-                    {ext.version && (
-                      <span className="text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-base)', color: 'var(--text-muted)' }}>
-                        v{ext.version}
-                      </span>
-                    )}
-                    {!isLocal && (
-                      <span className="flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}>
-                        <AlertCircle size={10} />
-                        Not installed locally
-                      </span>
-                    )}
+                  <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{ background: 'var(--bg-elevated)', color: 'var(--accent-light)' }}>
+                    <FolderOpen size={18} />
                   </div>
-                  {ext.description && (
-                    <p className="text-[11px] mt-0.5 truncate" style={{ color: 'var(--text-muted)' }}>
-                      {ext.description}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 min-w-0 mb-1">
+                      <h2 className="text-[14px] font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                        {section.teamName}
+                      </h2>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-md shrink-0" style={{ background: 'var(--bg-elevated)', color: 'var(--text-muted)' }}>
+                        {section.extensions.length} extension{section.extensions.length !== 1 ? 's' : ''}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                      <span className="truncate max-w-[260px]">
+                        Owner: <span style={{ color: 'var(--text-secondary)' }}>{section.ownerEmail || 'inconnu'}</span>
+                      </span>
+                      <span>·</span>
+                      <span className="truncate max-w-[360px]">
+                        Membres: <span style={{ color: 'var(--text-secondary)' }}>
+                          {section.members.length > 0
+                            ? section.members.map(member => member.email).join(', ')
+                            : 'aucun'}
+                        </span>
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                      {section.extensions.slice(0, 4).map(ext => (
+                        <span key={ext.id} className="text-[10px] px-1.5 py-0.5 rounded-md truncate max-w-[180px]" style={{ background: ext.enabled ? 'var(--accent-subtle)' : 'var(--bg-elevated)', color: ext.enabled ? 'var(--accent-light)' : 'var(--text-muted)' }}>
+                          {ext.name}
+                        </span>
+                      ))}
+                      {section.extensions.length > 4 && (
+                        <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                          +{section.extensions.length - 4}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[9px] mt-1 truncate" style={{ color: 'var(--text-muted)', opacity: 0.65 }}>
+                      {section.teamId}
                     </p>
+                  </div>
+                  {expandedTeamIds.has(section.teamId) ? (
+                    <ChevronDown size={16} style={{ color: 'var(--text-muted)' }} />
+                  ) : (
+                    <ChevronRight size={16} style={{ color: 'var(--text-muted)' }} />
                   )}
-                </div>
-
-                <button
-                  onClick={() => handleToggle(ext)}
-                  className="relative w-10 h-5 rounded-full flex-shrink-0 transition-colors"
-                  style={{ background: ext.enabled ? 'var(--accent)' : 'var(--bg-base)' }}
-                >
-                  <div
-                    className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
-                    style={{ left: ext.enabled ? '22px' : '2px' }}
-                  />
                 </button>
 
-                <button
-                  onClick={() => handleUpdateFolder(ext)}
-                  disabled={updating === ext.id}
-                  className="p-2 rounded-lg transition-colors"
-                  style={{ color: 'var(--text-muted)' }}
-                  title="Update (folder)"
-                  onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
-                  onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
-                >
-                  {updating === ext.id ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-                </button>
-
-                <button
-                  onClick={() => handleRemove(ext)}
-                  className="p-2 rounded-lg transition-colors hover:bg-red-500/10"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            );
-          })}
+                {expandedTeamIds.has(section.teamId) && (
+                  <div className="space-y-2 p-3 pt-0">
+                    {section.extensions.map(renderExtensionRow)}
+                  </div>
+                )}
+              </section>
+            ))
+          ) : (
+            <div className="space-y-2">
+              {extensions.map(renderExtensionRow)}
+            </div>
+          )}
         </div>
       )}
     </div>

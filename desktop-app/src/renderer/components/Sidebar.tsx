@@ -1,17 +1,16 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, ArrowLeftRight, UserPlus, X, Crown } from 'lucide-react';
-import { Folder as FolderType, AppPage } from '../../types';
+import { Plus, FolderOpen, MoreVertical, Edit, Trash2, Users, ChevronDown, ChevronRight, Globe, Puzzle, Settings, Zap, Clock, LogOut, CreditCard, UsersRound, Shield, PanelLeftClose, PanelLeftOpen, Crown, Activity, Database } from 'lucide-react';
+import { Folder as FolderType, Team, AppPage } from '../../types';
 import { useAuth } from '../contexts/AuthContext';
-
-const SWITCH_UIDS = [
-  'EsZbVc0qtNYwTsUmXm9drmF5hu53',  // florentivo95270@gmail.com
-  'OVH4X3zvyohKCYZfV5Q8cSWvj1M2',  // ivorraflorent1@gmail.com
-];
 
 interface SidebarProps {
   activePage: AppPage;
   onNavigate: (page: AppPage) => void;
   folders: FolderType[];
+  teams?: Team[];
+  activeWorkspaceTeamId?: string;
+  activeWorkspaceLabel?: string;
+  onOpenWorkspace?: (email: string) => Promise<boolean>;
   selectedFolderId: string | null;
   profileCounts: { [folderId: string]: number };
   totalProfiles: number;
@@ -32,6 +31,10 @@ const Sidebar: React.FC<SidebarProps> = ({
   activePage,
   onNavigate,
   folders,
+  teams = [],
+  activeWorkspaceTeamId,
+  activeWorkspaceLabel,
+  onOpenWorkspace,
   selectedFolderId,
   profileCounts,
   totalProfiles,
@@ -53,46 +56,15 @@ const Sidebar: React.FC<SidebarProps> = ({
   const [foldersExpanded, setFoldersExpanded] = useState(true);
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
   const [showNewDropdown, setShowNewDropdown] = useState(false);
+  const [showWorkspaceSwitch, setShowWorkspaceSwitch] = useState(false);
+  const [workspaceEmail, setWorkspaceEmail] = useState('');
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState('');
   const [appVersion, setAppVersion] = useState('');
-  const [showSwitchMenu, setShowSwitchMenu] = useState(false);
-  const [showAddAccount, setShowAddAccount] = useState(false);
-  const [newEmail, setNewEmail] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [savedAccounts, setSavedAccounts] = useState<{ email: string; password: string }[]>([]);
-
-  const isOwner = SWITCH_UIDS.includes(user?.uid || '');
-
-  // Load saved accounts from localStorage
+  // Remove credentials stored by versions prior to 1.10.
   useEffect(() => {
-    if (!isOwner) return;
-    try {
-      const stored = localStorage.getItem('spectra_saved_accounts');
-      if (stored) setSavedAccounts(JSON.parse(stored));
-    } catch {}
-  }, [isOwner]);
-
-  const saveAccounts = (accounts: { email: string; password: string }[]) => {
-    setSavedAccounts(accounts);
-    localStorage.setItem('spectra_saved_accounts', JSON.stringify(accounts));
-  };
-
-  const handleAddAccount = () => {
-    if (!newEmail || !newPassword) return;
-    const updated = [...savedAccounts.filter(a => a.email !== newEmail), { email: newEmail, password: newPassword }];
-    saveAccounts(updated);
-    setNewEmail('');
-    setNewPassword('');
-    setShowAddAccount(false);
-  };
-
-  const handleRemoveAccount = (email: string) => {
-    saveAccounts(savedAccounts.filter(a => a.email !== email));
-  };
-
-  const handleSwitch = (account: { email: string; password: string }) => {
-    setShowSwitchMenu(false);
-    onSwitchAccount?.(account.email, account.password);
-  };
+    localStorage.removeItem('spectra_saved_accounts');
+  }, []);
 
   useEffect(() => {
     window.electronAPI.getVersion().then(v => setAppVersion(v));
@@ -101,12 +73,14 @@ const Sidebar: React.FC<SidebarProps> = ({
   // Main navigation items
   const mainNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean }[] = [
     { page: 'profiles', label: 'Instances', icon: <Users size={18} /> },
+    { page: 'va-manager', label: 'VA Manager', icon: <Database size={18} />, adminOnly: true },
     { page: 'proxies', label: 'Proxies', icon: <Globe size={18} />, adminOnly: true },
-    { page: 'extensions', label: 'Extensions', icon: <Puzzle size={18} /> },
+    { page: 'extensions', label: 'Extensions', icon: <Puzzle size={18} />, adminOnly: true },
+    { page: 'diagnostics', label: 'Diagnostics', icon: <Activity size={18} /> },
     { page: 'recycle-bin', label: 'Recycle Bin', icon: <Trash2 size={18} />, adminOnly: true },
   ];
 
-  const isSuperAdmin = user?.uid === 'EsZbVc0qtNYwTsUmXm9drmF5hu53';
+  const isSuperAdmin = user?.role === 'super_admin';
 
   // Team section items
   const teamNavItems: { page: AppPage; label: string; icon: React.ReactNode; adminOnly?: boolean; superAdminOnly?: boolean }[] = [
@@ -210,9 +184,74 @@ const Sidebar: React.FC<SidebarProps> = ({
             <span className="text-[10px] font-medium" style={{ color: 'var(--text-muted)' }}>
               Antidetect Browser
             </span>
+            <span
+              className="inline-flex mt-1 px-1.5 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wider"
+              style={{ background: 'var(--warning-subtle)', color: 'var(--warning)' }}
+            >
+              Internal Build
+            </span>
           </div>
         )}
       </div>
+
+      {isSuperAdmin && !collapsed && activeWorkspaceTeamId && (
+        <div className="px-3 pb-1">
+          <label className="block px-1 mb-1 text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+            Active workspace
+          </label>
+          <button
+            onClick={() => {
+              setShowWorkspaceSwitch(value => !value);
+              setWorkspaceError('');
+            }}
+            className="w-full px-3 py-2 rounded-lg text-left"
+            style={{ background: 'var(--bg-elevated)', border: '1px solid var(--accent)', color: 'var(--text-primary)' }}
+            aria-label="Switch active workspace"
+          >
+            <span className="block text-[12px] font-semibold truncate">{activeWorkspaceLabel || 'Current workspace'}</span>
+            <span className="block text-[10px] mt-0.5" style={{ color: 'var(--accent-light)' }}>Switch workspace</span>
+          </button>
+          {showWorkspaceSwitch && (
+            <form
+              className="mt-2 p-2 rounded-lg"
+              style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}
+              onSubmit={async e => {
+                e.preventDefault();
+                if (!onOpenWorkspace || !workspaceEmail.trim()) return;
+                setWorkspaceLoading(true);
+                setWorkspaceError('');
+                const opened = await onOpenWorkspace(workspaceEmail);
+                setWorkspaceLoading(false);
+                if (opened) {
+                  setWorkspaceEmail('');
+                  setShowWorkspaceSwitch(false);
+                } else {
+                  setWorkspaceError('No workspace found for this email');
+                }
+              }}
+            >
+              <input
+                type="email"
+                value={workspaceEmail}
+                onChange={e => setWorkspaceEmail(e.target.value)}
+                placeholder="Owner or member email"
+                className="w-full px-2.5 py-2 rounded-md text-[11px]"
+                style={{ background: 'var(--bg-base)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
+                autoFocus
+              />
+              {workspaceError && <p className="mt-1 text-[10px]" style={{ color: 'var(--danger)' }}>{workspaceError}</p>}
+              <button
+                type="submit"
+                disabled={workspaceLoading || !workspaceEmail.trim()}
+                className="w-full mt-2 py-1.5 rounded-md text-[11px] font-semibold text-white disabled:opacity-50"
+                style={{ background: 'var(--accent)' }}
+              >
+                {workspaceLoading ? 'Opening...' : 'Open workspace'}
+              </button>
+            </form>
+          )}
+        </div>
+      )}
 
       {/* New Profile Button - only for admins */}
       {isAdmin && (
@@ -269,14 +308,16 @@ const Sidebar: React.FC<SidebarProps> = ({
         </div>
       )}
 
-      {/* Main Navigation */}
-      <nav className={`px-2 space-y-0.5 ${isAdmin ? '' : 'pt-3'}`}>
-        {filterItems(mainNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
-      </nav>
+      {/* Scrollable navigation keeps folders reachable on shorter windows. */}
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {/* Main Navigation */}
+        <nav className={`px-2 space-y-0.5 ${isAdmin ? '' : 'pt-3'}`}>
+          {filterItems(mainNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
+        </nav>
 
-      {/* Folders section - only visible when on profiles page and not collapsed */}
-      {activePage === 'profiles' && !collapsed && (
-        <div className="flex-1 px-2 pb-2 overflow-y-auto mt-3">
+        {/* Folders section - only visible when on profiles page and not collapsed */}
+        {activePage === 'profiles' && !collapsed && (
+          <div className="px-2 pb-2 mt-3">
           {/* Divider */}
           <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-3 mx-1" />
 
@@ -326,6 +367,15 @@ const Sidebar: React.FC<SidebarProps> = ({
             {foldersExpanded && (() => {
               const rootFolders = folders.filter(f => !f.parentId);
               const getChildren = (parentId: string) => folders.filter(f => f.parentId === parentId);
+              const teamNameById = new Map(teams.map(team => [team.id, team.name]));
+              const teamSections = Array.from(new Set(rootFolders.map(folder => folder.teamId || 'unknown')))
+                .map(teamId => ({
+                  teamId,
+                  teamName: teamNameById.get(teamId) || (teamId === 'unknown' ? 'No team' : `Team ${teamId.slice(0, 6)}`),
+                  folders: rootFolders.filter(folder => (folder.teamId || 'unknown') === teamId),
+                }))
+                .filter(section => section.folders.length > 0)
+                .sort((a, b) => a.teamName.localeCompare(b.teamName));
               const toggleParent = (folderId: string, e: React.MouseEvent) => {
                 e.stopPropagation();
                 setExpandedParents(prev => {
@@ -419,7 +469,16 @@ const Sidebar: React.FC<SidebarProps> = ({
 
               return (
                 <div className="space-y-0.5">
-                  {rootFolders.map(folder => renderFolder(folder))}
+                  {isSuperAdmin && teamSections.length > 1
+                    ? teamSections.map(section => (
+                        <div key={section.teamId} className="pt-1">
+                          <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider truncate" style={{ color: 'var(--text-muted)' }}>
+                            {section.teamName}
+                          </div>
+                          {section.folders.map(folder => renderFolder(folder))}
+                        </div>
+                      ))
+                    : rootFolders.map(folder => renderFolder(folder))}
                   {folders.length === 0 && (
                     <p className="text-[12px] px-3 py-2" style={{ color: 'var(--text-muted)' }}>
                       No folders yet
@@ -429,28 +488,26 @@ const Sidebar: React.FC<SidebarProps> = ({
               );
             })()}
           </div>
-        </div>
-      )}
-
-      {/* Spacer when folders not shown */}
-      {(activePage !== 'profiles' || collapsed) && <div className="flex-1" />}
-
-      {/* Team Section */}
-      {isAdmin && (
-        <div className="px-2 pb-2">
-          <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-2 mx-1" />
-          {!collapsed && (
-            <div className="px-3 mb-1">
-              <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
-                Team
-              </span>
-            </div>
-          )}
-          <div className="space-y-0.5">
-            {filterItems(teamNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
           </div>
-        </div>
-      )}
+        )}
+
+        {/* Team Section */}
+        {isAdmin && (
+          <div className="px-2 pb-2">
+            <div style={{ borderTop: '1px solid var(--border-subtle)' }} className="mb-2 mx-1" />
+            {!collapsed && (
+              <div className="px-3 mb-1">
+                <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-muted)' }}>
+                  Team
+                </span>
+              </div>
+            )}
+            <div className="space-y-0.5">
+              {filterItems(teamNavItems).map(({ page, label, icon }) => renderNavButton(page, label, icon))}
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Bottom: User info */}
       <div className={`${collapsed ? 'px-2' : 'px-3'} py-3 space-y-2 relative`} style={{ borderTop: '1px solid var(--border-subtle)' }}>
@@ -486,18 +543,6 @@ const Sidebar: React.FC<SidebarProps> = ({
                       {user.role}
                     </div>
                   </div>
-                  {isOwner && (
-                    <button
-                      onClick={() => setShowSwitchMenu(!showSwitchMenu)}
-                      className="p-1.5 rounded-lg transition-colors shrink-0"
-                      title="Switch account"
-                      style={{ color: 'var(--text-muted)' }}
-                      onMouseEnter={e => { e.currentTarget.style.background = 'var(--accent-subtle)'; e.currentTarget.style.color = 'var(--accent-light)'; }}
-                      onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
-                    >
-                      <ArrowLeftRight size={14} />
-                    </button>
-                  )}
                   <button onClick={onLogout} className="p-1.5 rounded-lg transition-colors shrink-0" title="Sign out"
                     style={{ color: 'var(--text-muted)' }}
                     onMouseEnter={e => { e.currentTarget.style.background = 'var(--danger-subtle)'; e.currentTarget.style.color = 'var(--danger)'; }}
@@ -505,104 +550,6 @@ const Sidebar: React.FC<SidebarProps> = ({
                     <LogOut size={14} />
                   </button>
                 </div>
-
-                {/* Switch Account Menu */}
-                {showSwitchMenu && isOwner && (
-                  <div className="absolute bottom-full left-0 right-0 mb-2 mx-2 rounded-xl shadow-2xl z-50 overflow-hidden"
-                    style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border-default)' }}>
-                    <div className="px-3 py-2 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                      <span className="text-[12px] font-semibold" style={{ color: 'var(--text-primary)' }}>Switch Account</span>
-                      <button onClick={() => setShowSwitchMenu(false)} className="p-0.5 rounded" style={{ color: 'var(--text-muted)' }}>
-                        <X size={12} />
-                      </button>
-                    </div>
-
-                    {savedAccounts.map((account) => (
-                      <div
-                        key={account.email}
-                        className="px-3 py-2 flex items-center gap-2 cursor-pointer transition-colors"
-                        style={{ color: account.email === user?.email ? 'var(--accent-light)' : 'var(--text-secondary)' }}
-                        onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-elevated)'}
-                        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                        onClick={() => account.email !== user?.email && handleSwitch(account)}
-                      >
-                        <div className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold text-white shrink-0"
-                          style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)' }}>
-                          {account.email.charAt(0).toUpperCase()}
-                        </div>
-                        <span className="text-[12px] flex-1 truncate">{account.email}</span>
-                        {account.email === user?.email && (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded-full" style={{ background: 'var(--accent-subtle)', color: 'var(--accent-light)' }}>active</span>
-                        )}
-                        {account.email !== user?.email && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); handleRemoveAccount(account.email); }}
-                            className="p-0.5 rounded transition-colors"
-                            style={{ color: 'var(--text-muted)' }}
-                            onMouseEnter={e => { e.currentTarget.style.color = 'var(--danger)'; }}
-                            onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-muted)'; }}
-                          >
-                            <X size={11} />
-                          </button>
-                        )}
-                      </div>
-                    ))}
-
-                    {savedAccounts.length === 0 && (
-                      <div className="px-3 py-3 text-[12px] text-center" style={{ color: 'var(--text-muted)' }}>
-                        No saved accounts
-                      </div>
-                    )}
-
-                    {!showAddAccount ? (
-                      <button
-                        onClick={() => setShowAddAccount(true)}
-                        className="w-full px-3 py-2 flex items-center gap-2 text-[12px] transition-colors"
-                        style={{ color: 'var(--text-muted)', borderTop: '1px solid var(--border-subtle)' }}
-                        onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-elevated)'; e.currentTarget.style.color = 'var(--text-primary)'; }}
-                        onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-muted)'; }}
-                      >
-                        <UserPlus size={13} />
-                        Add account
-                      </button>
-                    ) : (
-                      <div className="px-3 py-2 space-y-2" style={{ borderTop: '1px solid var(--border-subtle)' }}>
-                        <input
-                          type="email"
-                          placeholder="Email"
-                          value={newEmail}
-                          onChange={e => setNewEmail(e.target.value)}
-                          className="w-full px-2 py-1.5 rounded-lg text-[12px]"
-                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
-                        />
-                        <input
-                          type="password"
-                          placeholder="Password"
-                          value={newPassword}
-                          onChange={e => setNewPassword(e.target.value)}
-                          className="w-full px-2 py-1.5 rounded-lg text-[12px]"
-                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-primary)' }}
-                        />
-                        <div className="flex gap-1">
-                          <button
-                            onClick={handleAddAccount}
-                            className="flex-1 py-1.5 rounded-lg text-[11px] font-medium text-white"
-                            style={{ background: 'linear-gradient(135deg, #6366f1, #7c3aed)' }}
-                          >
-                            Save
-                          </button>
-                          <button
-                            onClick={() => { setShowAddAccount(false); setNewEmail(''); setNewPassword(''); }}
-                            className="px-3 py-1.5 rounded-lg text-[11px] font-medium"
-                            style={{ color: 'var(--text-muted)', border: '1px solid var(--border-default)' }}
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
 
                 <div className="flex items-center justify-between px-1">
                   <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Profiles</span>
