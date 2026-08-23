@@ -2540,11 +2540,17 @@ test('an instance stuck at the forced-close limit gets its service worker store 
 
   // Et seulement pour un tour Open Post, le seul ou la limite s'applique.
   assert.match(fonction, /hasTargetTweet === true/);
-  assert.match(
-    lanceur,
-    /if \(targetTweetUrl\) \{\s*this\.viderCacheServiceWorker/,
-    'le cache doit etre vide avant chaque ouverture Open Post'
-  );
+  // Le cache doit etre vide avant chaque tour pilote par Spectra : un Open
+  // Post comme une publication. Le 23 aout 2026, seul l'Open Post passait par
+  // la, et douze instances de mass post sont restees sur la page blanche.
+  const garde = lanceur.match(/if \(([^)]*)\) \{\s*this\.viderCacheServiceWorker/);
+  assert.ok(garde, 'le cache doit etre vide avant le tour');
+  for (const motif of ['targetTweetUrl', 'massPost', 'branding']) {
+    assert.ok(
+      garde[1].includes(motif),
+      `le vidage du cache doit couvrir ${motif}, condition lue : ${garde[1]}`
+    );
+  }
 });
 
 test('Open Post background bootstrap imports staged cookies before managed X navigation', async () => {

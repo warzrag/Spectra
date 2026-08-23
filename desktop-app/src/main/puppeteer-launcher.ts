@@ -2124,7 +2124,17 @@ public class Win32 {
       // Les cookies sont ailleurs (DefaultNetworkCookies) et ne bougent
       // pas : la session est preservee. Une instance ainsi remise a neuf
       // retweete en 9 a 11 s, comme une saine.
-      if (targetTweetUrl) {
+      //
+      // Une publication court exactement le meme risque, et elle etait hors
+      // du compte : son script est refabrique a chaque tour avec un autre
+      // texte et une autre image. Le 23 aout 2026, douze instances du VPS 128
+      // sont restees sur la page blanche a 15:38 puis a 17:28 -- les douze
+      // memes, pendant que treize autres publiaient dans la meme minute. Leur
+      // service worker n'a jamais dit un mot ; leur magasin pesait jusqu'a
+      // 570 Mo, contre 0,1 a 0,8 Mo pour une instance saine. L'effacer les a
+      // remises en marche. Le bot de RT ne l'avait jamais montre : lui passe
+      // par cette ligne depuis le 18 aout.
+      if (targetTweetUrl || options.massPost || options.branding) {
         this.viderCacheServiceWorker(options.profileId, profilePath);
       }
       this.desactiverGestionnaireMotsDePasse(profilePath);
