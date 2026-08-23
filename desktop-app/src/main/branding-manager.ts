@@ -457,6 +457,42 @@ export function lireHistoriquePublication(
  */
 export const PART_AVEC_MEDIA = 0.45;
 
+/** Quatre caracteres de largeur nulle : invisibles a l'ecran, comptes par X. */
+const CARACTERES_INVISIBLES = ['​', '‌', '‍', '﻿'];
+
+/** Retire les caracteres de largeur nulle, pour comparer ce qui se lit. */
+export function sansInvisibles(texte: string): string {
+  return String(texte || '').replace(/[​-‍﻿⁠]/g, '');
+}
+
+/**
+ * Rend une publication unique sans en changer une lettre.
+ *
+ * Un compte finit toujours par republier ses propres textes : avec quatorze
+ * posts et une tournee toutes les six heures, il a fait le tour en trois
+ * jours et demi. Il repart alors sur les memes, mot pour mot -- et c'est
+ * precisement ce que X sait reperer.
+ *
+ * On glisse donc deux a quatre caracteres de largeur nulle a des positions
+ * tirees au hasard. Le lecteur ne voit rien ; deux envois du meme post ne
+ * sont plus identiques. C'est la mecanique que VenusBot applique depuis le
+ * debut (makePostUnique), et qui lui permet de publier tous les jours.
+ *
+ * Ce que cela ne fait PAS : deux comptes qui envoient la meme phrase
+ * l'envoient toujours. Seuls des textes en plus le corrigent.
+ */
+export function rendreUnique(texte: string, hasard: () => number = Math.random): string {
+  if (!texte) return texte;
+  let sortie = texte;
+  const combien = 2 + Math.floor(3 * hasard());
+  for (let i = 0; i < combien; i++) {
+    const caractere = CARACTERES_INVISIBLES[Math.floor(hasard() * CARACTERES_INVISIBLES.length)];
+    const position = Math.floor(hasard() * sortie.length);
+    sortie = sortie.slice(0, position) + caractere + sortie.slice(position);
+  }
+  return sortie;
+}
+
 export function tirerPublication(
   racineDonnees: string,
   folderId: string,
@@ -504,7 +540,14 @@ export function tirerPublication(
     fs.renameSync(temporaire, chemin);
   }
 
-  return { post: post.valeur, media: media.valeur, epuise: post.epuise };
+  /* L'historique vient d'etre ecrit avec le texte d'origine : c'est lui qui
+     dit ce qu'un compte a deja envoye, et il doit rester comparable a la
+     reserve. Seule la copie qui part sur X est rendue unique. */
+  return {
+    post: post.valeur ? rendreUnique(post.valeur, hasard) : null,
+    media: media.valeur,
+    epuise: post.epuise,
+  };
 }
 
 // --- Ce qui a reellement abouti -----------------------------------------------
@@ -604,10 +647,20 @@ export function rendrePublication(
   const historique = lireHistoriquePublication(racineDonnees, folderId);
   const sien = historique[profileId];
   if (!sien) return;
+  /* On compare ce qui se lit, pas ce qui s'ecrit.
+     L'historique garde le texte d'origine, mais celui qu'on nous rend a
+     traverse rendreUnique() et porte des caracteres de largeur nulle. Les
+     comparer tels quels ne trouvait jamais rien : le post ne revenait pas
+     dans la reserve, et le compte le perdait pour toujours. */
   const retirerDernier = (liste: string[], valeur: string | null) => {
     if (!valeur) return liste;
-    const index = liste.lastIndexOf(valeur);
-    return index === -1 ? liste : [...liste.slice(0, index), ...liste.slice(index + 1)];
+    const cherche = sansInvisibles(valeur);
+    for (let i = liste.length - 1; i >= 0; i--) {
+      if (sansInvisibles(liste[i]) === cherche) {
+        return [...liste.slice(0, i), ...liste.slice(i + 1)];
+      }
+    }
+    return liste;
   };
   historique[profileId] = {
     posts: retirerDernier(sien.posts || [], post),

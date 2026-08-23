@@ -3414,7 +3414,17 @@ public class Win32 {
     '[data-testid="tweetButtonInline"]',
   ];
 
-  const normaliser = (valeur) => String(valeur || '').replace(/\\s+/g, ' ').trim();
+  /* On compare ce qui se lit, pas ce qui s'ecrit.
+     Le texte porte des caracteres de largeur nulle, glisses avant l'envoi
+     pour que deux publications du meme post ne soient pas identiques aux
+     yeux de X. Ils sont invisibles a l'ecran mais X les deplace ou les
+     retire en collant : sans les ecarter ici, la relecture ne
+     correspondrait jamais et le robot conclurait « le coller n'a pas
+     pris » alors que le texte est bon. */
+  const normaliser = (valeur) => String(valeur || '')
+    .replace(/[\\u200B-\\u200D\\uFEFF\\u2060]/g, '')
+    .replace(/\\s+/g, ' ')
+    .trim();
 
   /**
    * Relit ce qu'il y a dans l'editeur, ligne par ligne.

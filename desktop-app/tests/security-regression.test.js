@@ -1221,13 +1221,24 @@ test('a mass post never says the same thing twice', () => {
     path.join(lotMulti, 'posts.txt'),
     '# entete\nmayyy i dm you??\n\n(answer quickly)\n---\ndeuxieme post\n'
   );
+  // Ce qui part sur X porte des caracteres de largeur nulle, glisses pour que
+  // deux envois du meme post ne soient pas identiques. On compare donc ce qui
+  // se lit, pas ce qui s'ecrit.
+  const lisible = (valeur) => String(valeur || '').replace(/[​-‍﻿⁠]/g, '');
   const doubles = ['x', 'y'].map(
     (identifiant) => tirerPublication(multi, 'tous', identifiant, hasard).post
   );
   assert.deepEqual(
-    doubles.slice().sort(),
+    doubles.map(lisible).slice().sort(),
     ['deuxieme post', 'mayyy i dm you??\n\n(answer quickly)'],
     'un post sur plusieurs lignes doit rester entier'
+  );
+
+  // Et ces caracteres sont bien la : sans eux, un compte qui a fait le tour de
+  // la reserve republie son propre texte mot pour mot, ce que X repere.
+  assert.ok(
+    doubles.every((valeur) => lisible(valeur) !== valeur),
+    'chaque publication doit porter des caracteres de largeur nulle'
   );
   fs.rmSync(multi, { recursive: true, force: true });
 
@@ -3284,7 +3295,20 @@ test('la page VA Manager montre et filtre par assistant', () => {
 
   // Le filtre doit etre dans les dependances du calcul, sinon la liste ne se
   // rafraichit pas quand on change d'assistant.
-  assert.match(page, /\[accounts, auditFilter, etatParCompte, filtreVa, search, sort, statusFilter\]/);
+  // On verifie que chaque filtre y figure, sans figer la liste entiere :
+  // epingler l'ordre exact faisait echouer ce test a chaque nouveau filtre
+  // ajoute, alors que la regle protegee est seulement < tout filtre lu doit
+  // etre dans les dependances >. Casse le 23 aout 2026 en ajoutant le
+  // masquage des comptes deja en place.
+  const debutMemo = page.indexOf('const visibleAccounts = useMemo(');
+  assert.ok(debutMemo >= 0, 'visibleAccounts est introuvable');
+  const finMemo = page.indexOf('}, [', debutMemo);
+  const finDeps = page.indexOf(']);', finMemo);
+  assert.ok(finMemo > 0 && finDeps > finMemo, 'les dependances de visibleAccounts sont introuvables');
+  const deps = page.slice(finMemo + 4, finDeps);
+  for (const nom of ['accounts', 'auditFilter', 'etatParCompte', 'filtreVa', 'montrerEnPlace', 'search', 'sort', 'statusFilter']) {
+    assert.ok(deps.includes(nom), nom + ' manque dans les dependances de visibleAccounts');
+  }
 
   // Et le nom s'affiche sur la ligne du compte.
   assert.ok(page.includes('{account.vaName}'));
