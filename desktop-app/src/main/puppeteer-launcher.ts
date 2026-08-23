@@ -139,6 +139,30 @@ export class PuppeteerLauncher {
       : path.join(os.homedir(), '.antidetect-browser', 'profiles');
   }
 
+  /**
+   * Mode dev : le journal a l'ecran s'ouvre deplie.
+   *
+   * Allume par la presence d'un fichier, jamais par defaut --
+   * AppData\Local\AntidetectBrowser\mode-dev. Un VPS ne l'a pas ; le poste
+   * qui debogue le pose. Un reglage aurait voyage dans le cloud avec le
+   * reste, ce fichier non.
+   *
+   * Ce mode a d'abord ouvert la console de Chrome. Deux fois de trop :
+   * elle recouvrait le formulaire de connexion de VA Manager, puis --
+   * surtout -- elle mangeait les fenetres du mass post, qui font 460 px de
+   * large. Le bot ne voyait plus rien : il ne juge que ce qui a une
+   * largeur et une hauteur a l'ecran. Une aide au debogage qui empeche le
+   * travail n'aide personne. Le journal deplie montre les memes etapes
+   * sans rien recouvrir.
+   */
+  private static modeDevActif(): boolean {
+    try {
+      return fs.existsSync(path.join(path.dirname(this.getProfilesRoot()), 'mode-dev'));
+    } catch {
+      return false;
+    }
+  }
+
   private static appendLifecycleEvent(
     profileId: string,
     event: string,
@@ -3301,6 +3325,7 @@ public class Win32 {
   const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
   const PROFILE_ID = ${JSON.stringify(options.profileId)};
   const CLE = 'spectraJournalPublication';
+  const MODE_DEV = ${JSON.stringify(this.modeDevActif())};
 
   const attendre = (ms) => new Promise((suite) => setTimeout(suite, ms));
   const hasardEntre = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
@@ -3321,9 +3346,18 @@ public class Win32 {
    * Deplie, il recouvrait l'editeur et le media -- on ne voyait plus rien de
    * ce que le bot faisait. Un clic l'ouvre en entier quand il faut lire le
    * detail, et l'etat suit le profil d'une page a l'autre.
+   *
+   * En mode dev il part deplie -- un clic le replie quand meme, et ce choix
+   * l'emporte. C'est tout ce que ce mode fait : rien qui recouvre la page,
+   * rien qui retrecisse la fenetre.
    */
   const CLE_OUVERT = 'spectraJournalOuvert';
-  const estOuvert = () => sessionStorage.getItem(CLE_OUVERT) === '1';
+  const estOuvert = () => {
+    const choix = sessionStorage.getItem(CLE_OUVERT);
+    if (choix === '1') return true;
+    if (choix === '0') return false;
+    return MODE_DEV;
+  };
 
   function dessiner() {
     let boite = document.getElementById('spectra-journal');
@@ -3376,6 +3410,69 @@ public class Win32 {
       document.body.appendChild(point);
       setTimeout(() => point.remove(), 1400);
     } catch {}
+  }
+  /**
+   * Rien qui ouvre un menu, jamais.
+   *
+   * « Everyone », en haut de la fenetre de redaction, ouvre la liste du
+   * public. Aucun geste du bot n'a de raison de la toucher, et une liste
+   * ouverte recouvre l'editeur. Demande par Florent le 23 aout 2026, capture
+   * a l'appui. Aujourd'hui aucun selecteur ne peut l'atteindre -- ils visent
+   * tous un data-testid precis -- mais un selecteur de repli deraperait un
+   * jour. Le refus est donc pose ici, sur le passage oblige de tout clic.
+   */
+  const ouvreUnMenu = (element) => {
+    try {
+      return Boolean(element && element.closest && element.closest(
+        '[aria-haspopup="menu"], [aria-haspopup="listbox"], [aria-haspopup="true"], ' +
+        '[data-testid="tweetAudienceSelector"], [data-testid="reply-settings"]'
+      ));
+    } catch (e) {
+      return false;
+    }
+  };
+  /**
+   * Un clic complet, comme en fait un vrai doigt.
+   *
+   * X n'ecoute pas le clic : il ecoute la sequence qui le precede. VenusBot
+   * envoie ces dix evenements depuis toujours -- c'est son simulateClick --
+   * et n'a jamais eu de bouton qui refuse. Spectra appelait .click() tout
+   * seul sur le bouton Poster, ce qui n'est que le dernier des dix.
+   *
+   * Aucun accent grave dans ce commentaire : tout ce bloc vit dans un
+   * gabarit, et une paire d'accents graves le couperait en deux.
+   */
+  function cliquerComplet(element) {
+    if (ouvreUnMenu(element)) {
+      journal('Clic refusé : cet élément ouvre un menu', 'erreur');
+      return;
+    }
+    const b = element.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y = b.top + b.height / 2;
+    const d = {
+      bubbles: true,
+      cancelable: true,
+      clientX: x,
+      clientY: y,
+      screenX: x + window.screenX,
+      screenY: y + window.screenY,
+      button: 0,
+      buttons: 1,
+      pointerId: 1,
+      pointerType: 'mouse',
+      view: window,
+    };
+    element.dispatchEvent(new PointerEvent('pointerover', d));
+    element.dispatchEvent(new PointerEvent('pointerenter', d));
+    element.dispatchEvent(new MouseEvent('mouseover', d));
+    element.dispatchEvent(new MouseEvent('mouseenter', d));
+    element.dispatchEvent(new PointerEvent('pointerdown', d));
+    element.dispatchEvent(new MouseEvent('mousedown', d));
+    if (element.focus) element.focus();
+    element.dispatchEvent(new PointerEvent('pointerup', d));
+    element.dispatchEvent(new MouseEvent('mouseup', d));
+    element.click();
   }
   async function rapport(statut, message) {
     journal(message, statut === 'success' ? 'ok' : statut === 'failed' ? 'erreur' : 'attente');
@@ -3562,18 +3659,29 @@ public class Win32 {
   try {
     // Ou cliquer, et surtout ou NE PAS cliquer.
     //
-    // apercuMedia() peut renvoyer le bouton « Remove » : c'est l'un de ses
-    // selecteurs de repli. Cliquer dessus retirerait le media qu'on vient
-    // d'envoyer. On ne se sert donc jamais de cet element pour le clic.
+    // C'est le media qu'il faut reveiller -- Florent l'a montre a l'ecran le
+    // 23 aout 2026 : un clic dans le texte ne rallume pas le bouton, un clic
+    // sur l'image si. L'editeur ne sert plus que de repli, pour une
+    // publication sans media.
     //
-    // L'editeur de texte fait aussi bien : Florent l'a dit en montrant
-    // l'ecran, « il faut cliquer sur le media ou la page ». Un clic dans
-    // l'editeur ne peut rien casser, ne peut rien supprimer, et n'ouvre
-    // aucune fenetre de retouche.
+    // Deux boutons vivent dans l'apercu et ne doivent jamais etre touches :
+    // la croix qui supprime le media, et le crayon qui ouvre la retouche.
+    // Tous deux logent dans la bande du haut. On vise donc le conteneur des
+    // pieces jointes aux trois quarts de sa hauteur, en plein dans l'image,
+    // et on envoie les evenements au conteneur lui-meme : les gestionnaires
+    // des deux boutons ne peuvent alors pas se declencher.
+    //
+    // apercuMedia() n'est pas utilise ici : l'un de ses selecteurs de repli
+    // renvoie le bouton « Remove » en personne.
+    const conteneur = document.querySelector('[data-testid="attachments"]')
+      || document.querySelector('[data-testid="media"]');
     const editeur = document.querySelector('[data-testid="tweetTextarea_0"]');
-    const cible = editeur
-      || document.querySelector('[data-testid="attachments"]')
-      || null;
+    const cible = conteneur || editeur || null;
+    const surLeMedia = Boolean(conteneur);
+    if (cible && ouvreUnMenu(cible)) {
+      journal('Réveil refusé : cet élément ouvre un menu', 'erreur');
+      return false;
+    }
     if (cible) {
       // Un .click() ne suffisait pas : le 23 aout 2026 le bouton Poster
       // restait eteint sur une publication pourtant complete, texte et
@@ -3582,7 +3690,40 @@ public class Win32 {
       // ces dix evenements depuis toujours et n'a jamais eu ce probleme.
       const boite = cible.getBoundingClientRect();
       const x = boite.left + boite.width / 2;
-      const y = boite.top + boite.height / 2;
+      /* Aux trois quarts de la hauteur sur un media : la croix et le crayon
+         sont en haut, et un apercu fait au moins 120 px de haut -- le point
+         vise en est donc toujours tres loin. */
+      const y = surLeMedia
+        ? boite.top + boite.height * 0.75
+        : boite.top + boite.height / 2;
+      /* Montrer le clic, en rouge.
+         Sans cela on ne peut pas distinguer « le bot ne clique pas » de
+         « le bot clique au mauvais endroit » : les deux donnent le meme
+         bouton eteint. Le cadre entoure l'element vise, le rond marque le
+         point exact. Rien ne peut gener la page -- pointer-events: none, et
+         tout disparait en deux secondes. */
+      try {
+        const cadre = document.createElement('div');
+        cadre.style.cssText = 'position:fixed;left:' + boite.left + 'px;top:' + boite.top +
+          'px;width:' + boite.width + 'px;height:' + boite.height + 'px;' +
+          'border:2px solid #ff2d55;border-radius:6px;z-index:2147483646;pointer-events:none';
+        const rond = document.createElement('div');
+        rond.style.cssText = 'position:fixed;left:' + (x - 9) + 'px;top:' + (y - 9) + 'px;' +
+          'width:18px;height:18px;border-radius:50%;background:#ff2d55;' +
+          'box-shadow:0 0 0 7px rgba(255,45,85,.35);z-index:2147483647;pointer-events:none';
+        const racine = document.body || document.documentElement;
+        racine.appendChild(cadre);
+        racine.appendChild(rond);
+        setTimeout(function () {
+          if (cadre.parentNode) cadre.parentNode.removeChild(cadre);
+          if (rond.parentNode) rond.parentNode.removeChild(rond);
+        }, 2000);
+      } catch (eMarque) {}
+      journal(
+        'Clic sur ' + (surLeMedia ? 'le média' : 'le texte') +
+        ' (' + Math.round(x) + ', ' + Math.round(y) + ')',
+        'info'
+      );
       const details = {
         bubbles: true,
         cancelable: true,
@@ -3607,8 +3748,10 @@ public class Win32 {
       cible.dispatchEvent(new MouseEvent('mouseup', details));
       cible.click();
       // Poser le curseur a la fin, comme le ferait un clic humain dans le
-      // texte : c'est ce reveil de l'editeur qui rallume le bouton.
-      if (editeur) {
+      // texte. Seulement quand c'est le texte qu'on vient de cliquer :
+      // apres un clic sur le media, deplacer la selection ramenerait le
+      // focus dans l'editeur et defairait ce qu'on vient de faire.
+      if (editeur && !surLeMedia) {
         const selection = window.getSelection && window.getSelection();
         if (selection && document.createRange) {
           const plage = document.createRange();
@@ -3762,6 +3905,7 @@ public class Win32 {
       const bouton = Array.from(zone.querySelectorAll('button, [role="button"]'))
         .filter(visible)
         .filter((b) => !b.closest('[data-testid="toolBar"]'))
+        .filter((b) => !ouvreUnMenu(b))
         .find((b) => LIBELLES_ECARTER.includes(String(b.textContent || '').trim().toLowerCase()));
       if (bouton) {
         pointRouge(bouton);
@@ -3797,6 +3941,34 @@ public class Win32 {
       journal('Je vais sur le fil', 'attente');
       location.assign('https://x.com/home');
       return;
+    }
+
+    /* Ouvrir la fenetre de redaction avec la touche « n », comme VenusBot.
+       Sur le fil, le champ n'existe pas tant que rien ne l'ouvre : il est
+       replie derriere « Quoi de neuf ? ». On attendait donc douze secondes
+       un editeur qui ne pouvait pas venir, puis on basculait sur
+       /compose/post -- la page ou le bouton Poster reste eteint.
+       VenusBot ne fait que ca : un clic dans la page, puis « n ». Il refuse
+       meme de publier ailleurs que sur /home. */
+    if (!surCompose && !chercher(EDITEUR)) {
+      journal('J’ouvre la fenêtre de rédaction (touche n)', 'attente');
+      try {
+        document.body.click();
+        if (document.body.focus) document.body.focus();
+      } catch (eActivation) { /* activer la page ne doit rien casser */ }
+      await attendre(500);
+      const touche = {
+        key: 'n',
+        code: 'KeyN',
+        keyCode: 78,
+        which: 78,
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      };
+      document.body.dispatchEvent(new KeyboardEvent('keydown', touche));
+      document.dispatchEvent(new KeyboardEvent('keydown', touche));
+      await attendre(2000);
     }
 
     /* Douze secondes sur le fil, pas vingt-cinq : si le champ n'y est pas,
@@ -3872,7 +4044,20 @@ public class Win32 {
 
       await attendre(400);
     }
-    if (!envoiPossible(bouton)) {
+    /* Le bouton reste eteint ? On clique quand meme.
+       VenusBot ne regarde jamais s'il est allume : il le cherche, attend une
+       seconde, et lui envoie les dix evenements. Il publie tous les jours.
+       Spectra, lui, abandonnait au bout de trois minutes sans avoir essaye
+       une seule fois -- constate le 23 aout 2026 sur une publication
+       complete, texte et media en place.
+       Ce chemin ne peut rien coûter : sans lui, il finissait en echec de
+       toute facon. La confirmation qui suit reste le seul juge. */
+    const eteintMaisPresent = bouton && !envoiPossible(bouton);
+    if (eteintMaisPresent) {
+      journal('Le bouton reste éteint — je clique quand même', 'attente');
+      await attendre(1000);
+    }
+    if (!bouton) {
       // Dire POURQUOI, pas seulement que ca n'a pas marche.
       //
       // « Le bouton Poster reste éteint » ne se diagnostique pas : on ne sait
@@ -3888,13 +4073,13 @@ public class Win32 {
           + (media ? ', média joint' : ', sans média')
           + (plainte ? ', X dit : « ' + plainte[0].trim().slice(0, 60) + ' »' : '');
       } catch (e) { /* un diagnostic rate ne doit pas masquer l'echec */ }
-      await rapport('failed', (bouton ? 'Le bouton Poster reste éteint' : 'Bouton Poster introuvable') + etat);
+      await rapport('failed', 'Bouton Poster introuvable' + etat);
       return;
     }
 
     pointRouge(bouton);
     journal('Clic sur Poster', 'ok');
-    bouton.click();
+    cliquerComplet(bouton);
 
     // C'est parti quand l'editeur se vide ou que la page nous ramene au fil.
     const finEnvoi = Date.now() + 45000;
@@ -6008,10 +6193,18 @@ setTimeout(exportCookies, 1000);
       // qui pose sa boite de dialogue par-dessus la page et n'offre plus le
       // champ identifiant au meme endroit. L'accueil, lui, presente le
       // formulaire directement.
+      /* Une publication part du fil, comme VenusBot.
+         Elle partait de /compose/post, et le script ne pouvait donc jamais
+         faire ce que VenusBot fait : etre sur /home et ouvrir la fenetre de
+         redaction avec la touche « n ». Il se croyait deja arrive. C'est sur
+         /compose/post que le bouton Poster reste eteint, media joint et
+         texte en place -- constate le 23 aout 2026. VenusBot refuse meme de
+         publier ailleurs que sur /home. Le script garde /compose/post en
+         secours si le champ ne vient pas sur le fil. */
       let startUrl = sessionImportAttemptId
         ? 'https://x.com/'
         : options.massPost
-        ? 'https://x.com/compose/post'
+        ? 'https://x.com/home'
         : targetTweetUrl ||
           (
             isValidUrl(configuredLastUrl) && !isLegacyGoogleStartUrl(configuredLastUrl)

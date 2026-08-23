@@ -884,7 +884,11 @@ ipcMain.handle('massPost:apply', async (_, profileData, placement) => {
 
   const lancement = await launchProfileBrowser(profileId, {
     ...profileData,
-    lastUrl: 'https://x.com/compose/post',
+    // Le fil, pas la page de publication : c'est la que la touche « n »
+    // ouvre la fenetre de redaction, comme VenusBot. Voir startUrl dans
+    // puppeteer-launcher, qui impose deja /home pour un mass post -- cette
+    // ligne disait le contraire et n'aidait personne a comprendre.
+    lastUrl: 'https://x.com/home',
     launchMode: 'automation',
     autoStartTwitterBot: false,
     targetTweetUrl: undefined,
