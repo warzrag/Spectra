@@ -40,6 +40,8 @@ const getCookieSyncBackgroundSource = ({
   hasStagedCookies = false,
   openPostMode = false,
   cookieImportMode = 'remplacer',
+  // Mass post ou branding : Spectra pilote l'instance de bout en bout.
+  publicationMode = false,
 }) => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts').replace(/\r\n/g, '\n');
   const marker = "fs.writeFileSync(path.join(cookieSyncPath, 'background.js'),\n`";
@@ -56,6 +58,10 @@ const getCookieSyncBackgroundSource = ({
     .replaceAll('${JSON.stringify(hasStagedCookies)}', JSON.stringify(hasStagedCookies))
     .replaceAll('${JSON.stringify(modeImportCookies)}', JSON.stringify(cookieImportMode))
     .replaceAll('${JSON.stringify(sessionImportAttemptId)}', JSON.stringify(''))
+    .replaceAll(
+      '${JSON.stringify(Boolean(options.massPost || options.branding))}',
+      JSON.stringify(publicationMode)
+    )
     .replaceAll('${this.localServerConfig?.port || 0}', '45678')
     .replaceAll("${JSON.stringify(this.localServerConfig?.token || '')}", JSON.stringify('test-token'))
     .replaceAll('\\\\', '\\');
@@ -117,6 +123,24 @@ test('manual and managed browser launches use isolated startup policies', () => 
   assert.equal(resolveLaunchMode({ targetTweetUrl: 'https://x.com/user/status/1' }), 'open-post');
   assert.equal(resolveLaunchMode({ autoStartTwitterBot: true }), 'automation');
   assert.equal(resolveLaunchMode({ sessionImportAttemptId: 'attempt' }), 'session-import');
+
+  // Un mass post et un branding sont pilotes par Spectra, pas par
+  // l'utilisateur. Tant qu'ils tombaient en « manuel », aucune adresse
+  // n'etait imposee des lors que le profil avait une session Chrome a
+  // rouvrir : le navigateur restait sur la page vide ouverte pour poser les
+  // cookies. Invisible sur un poste ou ces profils ne servent qu'a ca ;
+  // total sur un VPS ou on les ouvre aussi a la main. Constate le
+  // 23 aout 2026, sur les 74 comptes du dossier « post mass ».
+  assert.equal(resolveLaunchMode({ publication: true }), 'publication');
+  assert.equal(isManagedLaunch('publication'), true);
+  assert.equal(shouldAppendLaunchUrl('publication', true), true);
+  assert.equal(shouldAppendLaunchUrl('manual', true), false);
+
+  // Un Open Post reste prioritaire : il vise un tweet precis.
+  assert.equal(
+    resolveLaunchMode({ publication: true, targetTweetUrl: 'https://x.com/u/status/1' }),
+    'open-post'
+  );
 
   assert.equal(isManagedLaunch('manual'), false);
   assert.equal(isManagedLaunch('open-post'), true);
@@ -468,10 +492,21 @@ test('manual profile launches do not inherit managed OpenPost tab behavior', () 
     launcher,
     /isValidUrl\(savedUrl\) && !isLegacyGoogleStartUrl\(savedUrl\)/
   );
-  assert.match(
-    launcher,
-    /const MANAGED_STARTUP_MODE = OPEN_POST_MODE \|\| Boolean\(LAUNCH_ID\) \|\| SESSION_IMPORT_MODE/
-  );
+  // Quatre facons d'ouvrir un profil sans que l'utilisateur y touche. Chacune
+  // doit mettre l'extension en mode pilote, sinon personne ne renvoie le
+  // navigateur sur X et il reste sur la page vide ouverte pour les cookies.
+  // On verifie la presence de chaque marqueur, sans figer la formulation :
+  // epingler la ligne entiere la faisait echouer au premier ajout, et c'est
+  // arrive le 23 aout 2026 en y ajoutant le mass post.
+  const debutManaged = launcher.indexOf('const MANAGED_STARTUP_MODE =');
+  assert.ok(debutManaged >= 0, 'MANAGED_STARTUP_MODE est introuvable');
+  const expressionManaged = launcher.slice(debutManaged, launcher.indexOf(';', debutManaged));
+  for (const marqueur of ['OPEN_POST_MODE', 'LAUNCH_ID', 'SESSION_IMPORT_MODE', 'PUBLICATION_MODE']) {
+    assert.ok(
+      expressionManaged.includes(marqueur),
+      marqueur + ' manque dans MANAGED_STARTUP_MODE'
+    );
+  }
   assert.match(
     launcher,
     /const ENFORCE_SINGLE_TAB = OPEN_POST_MODE \|\| Boolean\(LAUNCH_ID\)/
@@ -1766,7 +1801,11 @@ test('cookie import targets the file consumed by the runtime importer', () => {
 test('cross-device cookies are restored before Open Post actions and Chrome closes gracefully', () => {
   const launcher = read('desktop-app/src/main/puppeteer-launcher.ts');
   const profileSync = read('desktop-app/src/renderer/services/profile-sync-service.ts');
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl\s*:\s*targetTweetUrl\s*\?\s*'about:blank'/);
+  // Ce qui est protege ici : un Open Post part d'une page vide, pour que les
+  // cookies soient poses avant d'atteindre X. La condition qui precede peut
+  // s'allonger -- une publication s'y est ajoutee le 23 aout 2026 -- sans que
+  // cette regle change.
+  assert.match(launcher, /targetTweetUrl\s*\n?\s*\?\s*'about:blank'/);
   assert.match(launcher, /async function ensureCookiesImported\(\)/);
   // Les cookies restent restaures avant la navigation, mais chaque etape porte
   // desormais un delai : un blocage silencieux laissait le profil inerte une
@@ -1982,7 +2021,9 @@ test('Open Selected coordinates one exact startup tab and one VenusBot start com
   assert.match(launcher, /chrome\.tabs\.get\(retainedTabId\)/);
   assert.match(launcher, /target:\s*\{ tabId: retainedTabId \}/);
   assert.match(launcher, /return retainedTabId/);
-  assert.match(launcher, /options\.autoStartTwitterBot\s*\?\s*startUrl/);
+  // Un demarrage de robot va droit a l'adresse, sans page vide. La condition
+  // accepte d'autres cas a cote -- une publication s'y est ajoutee.
+  assert.match(launcher, /options\.autoStartTwitterBot[^?]*\?\s*\n?\s*startUrl/);
   assert.match(launcher, /startupTabsMarkerDeadline = Date\.now\(\) \+ 5000/);
   assert.match(launcher, /Single-tab marker delayed; using Requests fallback/);
   assert.doesNotMatch(launcher, /createStartupTabCleanerExtension/);

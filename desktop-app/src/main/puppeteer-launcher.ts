@@ -2094,6 +2094,7 @@ public class Win32 {
         sessionImportAttemptId,
         targetTweetUrl,
         autoStartTwitterBot: options.autoStartTwitterBot,
+        publication: Boolean(options.massPost || options.branding),
       });
       const managedLaunch = isManagedLaunch(launchMode);
 
@@ -3564,6 +3565,36 @@ public class Win32 {
       || document.querySelector('[data-testid="attachments"]')
       || null;
     if (cible) {
+      // Un .click() ne suffisait pas : le 23 aout 2026 le bouton Poster
+      // restait eteint sur une publication pourtant complete, texte et
+      // media en place. X n'ecoute pas le clic, il ecoute la sequence qui
+      // le precede -- survol, pointeur, souris, focus. VenusBot dispatche
+      // ces dix evenements depuis toujours et n'a jamais eu ce probleme.
+      const boite = cible.getBoundingClientRect();
+      const x = boite.left + boite.width / 2;
+      const y = boite.top + boite.height / 2;
+      const details = {
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+        screenX: x + window.screenX,
+        screenY: y + window.screenY,
+        button: 0,
+        buttons: 1,
+        pointerId: 1,
+        pointerType: 'mouse',
+        view: window,
+      };
+      cible.dispatchEvent(new PointerEvent('pointerover', details));
+      cible.dispatchEvent(new PointerEvent('pointerenter', details));
+      cible.dispatchEvent(new MouseEvent('mouseover', details));
+      cible.dispatchEvent(new MouseEvent('mouseenter', details));
+      cible.dispatchEvent(new PointerEvent('pointerdown', details));
+      cible.dispatchEvent(new MouseEvent('mousedown', details));
+      if (cible.focus) cible.focus();
+      cible.dispatchEvent(new PointerEvent('pointerup', details));
+      cible.dispatchEvent(new MouseEvent('mouseup', details));
       cible.click();
       // Poser le curseur a la fin, comme le ferait un clic humain dans le
       // texte : c'est ce reveil de l'editeur qui rallume le bouton.
@@ -4985,10 +5016,33 @@ const HAS_STAGED_COOKIES = ${JSON.stringify(hasStagedCookies)};
 const COOKIE_IMPORT_MODE = ${JSON.stringify(modeImportCookies)};
 const SESSION_IMPORT_ATTEMPT_ID = ${JSON.stringify(sessionImportAttemptId)};
 const SESSION_IMPORT_MODE = Boolean(SESSION_IMPORT_ATTEMPT_ID);
-const MANAGED_STARTUP_MODE = OPEN_POST_MODE || Boolean(LAUNCH_ID) || SESSION_IMPORT_MODE;
+/* Mass post ou branding : Spectra pilote, l'utilisateur ne touche a rien.
+   Sans ce marqueur, l'extension restait en mode manuel et personne ne
+   renvoyait le navigateur sur X -- il demeurait sur la page vide ouverte
+   pour poser les cookies. */
+const PUBLICATION_MODE = ${JSON.stringify(Boolean(options.massPost || options.branding))};
+const MANAGED_STARTUP_MODE =
+  OPEN_POST_MODE || Boolean(LAUNCH_ID) || SESSION_IMPORT_MODE || PUBLICATION_MODE;
+/* Volontairement sans PUBLICATION_MODE : fermer les autres onglets est utile
+   pour un Open Post, mais une publication n'a aucune raison de toucher a ce
+   que l'utilisateur avait ouvert. */
 const ENFORCE_SINGLE_TAB = OPEN_POST_MODE || Boolean(LAUNCH_ID);
 const SERVER = 'http://127.0.0.1:${this.localServerConfig?.port || 0}';
 const SERVER_TOKEN = ${JSON.stringify(this.localServerConfig?.token || '')};
+
+/* Temoin de vie, pose le 23 aout 2026.
+   Un mass post laissait les profils du VPS 128 sur la page vide, sans qu'une
+   seule etape soit journalisee. Impossible de savoir si le service worker ne
+   demarrait pas, ou s'il demarrait et echouait plus loin : dans les deux cas
+   le journal restait muet. Cette ligne repond a la question -- elle part
+   avant tout le reste, sans dependre de rien. */
+reportLifecycleEvent('worker-demarre', {
+  openPost: OPEN_POST_MODE,
+  publication: PUBLICATION_MODE,
+  cookiesEnReserve: HAS_STAGED_COOKIES,
+  pilote: MANAGED_STARTUP_MODE,
+}).catch(() => {});
+
 let bootstrapPromise = null;
 let bootstrapComplete = false;
 let exportInProgress = false;
@@ -6020,6 +6074,11 @@ setTimeout(exportCookies, 1000);
       // publique aurait suffi a la debloquer, mais l'aurait rendue lisible par
       // n'importe quel site : de quoi reconnaitre l'extension, et donc le
       // navigateur. Inacceptable ici.
+      /* La page vide n'est pas un detour : elle laisse a l'extension le temps
+         de poser les cookies avant d'atteindre X. Le 23 aout 2026 j'ai voulu
+         la sauter pour une publication, en croyant que la session vivait de
+         toute facon dans le profil. Elle n'y etait pas : les instances sont
+         arrivees sur X deconnectees. On la garde. */
       const regularLaunchUrl = options.autoStartTwitterBot
         ? startUrl
         : targetTweetUrl

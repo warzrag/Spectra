@@ -5,6 +5,7 @@ import AssignProfileModal from '../components/AssignProfileModal';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { logActivity } from '../services/firestore-service';
+import { downloadProfileFromCloud, needsCloudDownload } from '../services/profile-sync-service';
 import { Profile, Folder, Team, AppSettings, Platform, ProfileStatus, BotStatus } from '../../types';
 import { isLockedByOther } from '../services/profile-sync-service';
 import { normalizeTweetUrl } from '../../shared/twitter-url';
@@ -587,6 +588,29 @@ const Dashboard: React.FC<DashboardProps> = ({
         if (!profil) return;
         setBrandingEnCours({ fait, total: traitables.length, nom: profil.name });
         try {
+          /* Rapatrier le profil depuis le cloud avant de l'ouvrir, exactement
+             comme le fait le bouton Open.
+
+             Un lot passait directement au lanceur, sans cette etape. Sur le
+             poste ou les profils sont a jour, cela ne se voyait pas. Sur une
+             machine qui ne les avait pas encore -- le VPS 128, le 23 aout
+             2026 -- les instances arrivaient sur X deconnectees : leur
+             session vit dans le cloud, pas sur le disque. Ouvrir la meme
+             instance a la main la connectait, parce que ce chemin-la
+             telechargeait d'abord.
+
+             Un echec de telechargement ne doit pas arreter le lot : on
+             tente quand meme, avec ce qu'il y a sur place. */
+          try {
+            if (await needsCloudDownload(profil)) {
+              await downloadProfileFromCloud(profil, () => {});
+            }
+          } catch (erreurTelechargement) {
+            showToast(
+              `${profil.name} : téléchargement du profil impossible, ouverture avec la copie locale`,
+              'warning'
+            );
+          }
           const resultat = await action(profil, place);
           if (resultat?.status === 'success') reussis++;
           else {

@@ -1,16 +1,42 @@
-export type SpectraLaunchMode = 'manual' | 'automation' | 'open-post' | 'session-import';
+export type SpectraLaunchMode =
+  | 'manual'
+  | 'automation'
+  | 'open-post'
+  | 'session-import'
+  | 'publication';
 
 export interface LaunchPolicyInput {
   launchMode?: SpectraLaunchMode;
   autoStartTwitterBot?: boolean;
   targetTweetUrl?: string | null;
   sessionImportAttemptId?: string | null;
+  /** Un mass post ou un branding : Spectra pilote l'instance, l'utilisateur non. */
+  publication?: boolean;
 }
 
+/**
+ * A quel titre ce profil s'ouvre-t-il.
+ *
+ * `publication` a ete ajoute le 23 aout 2026. Un mass post ne portait aucun
+ * des trois marqueurs precedents : il tombait donc en « manuel », avec deux
+ * consequences qui le rendaient inoperant des que le profil avait deja servi.
+ *
+ *   1. shouldAppendLaunchUrl n'imposait aucune adresse -- Chrome rouvrait ses
+ *      onglets d'avant, souvent une page vide, et le navigateur restait la ;
+ *   2. l'extension ne se mettait pas en mode pilote, donc personne ne la
+ *      renvoyait sur X.
+ *
+ * Cela ne se voyait pas sur un poste ou ces profils ne servent qu'au mass
+ * post : sans session Chrome a restaurer, l'adresse etait imposee et tout
+ * marchait. Sur un VPS ou les memes profils sont ouverts a la main tous les
+ * jours, aucun mass post n'aboutissait -- constate le 23 aout 2026, et ce
+ * chemin n'avait alors jamais servi sur un VPS.
+ */
 export function resolveLaunchMode(input: LaunchPolicyInput): SpectraLaunchMode {
   if (input.launchMode) return input.launchMode;
   if (input.sessionImportAttemptId) return 'session-import';
   if (input.targetTweetUrl) return 'open-post';
+  if (input.publication) return 'publication';
   if (input.autoStartTwitterBot) return 'automation';
   return 'manual';
 }
